@@ -18,13 +18,15 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use peerline_host::{Host, Mount};
+use peerline_host::{Host, Mount, WsPolicy};
 use peerline_manager::Manager;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 /// Canonical defaults — chosen so the manager + dashboard just work with no
-/// env config, on loopback only (override to `0.0.0.0:…` to expose on a LAN).
+/// env config, on loopback only (override to `0.0.0.0:…` to expose on a LAN;
+/// exposing the dashboard that way also needs `PEERLINE_MANAGER_ORIGINS`, so
+/// the RPC port admits the URL browsers will actually load it from).
 const DEFAULT_SOCK: &str = "/tmp/peerline-manager.sock";
 const DEFAULT_WS: &str = "127.0.0.1:6466";
 const DEFAULT_UI: &str = "127.0.0.1:6467";
@@ -73,7 +75,16 @@ async fn main() -> Result<(), String> {
     // self-describing.
     let mut host = Host::new();
     if let Some(addr) = ws_addr {
-        mount = mount.ws("/");
+        // The dashboard is the only browser client, so the allowlist is
+        // derived from where it is served. Without this any page the user
+        // visits could open a socket here and enumerate every service on
+        // the machine — browsers exempt WebSocket handshakes from CORS, so
+        // nothing else stops it.
+        //
+        // Native clients (`peerline-mon`, other hosts) send no `Origin` and
+        // are unaffected; see `WsPolicy::origins`. With the dashboard off,
+        // the list is empty and every browser is refused.
+        mount = mount.ws("/", WsPolicy::origins(dashboard_origins(ui_addr)));
         host = host.ws_bind(addr);
     }
 
@@ -91,6 +102,52 @@ async fn main() -> Result<(), String> {
     }
 
     host.mount(Manager::new(), mount).run().await
+}
+
+/// The origins a browser can present when it loaded the dashboard from
+/// `ui_addr`. A user may reach a loopback listener by any of its spellings,
+/// and the browser reports whichever they typed.
+///
+/// `PEERLINE_MANAGER_ORIGINS` (comma-separated) overrides this entirely.
+/// It has to exist: binding the UI to `0.0.0.0` is a documented
+/// configuration, and there is no way to enumerate from an unspecified
+/// bind which host a browser will actually have typed. Without the
+/// override such a deployment would load the page and then be refused on
+/// the RPC socket — closed rather than open, but broken.
+fn dashboard_origins(ui_addr: Option<SocketAddr>) -> Vec<String> {
+    if let Ok(raw) = std::env::var("PEERLINE_MANAGER_ORIGINS") {
+        return raw
+            .split(',')
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    let Some(ui) = ui_addr else { return Vec::new() };
+    let port = ui.port();
+    if ui.ip().is_loopback() {
+        vec![
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+            format!("http://[::1]:{port}"),
+        ]
+    } else if ui.ip().is_unspecified() {
+        // Reachable under any of this host's names; we cannot know which
+        // the user will type. Loopback still works out of the box; a LAN
+        // browser needs PEERLINE_MANAGER_ORIGINS.
+        tracing::warn!(
+            "dashboard is bound to an unspecified address: only loopback origins are \
+             allowed on the RPC port. Set PEERLINE_MANAGER_ORIGINS to the URL browsers \
+             will actually use (e.g. http://192.168.1.10:{port})."
+        );
+        vec![
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+            format!("http://[::1]:{port}"),
+        ]
+    } else {
+        vec![format!("http://{ui}")]
+    }
 }
 
 /// Tiny static server for the dashboard page (one route, `GET /`).

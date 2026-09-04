@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use peerline::runtime::Peer;
 use peerline::wire::RpcError;
-use peerline_host::{Host, Mount, Service};
+use peerline_host::{Host, Mount, Remote, Service, WsPolicy};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -54,8 +54,14 @@ async fn host_mounts_two_services_by_path() {
     drop(probe);
 
     let host = Host::new()
-        .mount(Echo { name: "alpha" }, Mount::new().ws("/alpha"))
-        .mount(Echo { name: "beta" }, Mount::new().ws("/beta"))
+        .mount(
+            Echo { name: "alpha" },
+            Mount::new().ws("/alpha", WsPolicy::allow_any()),
+        )
+        .mount(
+            Echo { name: "beta" },
+            Mount::new().ws("/beta", WsPolicy::allow_any()),
+        )
         .ws_bind(addr)
         .no_report();
     tokio::spawn(async move {
@@ -89,8 +95,14 @@ async fn run_rejects_empty_dupe_and_no_mount() {
 
     // Two services colliding on one WS path.
     let err = Host::new()
-        .mount(Echo { name: "a" }, Mount::new().ws("/same"))
-        .mount(Echo { name: "b" }, Mount::new().ws("/same"))
+        .mount(
+            Echo { name: "a" },
+            Mount::new().ws("/same", WsPolicy::allow_any()),
+        )
+        .mount(
+            Echo { name: "b" },
+            Mount::new().ws("/same", WsPolicy::allow_any()),
+        )
         .ws_bind(addr)
         .run()
         .await
@@ -100,9 +112,103 @@ async fn run_rejects_empty_dupe_and_no_mount() {
     // A service exists but no transport is active (mount requests WS, host
     // never binds a WS port).
     let err = Host::new()
-        .mount(Echo { name: "x" }, Mount::new().ws("/x"))
+        .mount(
+            Echo { name: "x" },
+            Mount::new().ws("/x", WsPolicy::allow_any()),
+        )
         .run()
         .await
         .unwrap_err();
     assert!(err.contains("no active mounts"), "{err}");
+}
+
+/// The uid `register_remote` saw, so the test can prove credentials
+/// actually arrived rather than the branch being skipped.
+static SEEN_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// A service that varies *what exists* by who connected, rather than
+/// checking permissions inside a handler.
+struct Guarded;
+
+impl Service for Guarded {
+    fn name(&self) -> &'static str {
+        "guarded"
+    }
+
+    fn register(&self, peer: &Peer) {
+        peer.on_request("public", |_: serde_json::Value| async {
+            Ok::<_, RpcError>("open")
+        });
+    }
+
+    fn register_remote(&self, peer: &Peer, remote: &Remote) {
+        self.register(peer);
+        // Over UDS the caller's uid is kernel-attested. Root is the
+        // predicate here purely because the test is definitely not root,
+        // so the privileged op must end up unregistered.
+        let trusted = match remote {
+            Remote::Uds(c) => {
+                SEEN_UID.store(c.uid(), std::sync::atomic::Ordering::Release);
+                c.uid() == 0
+            }
+            _ => false,
+        };
+        if trusted {
+            peer.on_request("privileged", |_: serde_json::Value| async {
+                Ok::<_, RpcError>("granted")
+            });
+        }
+    }
+}
+
+/// An op the caller was not granted is not merely refused — it was never
+/// registered, so it answers `MethodNotFound` and does not even confirm it
+/// exists. That is the point of deciding at registration time.
+#[tokio::test]
+async fn register_remote_varies_the_op_set_by_identity() {
+    let dir = std::env::temp_dir().join(format!("pl-host-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sock = dir.join("guarded.sock");
+
+    let serve_sock = sock.clone();
+    let host = tokio::spawn(async move {
+        Host::new()
+            .mount(Guarded, Mount::new().uds(&serve_sock))
+            .no_report()
+            .run()
+            .await
+    });
+
+    let mut connected = None;
+    for _ in 0..200 {
+        if let Ok(c) = peerline_transport_uds::connect(&sock).await {
+            connected = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (peer, driver) = connected.expect("uds server should come up");
+    tokio::spawn(driver);
+
+    let open: String = peer
+        .call("public", &serde_json::json!({}))
+        .await
+        .expect("the ungated op is registered for everyone");
+    assert_eq!(open, "open");
+
+    let denied = peer
+        .call::<_, String>("privileged", &serde_json::json!({}))
+        .await;
+    assert!(
+        denied.is_err(),
+        "an op that was never registered must not answer"
+    );
+
+    // Credentials really arrived — the branch was taken, not skipped.
+    let seen = SEEN_UID.load(std::sync::atomic::Ordering::Acquire);
+    assert_ne!(seen, u32::MAX, "register_remote never saw a Uds remote");
+    assert_ne!(seen, 0, "test should not be running as root");
+
+    host.abort();
+    let _ = std::fs::remove_dir_all(&dir);
 }

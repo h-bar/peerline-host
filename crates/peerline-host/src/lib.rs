@@ -33,6 +33,9 @@
 
 #![forbid(unsafe_code)]
 
+// Only `reject_dupes` needs it, and that exists only when some transport
+// can actually be mounted.
+#[cfg(any(feature = "ws", feature = "uds", feature = "iroh"))]
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -44,11 +47,84 @@ use peerline::runtime::Peer;
 use tokio::sync::oneshot;
 use tracing::info;
 
-/// The boxed per-connection peer initializer handed to each transport.
-type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
-
 /// A transport's forever-running accept loop.
 type Serve = BoxFuture<'static, Result<(), String>>;
+
+// One mount entry per transport. Only defined when that transport is
+// compiled in: `Mount` has no setter for a disabled one, so nothing can be
+// mounted on it and its whole assembly path is gone.
+#[cfg(feature = "ws")]
+type WsMount = (String, peerline_transport_ws::Acceptor);
+#[cfg(feature = "uds")]
+type UdsMount = (PathBuf, peerline_transport_uds::Acceptor);
+#[cfg(feature = "iroh")]
+type IrohMount = (Vec<u8>, peerline_transport_iroh::Acceptor);
+
+// Re-exported so a consumer configures mounts without taking a direct
+// dependency on the transport crates. Each stays in its own crate because
+// what it screens on is specific to that transport (see [`Remote`]).
+#[cfg(feature = "iroh")]
+pub use peerline_transport_iroh::{EndpointId, IrohAccept, IrohPolicy};
+#[cfg(feature = "uds")]
+pub use peerline_transport_uds::{UdsAccept, UdsPolicy};
+#[cfg(feature = "ws")]
+pub use peerline_transport_ws::{WsAccept, WsPolicy};
+
+// ---------------------------------------------------------------------------
+// Acceptors — where a transport's authenticated facts become a `Remote`
+//
+// Each is the same two-step: apply the mount's policy, and on admission
+// hand back an initializer that has captured who connected. That capture is
+// the whole mechanism — nothing threads identity through `peerline` itself.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ws")]
+fn ws_acceptor(
+    svc: Arc<dyn Service>,
+    policy: peerline_transport_ws::WsPolicy,
+) -> peerline_transport_ws::Acceptor {
+    use peerline_transport_ws::{WsAccept, WsAdmit};
+    Arc::new(move |accept: &WsAccept| {
+        policy.check(accept)?;
+        let remote = Remote::Ws(accept.clone());
+        let svc = svc.clone();
+        Ok(WsAdmit::new(move |peer: &Peer| {
+            svc.register_remote(peer, &remote);
+        }))
+    })
+}
+
+#[cfg(feature = "uds")]
+fn uds_acceptor(
+    svc: Arc<dyn Service>,
+    policy: peerline_transport_uds::UdsPolicy,
+) -> peerline_transport_uds::Acceptor {
+    use peerline_transport_uds::UdsAccept;
+    Arc::new(move |accept: &UdsAccept| {
+        policy.check(accept)?;
+        let remote = Remote::Uds(*accept);
+        let svc = svc.clone();
+        Ok(Arc::new(move |peer: &Peer| {
+            svc.register_remote(peer, &remote);
+        }) as peerline_transport_uds::PeerHandler)
+    })
+}
+
+#[cfg(feature = "iroh")]
+fn iroh_acceptor(
+    svc: Arc<dyn Service>,
+    policy: peerline_transport_iroh::IrohPolicy,
+) -> peerline_transport_iroh::Acceptor {
+    use peerline_transport_iroh::IrohAccept;
+    Arc::new(move |accept: &IrohAccept| {
+        policy.check(accept)?;
+        let remote = Remote::Iroh(accept.clone());
+        let svc = svc.clone();
+        Ok(Arc::new(move |peer: &Peer| {
+            svc.register_remote(peer, &remote);
+        }) as peerline_transport_iroh::PeerHandler)
+    })
+}
 
 /// A composable peerline service: a name (for logging) plus the handler
 /// registrations that run on each freshly-connected peer.
@@ -64,6 +140,54 @@ pub trait Service: Send + Sync + 'static {
     /// Register this service's request / notification / stream handlers on
     /// a freshly-connected peer. Called once per connection.
     fn register(&self, peer: &Peer);
+
+    /// Register handlers knowing who connected. Defaults to
+    /// [`register`](Self::register), so existing services need no change.
+    ///
+    /// Override it to vary *what exists* per caller rather than checking
+    /// permissions inside each handler:
+    ///
+    /// ```ignore
+    /// fn register_remote(&self, peer: &Peer, remote: &Remote) {
+    ///     self.register(peer);                       // read-only ops, everyone
+    ///     if self.trusted(remote) {
+    ///         peer.on_request("admin.wipe", ...);    // only for some
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// An op that was never registered answers `MethodNotFound`, which
+    /// does not even confirm it exists — and there is no check to forget.
+    fn register_remote(&self, peer: &Peer, remote: &Remote) {
+        let _ = remote;
+        self.register(peer);
+    }
+}
+
+/// Who is on the other end, as the transport that accepted them
+/// authenticated it.
+///
+/// Deliberately not unified into one `Identity`: the three carry
+/// different *kinds* of claim with different weight. An `Origin` is
+/// asserted by a browser about a page and is worth nothing against a
+/// native client; a uid is kernel-attested; an endpoint id is proved by a
+/// handshake. Flattening them would invite policy that treats a hint like
+/// a proof.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum Remote {
+    /// A WebSocket handshake. See [`WsAccept::origin`] for what its
+    /// `Origin` does and does not establish.
+    ///
+    /// [`WsAccept::origin`]: peerline_transport_ws::WsAccept::origin
+    #[cfg(feature = "ws")]
+    Ws(peerline_transport_ws::WsAccept),
+    /// A Unix socket peer, with kernel-attested credentials.
+    #[cfg(feature = "uds")]
+    Uds(peerline_transport_uds::UdsAccept),
+    /// An iroh peer, with a handshake-proved endpoint id.
+    #[cfg(feature = "iroh")]
+    Iroh(peerline_transport_iroh::IrohAccept),
 }
 
 /// Where one service is mounted, per transport. A `None` field means the
@@ -71,14 +195,15 @@ pub trait Service: Send + Sync + 'static {
 /// setters; every address is explicit.
 #[derive(Default, Clone)]
 pub struct Mount {
-    /// WebSocket path on the shared port, e.g. `/` or `/foo`. Only active
-    /// if the host also has a [`Host::ws_bind`] address.
-    pub ws_path: Option<String>,
+    /// WebSocket path on the shared port, with the policy screening it.
+    #[cfg(feature = "ws")]
+    ws: Option<(String, peerline_transport_ws::WsPolicy)>,
     /// Unix domain socket file. Its parent directory is created if missing.
-    pub uds_path: Option<PathBuf>,
-    /// iroh ALPN on the shared endpoint. Only active if the host also has a
-    /// [`Host::iroh_endpoint`].
-    pub iroh_alpn: Option<Vec<u8>>,
+    #[cfg(feature = "uds")]
+    uds: Option<(PathBuf, peerline_transport_uds::UdsPolicy)>,
+    /// iroh ALPN on the shared endpoint, with the policy screening it.
+    #[cfg(feature = "iroh")]
+    iroh: Option<(Vec<u8>, peerline_transport_iroh::IrohPolicy)>,
 }
 
 impl Mount {
@@ -87,24 +212,63 @@ impl Mount {
         Self::default()
     }
 
-    /// Serve this service at `path` on the shared WebSocket port.
+    /// Serve this service at `path` on the shared WebSocket port, admitting
+    /// the connections `policy` allows. Only active if the host also has a
+    /// [`Host::ws_bind`] address.
+    ///
+    /// The policy is a required argument rather than an option with a
+    /// default: WebSocket is the transport a browser can reach, and there
+    /// is no default that is right for both a public app and a localhost
+    /// daemon. `WsPolicy::allow_any()` is available and says so out loud.
+    #[cfg(feature = "ws")]
     #[must_use]
-    pub fn ws(mut self, path: impl Into<String>) -> Self {
-        self.ws_path = Some(path.into());
+    pub fn ws(mut self, path: impl Into<String>, policy: peerline_transport_ws::WsPolicy) -> Self {
+        self.ws = Some((path.into(), policy));
         self
     }
 
-    /// Serve this service on the Unix socket file `path`.
+    /// Serve this service on the Unix socket file `path`, admitting the
+    /// same user (and root) — which the socket's `0600` permissions already
+    /// enforce at the kernel, so this is defence in depth rather than a
+    /// choice. Use [`uds_policy`](Self::uds_policy) for anything else.
+    #[cfg(feature = "uds")]
     #[must_use]
     pub fn uds(mut self, path: impl Into<PathBuf>) -> Self {
-        self.uds_path = Some(path.into());
+        self.uds = Some((path.into(), peerline_transport_uds::UdsPolicy::same_user()));
         self
     }
 
-    /// Serve this service under `alpn` on the shared iroh endpoint.
+    /// Serve this service on `path`, screened by `policy`. Replaces any
+    /// socket set by a previous [`uds`](Self::uds) or `uds_policy` on this
+    /// mount — the two are alternatives, not a setter and a modifier.
+    #[cfg(feature = "uds")]
     #[must_use]
-    pub fn iroh(mut self, alpn: impl Into<Vec<u8>>) -> Self {
-        self.iroh_alpn = Some(alpn.into());
+    pub fn uds_policy(
+        mut self,
+        path: impl Into<PathBuf>,
+        policy: peerline_transport_uds::UdsPolicy,
+    ) -> Self {
+        self.uds = Some((path.into(), policy));
+        self
+    }
+
+    /// Serve this service under `alpn` on the shared iroh endpoint,
+    /// admitting the endpoints `policy` allows. Only active if the host
+    /// also has a [`Host::iroh_endpoint`].
+    ///
+    /// Required, like the WebSocket policy, and for a sharper reason: an
+    /// iroh ticket is an *address*, not a credential — it travels through
+    /// logs, pastes and QR codes — so "reached us" cannot be the default
+    /// authorization. `IrohPolicy::any_ticket_holder()` is available when
+    /// that really is the intent.
+    #[cfg(feature = "iroh")]
+    #[must_use]
+    pub fn iroh(
+        mut self,
+        alpn: impl Into<Vec<u8>>,
+        policy: peerline_transport_iroh::IrohPolicy,
+    ) -> Self {
+        self.iroh = Some((alpn.into(), policy));
         self
     }
 }
@@ -239,32 +403,41 @@ impl Host {
             return Err("peerline-host: no services registered".into());
         }
 
-        // One boxed initializer per service, reused across transports.
-        let prepared: Vec<(&'static str, Mount, PeerHandler)> = self
+        // The service itself, not a pre-boxed initializer: each transport
+        // builds its own acceptor, because the initializer now closes over
+        // the identity that transport authenticated.
+        let prepared: Vec<(&'static str, Mount, Arc<dyn Service>)> = self
             .services
             .iter()
-            .map(|(svc, mount)| {
-                let s = svc.clone();
-                let handler: PeerHandler = Arc::new(move |peer: &Peer| s.register(peer));
-                (svc.name(), mount.clone(), handler)
-            })
+            .map(|(svc, mount)| (svc.name(), mount.clone(), svc.clone()))
             .collect();
 
+        // With every transport feature off nothing can be mounted, so this
+        // stays empty and `run` fails on "no mount is active".
+        #[cfg_attr(
+            not(any(feature = "ws", feature = "uds", feature = "iroh")),
+            allow(unused_mut)
+        )]
         let mut serves: Vec<Serve> = Vec::new();
         // Receives the iroh ticket once the endpoint binds, so the manager
         // report can include it. Only wired when we're going to report.
+        #[cfg(feature = "iroh")]
         let will_report = !matches!(self.report, ReportMode::Off);
+        #[cfg_attr(not(feature = "iroh"), allow(unused_mut))]
         let mut ticket_rx: Option<oneshot::Receiver<String>> = None;
 
-        // WebSocket — paths on the shared port.
+        // WebSocket — paths on the shared port. Gated: without the
+        // feature `Mount::ws` does not exist, so nothing can be mounted
+        // here and the whole block is dead.
+        #[cfg(feature = "ws")]
         if let Some(addr) = self.ws_bind {
-            let mut mounts = Vec::new();
-            for (name, mount, handler) in &prepared {
-                if let Some(path) = &mount.ws_path {
+            let mut mounts: Vec<WsMount> = Vec::new();
+            for (name, mount, svc) in &prepared {
+                if let Some((path, policy)) = &mount.ws {
                     // Explicit dial coordinates so a caller sees how to reach us.
                     info!(service = name, url = %format!("ws://{addr}{path}"),
                           "peerline-host: reachable (ws)");
-                    mounts.push((path.clone(), handler.clone()));
+                    mounts.push((path.clone(), ws_acceptor(svc.clone(), policy.clone())));
                 }
             }
             reject_dupes("ws path", mounts.iter().map(|(p, _)| p.clone()))?;
@@ -274,10 +447,11 @@ impl Host {
         }
 
         // Unix sockets — one file per service.
+        #[cfg(feature = "uds")]
         {
-            let mut mounts = Vec::new();
-            for (name, mount, handler) in &prepared {
-                if let Some(path) = &mount.uds_path {
+            let mut mounts: Vec<UdsMount> = Vec::new();
+            for (name, mount, svc) in &prepared {
+                if let Some((path, policy)) = &mount.uds {
                     if let Some(dir) = path.parent() {
                         std::fs::create_dir_all(dir).map_err(|e| {
                             format!("peerline-host: uds dir {}: {e}", dir.display())
@@ -285,7 +459,7 @@ impl Host {
                     }
                     info!(service = name, socket = %path.display(),
                           "peerline-host: reachable (uds)");
-                    mounts.push((path.clone(), handler.clone()));
+                    mounts.push((path.clone(), uds_acceptor(svc.clone(), policy.clone())));
                 }
             }
             reject_dupes(
@@ -300,13 +474,14 @@ impl Host {
         // iroh — ALPNs on the shared endpoint. The ticket isn't known until
         // the endpoint binds, so per-service dial info is printed from the
         // bind callback (see `iroh_serve`); collect (name, alpn) for it.
+        #[cfg(feature = "iroh")]
         if let Some(key_path) = &self.iroh_key {
-            let mut mounts = Vec::new();
+            let mut mounts: Vec<IrohMount> = Vec::new();
             let mut dials: Vec<(String, String)> = Vec::new();
-            for (name, mount, handler) in &prepared {
-                if let Some(alpn) = &mount.iroh_alpn {
+            for (name, mount, svc) in &prepared {
+                if let Some((alpn, policy)) = &mount.iroh {
                     dials.push((name.to_string(), String::from_utf8_lossy(alpn).into_owned()));
-                    mounts.push((alpn.clone(), handler.clone()));
+                    mounts.push((alpn.clone(), iroh_acceptor(svc.clone(), policy.clone())));
                 }
             }
             reject_dupes("iroh alpn", mounts.iter().map(|(a, _)| a.clone()))?;
@@ -385,21 +560,16 @@ impl Host {
 // the binary wasn't built with — the public API is identical either way.
 
 #[cfg(feature = "ws")]
-fn ws_serve(addr: SocketAddr, mounts: Vec<(String, PeerHandler)>) -> Result<Serve, String> {
+fn ws_serve(
+    addr: SocketAddr,
+    mounts: Vec<(String, peerline_transport_ws::Acceptor)>,
+) -> Result<Serve, String> {
     Ok(Box::pin(peerline_transport_ws::serve_mounted(addr, mounts)))
-}
-#[cfg(not(feature = "ws"))]
-fn ws_serve(_: SocketAddr, _: Vec<(String, PeerHandler)>) -> Result<Serve, String> {
-    Err("peerline-host: WS mounts configured but the `ws` feature is disabled".into())
 }
 
 #[cfg(feature = "uds")]
-fn uds_serve(mounts: Vec<(PathBuf, PeerHandler)>) -> Result<Serve, String> {
+fn uds_serve(mounts: Vec<UdsMount>) -> Result<Serve, String> {
     Ok(Box::pin(peerline_transport_uds::serve_mounted(mounts)))
-}
-#[cfg(not(feature = "uds"))]
-fn uds_serve(_: Vec<(PathBuf, PeerHandler)>) -> Result<Serve, String> {
-    Err("peerline-host: UDS mounts configured but the `uds` feature is disabled".into())
 }
 
 #[cfg(feature = "iroh")]
@@ -407,7 +577,7 @@ fn iroh_serve(
     key_path: Option<PathBuf>,
     relays: Vec<String>,
     port: Option<u16>,
-    mounts: Vec<(Vec<u8>, PeerHandler)>,
+    mounts: Vec<IrohMount>,
     dials: Vec<(String, String)>,
     ticket_tx: Option<oneshot::Sender<String>>,
 ) -> Result<Serve, String> {
@@ -448,17 +618,6 @@ fn iroh_serve(
         Ok(())
     }))
 }
-#[cfg(not(feature = "iroh"))]
-fn iroh_serve(
-    _: Option<PathBuf>,
-    _: Vec<String>,
-    _: Option<u16>,
-    _: Vec<(Vec<u8>, PeerHandler)>,
-    _: Vec<(String, String)>,
-    _: Option<oneshot::Sender<String>>,
-) -> Result<Serve, String> {
-    Err("peerline-host: iroh mounts configured but the `iroh` feature is disabled".into())
-}
 
 // --- manager auto-registration (`report_to`) -------------------------------
 
@@ -467,25 +626,36 @@ fn iroh_serve(
 #[cfg(feature = "uds")]
 fn build_report(
     manager_sock: PathBuf,
-    prepared: &[(&'static str, Mount, PeerHandler)],
+    prepared: &[(&'static str, Mount, Arc<dyn Service>)],
     ws_bind: Option<SocketAddr>,
     iroh_enabled: bool,
     ticket_rx: Option<oneshot::Receiver<String>>,
 ) -> Result<BoxFuture<'static, ()>, String> {
     use peerline_manager_protocol::Endpoints;
 
+    // Each of these feeds exactly one transport's arm below, so with that
+    // transport compiled out it has no reader.
+    #[cfg(not(feature = "ws"))]
+    let _ = ws_bind;
+    #[cfg(not(feature = "iroh"))]
+    let _ = iroh_enabled;
+
     let mut endpoints: std::collections::BTreeMap<String, Endpoints> =
         std::collections::BTreeMap::new();
+    #[cfg_attr(not(feature = "iroh"), allow(unused_mut))]
     let mut iroh_dials: Vec<(String, String)> = Vec::new();
     for (name, mount, _) in prepared {
         let e = endpoints.entry(name.to_string()).or_default();
-        if let (Some(addr), Some(path)) = (ws_bind, &mount.ws_path) {
+        #[cfg(feature = "ws")]
+        if let (Some(addr), Some((path, _))) = (ws_bind, &mount.ws) {
             e.ws.push(format!("ws://{addr}{path}"));
         }
-        if let Some(path) = &mount.uds_path {
+        #[cfg(feature = "uds")]
+        if let Some((path, _)) = &mount.uds {
             e.uds.push(path.display().to_string());
         }
-        if iroh_enabled && let Some(alpn) = &mount.iroh_alpn {
+        #[cfg(feature = "iroh")]
+        if iroh_enabled && let Some((alpn, _)) = &mount.iroh {
             iroh_dials.push((name.to_string(), String::from_utf8_lossy(alpn).into_owned()));
         }
     }
@@ -511,7 +681,7 @@ fn build_report(
 #[cfg(feature = "uds")]
 fn build_report_future(
     report_sock: Option<PathBuf>,
-    prepared: &[(&'static str, Mount, PeerHandler)],
+    prepared: &[(&'static str, Mount, Arc<dyn Service>)],
     ws_bind: Option<SocketAddr>,
     iroh_enabled: bool,
     ticket_rx: Option<oneshot::Receiver<String>>,
@@ -525,7 +695,7 @@ fn build_report_future(
 #[cfg(not(feature = "uds"))]
 fn build_report_future(
     _report_sock: Option<PathBuf>,
-    _prepared: &[(&'static str, Mount, PeerHandler)],
+    _prepared: &[(&'static str, Mount, Arc<dyn Service>)],
     _ws_bind: Option<SocketAddr>,
     _iroh_enabled: bool,
     _ticket_rx: Option<oneshot::Receiver<String>>,
@@ -642,6 +812,7 @@ async fn report_once(
 
 /// Reject two services sharing one address on a transport — that would let
 /// one silently shadow the other (and axum panics on a duplicate path).
+#[cfg(any(feature = "ws", feature = "uds", feature = "iroh"))]
 fn reject_dupes<T: std::hash::Hash + Eq + std::fmt::Debug>(
     kind: &str,
     keys: impl Iterator<Item = T>,
