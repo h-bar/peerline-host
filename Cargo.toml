@@ -1,0 +1,27 @@
+# The peerline service layer: a composable `Service` + multi-transport `Host`,
+# and a live registry (`peerline-manager`) that is itself a peerline service.
+#
+# The protocol itself — wire envelopes, the peer runtime and the WS / UDS /
+# iroh transports — lives in the `peerline` repository. The dependency arrow
+# only ever points that way; nothing here is depended on by peerline.
+[workspace]
+members = [
+    "crates/peerline-host",
+    "crates/peerline-manager-protocol",
+    "crates/peerline-manager",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.6"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/h-bar/peerline-host"
+
+[workspace.dependencies]
+# The sibling protocol repo. Swap these for a version requirement once
+# peerline is published to crates.io.
+peerline = { path = "../peerline/crates/peerline", features = ["runtime"] }
+peerline-transport-ws = { path = "../peerline/crates/peerline-transport-ws" }
+peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds" }
+peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh" }

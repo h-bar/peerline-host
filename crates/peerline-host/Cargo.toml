@@ -1,0 +1,33 @@
+[package]
+name = "peerline-host"
+description = "Unified multi-service host for peerline — register several `Service`s and serve them all from one binary over WS / UDS / iroh, each mounted under its own name (WS path, UDS socket, iroh ALPN) so their ops never collide. Replaces the per-service `serve` + transport fan-out + shutdown boilerplate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# All transports on by default; a consumer that only serves some can opt
+# out (e.g. a WS+UDS daemon skips the heavy iroh/QUIC stack with
+# `default-features = false, features = ["ws", "uds"]`).
+default = ["ws", "uds", "iroh"]
+ws = ["dep:peerline-transport-ws"]
+uds = ["dep:peerline-transport-uds"]
+iroh = ["dep:peerline-transport-iroh"]
+
+[dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
+tracing = "0.1"
+peerline = { workspace = true }
+# Wire shapes for `Host::report_to` (auto-registration with a manager).
+peerline-manager-protocol = { path = "../peerline-manager-protocol" }
+peerline-transport-ws = { workspace = true, optional = true }
+peerline-transport-uds = { workspace = true, optional = true }
+peerline-transport-iroh = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+peerline-transport-ws = { workspace = true }
