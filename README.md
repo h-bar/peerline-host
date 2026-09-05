@@ -1,5 +1,8 @@
 # peerline-host
 
+[![CI](https://github.com/h-bar/peerline-host/actions/workflows/ci.yml/badge.svg)](https://github.com/h-bar/peerline-host/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 The service layer for [peerline]: a composable `Service` trait, a
 multi-transport `Host` that mounts many services in one binary, and a live
 registry of what's running.
