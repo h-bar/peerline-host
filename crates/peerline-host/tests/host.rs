@@ -32,11 +32,14 @@ impl Service for Echo {
 }
 
 async fn dial(url: &str) -> (Peer, futures::future::BoxFuture<'static, ()>) {
+    use peerline_transport_ws::ConnectError;
     let mut attempt = 0u32;
     loop {
         match peerline_transport_ws::connect(url).await {
             Ok(pair) => break pair,
-            Err(_) if attempt < 100 => {
+            // The listener may not be up yet — retry transient failures,
+            // but a policy refusal is deterministic, so fail fast on it.
+            Err(ConnectError::Other(_)) if attempt < 100 => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
