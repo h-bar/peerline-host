@@ -115,7 +115,7 @@ a config file. Set `PEERLINE_MANAGER_*` in the unit or plist to override:
 Needs the sibling `peerline` repository checked out alongside this one:
 
 ```
-libs/
+peerline/                  (any parent folder)
 ├── peerline/
 └── peerline-host/
 ```
