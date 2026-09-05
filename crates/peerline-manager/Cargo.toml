@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# A daemon + CLI, installed from a checkout via `just install` — not a
+# library for crates.io.
+publish = false
 
 # The manager daemon (also serves the web dashboard).
 [[bin]]
@@ -18,11 +21,13 @@ path = "src/bin/peerline-mon.rs"
 
 [dependencies]
 peerline = { workspace = true }
-peerline-manager-protocol = { path = "../peerline-manager-protocol" }
+peerline-manager-protocol = { workspace = true }
 serde_json = "1"
 tracing = "0.1"
 # The daemon runs the Manager on a Host over uds (+ optional ws for browsers).
-peerline-host = { path = "../peerline-host", default-features = false, features = ["uds", "ws"] }
+# Inline (not `workspace = true`) because this is the one consumer that turns
+# default features off, which cargo ignores on a workspace-inherited dep.
+peerline-host = { path = "../peerline-host", version = "0.0.7", default-features = false, features = ["uds", "ws"] }
 # Dial transports for the `peerline-mon` CLI client.
 peerline-transport-uds = { workspace = true }
 peerline-transport-ws = { workspace = true }

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI without putting a `deny` attribute in the source,
+  # which would make a warning-producing `cargo build` fail for consumers too.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: peerline-host
+    steps:
+      # The workspace path-depends on the sibling `peerline` repository
+      # (`../peerline/crates/…`), so check both out side by side, exactly
+      # like the local layout.
+      - uses: actions/checkout@v5
+        with:
+          path: peerline-host
+      - uses: actions/checkout@v5
+        with:
+          repository: h-bar/peerline
+          path: peerline
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: peerline-host
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+  # No `cargo package` job, unlike the peerline repository's CI: every
+  # publishable crate here depends on the peerline crates by path + version,
+  # and packaging resolves that version requirement against the crates.io
+  # index — it fails until peerline 0.0.7 is actually published there.
+  # Packaging is verified by the release itself, in dependency order.

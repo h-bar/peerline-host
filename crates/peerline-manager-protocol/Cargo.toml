@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["rpc", "peer-to-peer", "service", "registry", "peerline"]
+categories = ["network-programming", "encoding"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

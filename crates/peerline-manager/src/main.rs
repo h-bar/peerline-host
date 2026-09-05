@@ -11,6 +11,10 @@
 //!   `127.0.0.1:6466`; `off` to disable). Needed by browser clients.
 //! - `PEERLINE_MANAGER_UI=<addr:port>` — web dashboard bind (default
 //!   `127.0.0.1:6467`; `off` to disable). Connects back to the WS port.
+//! - `PEERLINE_MANAGER_ORIGINS=<url,url,…>` — browser origins admitted on
+//!   the RPC port, overriding the default derived from the dashboard
+//!   address (see [`dashboard_origins`]). Required when the dashboard is
+//!   exposed beyond loopback.
 //! - `RUST_LOG=<spec>` — tracing filter (default `info`).
 
 #![forbid(unsafe_code)]

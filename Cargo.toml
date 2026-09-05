@@ -13,15 +13,21 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/h-bar/peerline-host"
 
+# Every dependency on a sibling repo or workspace member is declared with both
+# a path and a version: the path is what a workspace build uses, the version is
+# what `cargo package` writes into the published manifest. A path dependency
+# without a version cannot be packaged at all.
 [workspace.dependencies]
-# The sibling protocol repo. Swap these for a version requirement once
-# peerline is published to crates.io.
-peerline = { path = "../peerline/crates/peerline", features = ["runtime"] }
-peerline-transport-ws = { path = "../peerline/crates/peerline-transport-ws" }
-peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds" }
-peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh" }
+# The sibling protocol repo, checked out alongside this one.
+peerline = { path = "../peerline/crates/peerline", version = "0.0.7", features = ["runtime"] }
+peerline-transport-ws = { path = "../peerline/crates/peerline-transport-ws", version = "0.0.7" }
+peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds", version = "0.0.7" }
+peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh", version = "0.0.7" }
+# Workspace members, same pattern.
+peerline-host = { path = "crates/peerline-host", version = "0.0.7" }
+peerline-manager-protocol = { path = "crates/peerline-manager-protocol", version = "0.0.7" }

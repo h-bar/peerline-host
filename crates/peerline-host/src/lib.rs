@@ -21,8 +21,12 @@
 //! path), while a multi-service host gives each a distinct mount.
 //!
 //! ```ignore
-//! let mut host = Host::new()
-//!     .mount(Sh::new(state), Mount::new().ws("/").uds(cfg.socket));
+//! let mut host = Host::new().mount(
+//!     Sh::new(state),
+//!     Mount::new()
+//!         .ws("/", WsPolicy::origins(["https://app.example"]))
+//!         .uds(cfg.socket), // admits the same user (and root) by default
+//! );
 //! if let Some(addr) = cfg.ws_bind { host = host.ws_bind(addr); }
 //! host.run().await?;   // binds transports, serves until SIGINT
 //! ```

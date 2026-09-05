@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["rpc", "peer-to-peer", "service", "transport", "peerline"]
+categories = ["network-programming", "asynchronous"]
 
 [features]
 # All transports on by default; a consumer that only serves some can opt
@@ -21,7 +24,7 @@ tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 peerline = { workspace = true }
 # Wire shapes for `Host::report_to` (auto-registration with a manager).
-peerline-manager-protocol = { path = "../peerline-manager-protocol" }
+peerline-manager-protocol = { workspace = true }
 peerline-transport-ws = { workspace = true, optional = true }
 peerline-transport-uds = { workspace = true, optional = true }
 peerline-transport-iroh = { workspace = true, optional = true }

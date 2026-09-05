@@ -15,9 +15,12 @@
     <string>info</string>
     <!-- Canonical defaults are used when unset: uds /tmp/peerline-manager.sock,
          WS 127.0.0.1:6466, dashboard 127.0.0.1:6467. Uncomment to override,
-         e.g. expose on a LAN or disable a transport with `off`.
+         e.g. expose on a LAN or disable a transport with `off`. A dashboard
+         exposed beyond loopback also needs PEERLINE_MANAGER_ORIGINS
+         (comma-separated) set to the URL browsers will actually load it from.
     <key>PEERLINE_MANAGER_WS</key>  <string>0.0.0.0:6466</string>
-    <key>PEERLINE_MANAGER_UI</key>  <string>0.0.0.0:6467</string> -->
+    <key>PEERLINE_MANAGER_UI</key>  <string>0.0.0.0:6467</string>
+    <key>PEERLINE_MANAGER_ORIGINS</key>  <string>http://192.168.1.10:6467</string> -->
   </dict>
   <key>RunAtLoad</key>
   <true/>

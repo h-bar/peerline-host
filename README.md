@@ -25,8 +25,12 @@ behind one transport stack, so a fleet of services runs from one binary
 instead of one binary each.
 
 ```rust
-let mut host = Host::new()
-    .mount(Sh::new(state), Mount::new().ws("/").uds(cfg.socket));
+let mut host = Host::new().mount(
+    Sh::new(state),
+    Mount::new()
+        .ws("/", WsPolicy::origins(["https://app.example"]))
+        .uds(cfg.socket), // admits the same user (and root) by default
+);
 if let Some(addr) = cfg.ws_bind { host = host.ws_bind(addr); }
 host.run().await?;   // binds transports, serves until SIGINT
 ```
@@ -44,6 +48,20 @@ a single-service daemon keeps its exact wire addresses. The host owns the
 boilerplate each service used to hand-roll: binding transports, requiring at
 least one active mount, iroh key persistence and ticket emission, and graceful
 shutdown.
+
+### Admission
+
+Every mount carries an admission policy — the transport's screening of who
+gets a connection at all, applied before the service sees anything.
+`Mount::ws` and `Mount::iroh` take theirs as a required argument (`WsPolicy`,
+`IrohPolicy`): WebSocket is what a browser can reach and an iroh ticket is an
+address rather than a credential, so neither has a default that is safe to
+assume (`WsPolicy::allow_any()` / `IrohPolicy::any_ticket_holder()` exist and
+say so out loud). `Mount::uds` defaults to `UdsPolicy::same_user()` — same
+user and root, which the socket's `0600` permissions already enforce — with
+`Mount::uds_policy` for anything else. The policies live in the `peerline`
+transport crates (re-exported here); see the [peerline] docs for what each
+one can and cannot establish.
 
 All transports are on by default; a WS+UDS daemon can skip the iroh/QUIC stack
 entirely with `default-features = false, features = ["ws", "uds"]`.
@@ -78,7 +96,19 @@ just uninstall
 
 The daemon is env-driven with canonical defaults — UDS socket, WS RPC on
 `127.0.0.1:6466`, dashboard on `http://127.0.0.1:6467/` — so nothing installs
-a config file. Set `PEERLINE_MANAGER_*` in the unit or plist to override.
+a config file. Set `PEERLINE_MANAGER_*` in the unit or plist to override:
+
+- `PEERLINE_MANAGER_SOCK=<path>` — Unix socket (default
+  `/tmp/peerline-manager.sock`).
+- `PEERLINE_MANAGER_WS=<addr:port>` — WebSocket RPC bind (default
+  `127.0.0.1:6466`; `off` to disable). Needed by browser clients.
+- `PEERLINE_MANAGER_UI=<addr:port>` — web dashboard bind (default
+  `127.0.0.1:6467`; `off` to disable). Connects back to the WS port.
+- `PEERLINE_MANAGER_ORIGINS=<url,url,…>` — browser origins admitted on the
+  RPC port, overriding the default (the loopback spellings of the dashboard
+  address). Required when the dashboard is exposed beyond loopback — set it
+  to the URL browsers will actually load it from, e.g.
+  `http://192.168.1.10:6467`.
 
 ## Development
 

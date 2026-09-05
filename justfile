@@ -24,7 +24,9 @@ fmt:
 # --- peerline-manager service (the daemon + the peerline-mon CLI) ---
 # The daemon is env-driven with canonical defaults (uds socket, WS RPC on
 # 127.0.0.1:6466, web dashboard on http://127.0.0.1:6467/), so no config
-# file is installed — set PEERLINE_MANAGER_* in the unit/plist to override.
+# file is installed — set PEERLINE_MANAGER_* in the unit/plist to override
+# (SOCK / WS / UI binds; exposing the dashboard beyond loopback also needs
+# PEERLINE_MANAGER_ORIGINS set to the URL browsers will load it from).
 
 install: build
     #!/usr/bin/env bash
