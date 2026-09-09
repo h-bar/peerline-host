@@ -28,12 +28,51 @@
 //!         .uds(cfg.socket), // admits the same user (and root) by default
 //! );
 //! if let Some(addr) = cfg.ws_bind { host = host.ws_bind(addr); }
-//! host.run().await?;   // binds transports, serves until SIGINT
+//! host.run().await?;   // binds transports, serves until SIGINT / SIGTERM
 //! ```
 //!
 //! The host owns the boilerplate every service used to hand-roll: binding
 //! each transport, requiring at least one active mount, iroh key
 //! persistence + ticket emission, and graceful shutdown.
+//!
+//! # Joining a cluster
+//!
+//! A service that needs *another* service declares a **contract** rather than
+//! an address ([`Service::consumes`]), and a host that is given a coordinator
+//! resolves it at startup:
+//!
+//! ```ignore
+//! host.coordinator(peerline_contract::coord::DEFAULT_SOCKET)
+//!     .run()
+//!     .await?;
+//! ```
+//!
+//! ```text
+//! Bind -> Register -> AwaitReady -> Service::bind(deps) -> Serve -> Ready
+//!             |
+//!   heartbeat starts here, concurrent with everything to its right
+//! ```
+//!
+//! Binding first is what makes the registration honest: an ephemeral ws port
+//! and an iroh ticket are not known until the socket exists. Serving only
+//! after [`Service::bind`] is what makes the dependency handles safe: no
+//! handler can run before its dependencies are in hand. And because `bind`
+//! and `accept` are separate syscalls, a client that dials during the
+//! resolving window queues in the kernel backlog instead of being refused.
+//!
+//! **The coordinator is opt-in.** A host that never calls
+//! [`Host::coordinator`] makes no outbound connection and never waits for
+//! anything — which is how the coordinator's own host avoids registering with
+//! itself. A service that declares `consumes` without one is a configuration
+//! error and fails at [`Host::run`] rather than hanging.
+//!
+//! # Reporting a manifest instead of serving
+//!
+//! With `PEERLINE_MANIFEST_OUT=/path/to.json` in the environment,
+//! [`Host::run`] writes what its services produce and consume to that path and
+//! exits 0 without binding anything. That is how a supervisor learns the
+//! contract graph: from the binary, which is the only thing that cannot drift
+//! from the code. See [`peerline_contract::manifest`].
 
 #![forbid(unsafe_code)]
 
@@ -43,13 +82,31 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use peerline::runtime::Peer;
-use tokio::sync::oneshot;
-use tracing::info;
+// Only the coordinator client builds these, and it is uds-only.
+#[cfg(feature = "uds")]
+use peerline_contract::coord::ServiceEntry;
+use peerline_contract::manifest::{MANIFEST_OUT_ENV, Manifest, ServiceManifest};
+use peerline_contract::{Consumed, Endpoints, HostId, Produced};
+use tracing::{info, warn};
+
+mod bindings;
+#[cfg(feature = "uds")]
+mod coordinator;
+mod hostid;
+
+pub use bindings::{Bindings, Connection};
+pub use hostid::host_id;
+// The two variables a supervisor injects into every child it spawns (§10.4).
+// Re-exported here because this is the crate a service already depends on:
+// `Host::coordinator_from_env` reads the first, and a service picking its
+// mount address is expected to honour the second.
+pub use peerline_contract::env::{COORD_SOCK_ENV, SERVICE_UDS_ENV};
 
 /// A transport's forever-running accept loop.
 type Serve = BoxFuture<'static, Result<(), String>>;
@@ -68,11 +125,27 @@ type IrohMount = (Vec<u8>, peerline_transport_iroh::Acceptor);
 // dependency on the transport crates. Each stays in its own crate because
 // what it screens on is specific to that transport (see [`Remote`]).
 #[cfg(feature = "iroh")]
-pub use peerline_transport_iroh::{EndpointId, IrohAccept, IrohPolicy};
+pub use peerline_transport_iroh::{EndpointId, IrohAccept, IrohPolicy, Reachability};
 #[cfg(feature = "uds")]
 pub use peerline_transport_uds::{UdsAccept, UdsPolicy};
 #[cfg(feature = "ws")]
 pub use peerline_transport_ws::{WsAccept, WsPolicy};
+
+/// How long a host waits for its required contracts before giving up.
+///
+/// There is deliberately no "wait forever": a cluster's characteristic failure
+/// is silence, and a deadline is what converts silence into a diagnosis naming
+/// the contracts that did not resolve.
+pub const DEFAULT_AWAIT_READY: Duration = Duration::from_secs(30);
+
+/// How long a host keeps re-resolving a dependency whose connection dropped
+/// before it exits.
+///
+/// Exiting on the first drop would turn a routine restart of a popular producer
+/// into a cluster-wide outage: its consumers exit, their consumers exit, and so
+/// on down the closure. A budget keeps the crash-only property — the exit path
+/// is real and regularly taken — while making an ordinary restart survivable.
+pub const DEFAULT_DEPENDENCY_BUDGET: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Acceptors — where a transport's authenticated facts become a `Remote`
@@ -130,16 +203,74 @@ fn iroh_acceptor(
     })
 }
 
-/// A composable peerline service: a name (for logging) plus the handler
-/// registrations that run on each freshly-connected peer.
+/// A composable peerline service: a name (for logging), what it produces and
+/// consumes, and the handler registrations that run on each freshly-connected
+/// peer.
 ///
 /// Migrating an existing service is mechanical: its old
 /// `register_handlers(peer, state)` body becomes [`Service::register`], and
-/// its state lives in the implementing struct.
+/// its state lives in the implementing struct. Every method but
+/// [`name`](Self::name) and [`register`](Self::register) has a default, so a
+/// service that takes no part in a cluster is unchanged.
 pub trait Service: Send + Sync + 'static {
     /// Stable name, used in logs. The wire address comes from [`Mount`],
     /// not from here.
     fn name(&self) -> &'static str;
+
+    /// The contracts this service implements.
+    ///
+    /// A contract is a *capability*, not an instance: several processes may
+    /// produce the same one, and a coordinator may hand any ready producer to
+    /// any consumer. Producers of one contract at one version must therefore be
+    /// interchangeable — see [`peerline_contract`].
+    fn produces(&self) -> Vec<Produced> {
+        Vec::new()
+    }
+
+    /// The contracts this service depends on.
+    ///
+    /// Declaring one makes a coordinator mandatory: the host waits for every
+    /// required contract to resolve before it serves anything, and a host with
+    /// no [`Host::coordinator`] fails at [`Host::run`] rather than hanging.
+    fn consumes(&self) -> Vec<Consumed> {
+        Vec::new()
+    }
+
+    /// Take delivery of the resolved dependencies.
+    ///
+    /// Called **once**, after every required contract resolved and before any
+    /// transport accepts, so a handler can never observe a dependency that is
+    /// not there yet. A reconnect to the coordinator deliberately does not call
+    /// it again — a second `OnceLock::set` would be a silent no-op.
+    ///
+    /// ```ignore
+    /// struct FsService { root: PathBuf, storage: OnceLock<Bindings> }
+    ///
+    /// impl Service for FsService {
+    ///     fn name(&self) -> &'static str { "fs" }
+    ///     fn produces(&self) -> Vec<Produced> { vec![Produced::new("fs", 1)] }
+    ///     fn consumes(&self) -> Vec<Consumed> { vec![Consumed::new("storage", 1)] }
+    ///     fn bind(&self, b: &Bindings) { let _ = self.storage.set(b.clone()); }
+    ///     fn register(&self, peer: &Peer) { /* handlers dial through self.storage */ }
+    /// }
+    /// ```
+    ///
+    /// Storing the whole [`Bindings`] rather than one [`Binding`] is the
+    /// better default: it is what re-dials after a producer restart pick up the
+    /// *re-resolved* coordinates.
+    ///
+    /// A service holding a long-lived connection spawns that from here (this
+    /// method is synchronous), and the loop has three steps rather than two:
+    /// dial, wait for [`Connection::closed`], then wait for
+    /// [`Bindings::refreshed`] before dialling again. The third is what stops
+    /// it racing the host's re-resolve and re-dialling the coordinates that
+    /// just died. If the dependency never comes back, the host exits when its
+    /// budget is spent and the task dies with the process.
+    ///
+    /// [`Binding`]: peerline_contract::Binding
+    fn bind(&self, bindings: &Bindings) {
+        let _ = bindings;
+    }
 
     /// Register this service's request / notification / stream handlers on
     /// a freshly-connected peer. Called once per connection.
@@ -277,25 +408,17 @@ impl Mount {
     }
 }
 
-/// Whether/where the host registers with a `peerline-manager`.
-#[derive(Default)]
-enum ReportMode {
-    /// Register with the default manager (`PEERLINE_MANAGER_SOCK` or the
-    /// canonical `/tmp/peerline-manager.sock`). The default.
-    #[default]
-    Auto,
-    /// Register with a specific manager socket.
-    To(PathBuf),
-    /// Don't register at all.
-    Off,
-}
-
-/// The default manager socket a host reports to — the same
-/// `PEERLINE_MANAGER_SOCK` (+ default) the manager itself binds.
-fn default_manager_sock() -> PathBuf {
-    std::env::var_os("PEERLINE_MANAGER_SOCK")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/peerline-manager.sock"))
+/// One mounted service, resolved out of the builder for the run.
+struct Prepared {
+    name: &'static str,
+    /// Read once per transport; with every transport compiled out there is
+    /// nothing left to read it.
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "uds", feature = "iroh")),
+        allow(dead_code)
+    )]
+    mount: Mount,
+    svc: Arc<dyn Service>,
 }
 
 /// Builder for a unified multi-service peerline host.
@@ -306,7 +429,12 @@ pub struct Host {
     iroh_key: Option<Option<PathBuf>>,
     iroh_relays: Vec<String>,
     iroh_port: Option<u16>,
-    report: ReportMode,
+    #[cfg(feature = "iroh")]
+    iroh_reachability: peerline_transport_iroh::Reachability,
+    coordinator: Option<PathBuf>,
+    instance: Option<String>,
+    await_timeout: Option<Duration>,
+    dependency_budget: Option<Duration>,
 }
 
 impl Host {
@@ -362,154 +490,195 @@ impl Host {
         self
     }
 
-    /// Register this host's services + dial coordinates with a
-    /// `peerline-manager` at a **specific** socket, overriding the default.
+    /// How far the shared iroh endpoint's ticket has to reach.
     ///
-    /// By default a host already reports to the default manager
-    /// (`PEERLINE_MANAGER_SOCK` or `/tmp/peerline-manager.sock`); call this
-    /// only to target a different one, or [`Host::no_report`] to opt out.
+    /// Defaults to [`Reachability::Global`]: the bind waits for a relay and
+    /// **fails** without one, because a ticket is an address handed to
+    /// someone and one that silently works only on-LAN fails confusingly at
+    /// the far end instead of loudly here.
     ///
-    /// Once every transport binds (including the iroh ticket, if any), the
-    /// host registers and heartbeats, holding the connection for the process
-    /// lifetime; the manager expires it on TTL after it exits. Harmless if no
-    /// manager is running (it retries). Requires the `uds` feature.
+    /// [`Reachability::LocalOnly`] is the opt-out for a deployment that is
+    /// one machine, or one LAN, with no route out: the endpoint publishes a
+    /// direct-address ticket immediately and never waits on a relay. The
+    /// coordinates it registers are then dialable from this machine or LAN
+    /// and nowhere else — see [`Reachability`] for exactly what such a
+    /// ticket does and does not promise. Only takes effect with an
+    /// [`Host::iroh_endpoint`].
+    #[cfg(feature = "iroh")]
     #[must_use]
-    pub fn report_to(mut self, manager_sock: impl Into<PathBuf>) -> Self {
-        self.report = ReportMode::To(manager_sock.into());
+    pub fn iroh_reachability(mut self, reachability: Reachability) -> Self {
+        self.iroh_reachability = reachability;
         self
     }
 
-    /// Opt out of registering with a manager. By default a host reports to
-    /// the default manager socket; use this for standalone services (or
-    /// tests) that shouldn't touch a manager.
+    /// Join the cluster coordinated at `socket`: register this host's
+    /// coordinates, heartbeat, wait for its consumed contracts to resolve, and
+    /// announce readiness once it is serving.
+    ///
+    /// **Opt-in, deliberately.** Without this call a host makes no outbound
+    /// connection at all and never blocks on anything, which is what lets the
+    /// coordinator's own host — and a supervisor's control service — bind and
+    /// serve without registering with themselves. A host whose services declare
+    /// [`Service::consumes`] but which never calls this fails at
+    /// [`Host::run`], because the alternative is a service that hangs forever
+    /// waiting for a resolution that cannot arrive.
+    ///
+    /// `peerline_contract::coord::DEFAULT_SOCKET` is the conventional path.
+    /// Requires the `uds` feature: a coordinator is uds-only.
     #[must_use]
-    pub fn no_report(mut self) -> Self {
-        self.report = ReportMode::Off;
+    pub fn coordinator(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.coordinator = Some(socket.into());
         self
     }
 
-    /// Bind every configured transport and serve until Ctrl-C (SIGINT). See
-    /// [`Host::run_until`] to supply a custom shutdown signal.
+    /// Join the coordinator named by [`COORD_SOCK_ENV`], if it is set.
+    ///
+    /// **This is the injection contract, stated (§10.4).** Nothing in a
+    /// cluster config reaches a child unless the supervisor puts it there: the
+    /// file declares the coordinator's socket and each service's `uds`, and a
+    /// child process cannot see either. The supervisor therefore exports
+    /// `PEERLINE_COORD_SOCK` (and [`SERVICE_UDS_ENV`]) into every child it
+    /// spawns, and this is the half a service links against — without it, a
+    /// service keeps reading a coordinator address out of its own config and
+    /// the cluster file's addresses are decorative.
+    ///
+    /// Unset leaves the host exactly as it was, which is the point: the same
+    /// binary run by hand, with no supervisor and no variable, makes no
+    /// outbound connection and does not wait for anybody (§10.7). A service
+    /// that consumes contracts and is started without the variable still fails
+    /// loudly at [`Host::run`] rather than hanging.
+    ///
+    /// An empty value is treated as unset — an exported-but-blank variable is
+    /// a supervisor or shell artefact, never a request to dial `""`.
+    #[must_use]
+    pub fn coordinator_from_env(self) -> Self {
+        match peerline_contract::env::var(COORD_SOCK_ENV) {
+            Some(v) => self.coordinator(PathBuf::from(v)),
+            None => self,
+        }
+    }
+
+    /// Override the instance id this host registers under.
+    ///
+    /// The default is derived from the mounted service names and their
+    /// configured addresses, which is stable across restarts of either side —
+    /// so one service keeps one identity in logs, in a dashboard and in a CLI.
+    /// Set it explicitly when two hosts would otherwise derive the same id, or
+    /// when an operator wants to choose the name.
+    #[must_use]
+    pub fn instance(mut self, id: impl Into<String>) -> Self {
+        self.instance = Some(id.into());
+        self
+    }
+
+    /// How long to wait for required contracts before failing the run.
+    /// Defaults to [`DEFAULT_AWAIT_READY`].
+    #[must_use]
+    pub fn await_ready_timeout(mut self, timeout: Duration) -> Self {
+        self.await_timeout = Some(timeout);
+        self
+    }
+
+    /// How long to keep re-resolving a dependency whose connection dropped
+    /// before exiting. Defaults to [`DEFAULT_DEPENDENCY_BUDGET`].
+    #[must_use]
+    pub fn dependency_budget(mut self, budget: Duration) -> Self {
+        self.dependency_budget = Some(budget);
+        self
+    }
+
+    /// What this host would report if probed: every mounted service and the
+    /// contracts it declares. See [`peerline_contract::manifest`].
+    pub fn manifest(&self) -> Manifest {
+        Manifest {
+            services: self
+                .services
+                .iter()
+                .map(|(svc, _)| ServiceManifest {
+                    service: svc.name().to_string(),
+                    produces: svc.produces(),
+                    consumes: svc.consumes(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Bind every configured transport and serve until a **termination
+    /// signal** — `SIGINT` (Ctrl-C) or, on unix, `SIGTERM`. See
+    /// [`Host::run_until`] to supply a shutdown future of your own.
+    ///
+    /// `SIGTERM` is not a nicety. A supervisor stops its children with it
+    /// (§9, §10.5), and its default disposition kills the process outright —
+    /// so a host that waited only on `ctrl_c()` never reached its own shutdown
+    /// path under a supervisor, and the graceful path was exercised solely by
+    /// a human pressing Ctrl-C. Both signals resolve the same future and
+    /// [`Host::run`] returns `Ok(())`: a clean stop, distinct from the
+    /// non-zero "restart me" of an error.
     pub async fn run(self) -> Result<(), String> {
-        self.run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        self.run_until(terminate()).await
     }
 
     /// Bind every configured transport and serve until `shutdown` resolves
-    /// or a transport fails.
+    /// or the run fails.
     ///
     /// Errors if no service is registered, no mount is active on any
-    /// configured transport, or two services collide on one address.
+    /// configured transport, two services collide on one address, a service
+    /// consumes a contract with no [`Host::coordinator`] configured, the
+    /// required contracts never resolve, or a dependency stays gone past the
+    /// [`dependency budget`](Host::dependency_budget). An error is the "restart
+    /// me" signal: map it to a non-zero exit, which is what distinguishes it
+    /// from the clean `Ok(())` of a shutdown signal.
+    ///
+    /// With `PEERLINE_MANIFEST_OUT` set it binds nothing, writes the manifest
+    /// to that path and returns `Ok(())`.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> Result<(), String> {
         if self.services.is_empty() {
             return Err("peerline-host: no services registered".into());
         }
 
+        // The probe (§10.3): report and exit, before anything is bound and
+        // before any coordinate is claimed.
+        // Through the shared helper, so that an exported-but-blank
+        // `PEERLINE_MANIFEST_OUT` is *unset* — the rule `peerline-contract`
+        // states for every one of these variables. `var_os` alone made a blank
+        // value a request to write the manifest to `""`, which fails, and
+        // fails before anything binds: one stray `export` and every host in
+        // the cluster refuses to start.
+        if let Some(out) = peerline_contract::env::var(MANIFEST_OUT_ENV) {
+            return write_manifest(&self.manifest(), Path::new(&out));
+        }
+
         // The service itself, not a pre-boxed initializer: each transport
         // builds its own acceptor, because the initializer now closes over
         // the identity that transport authenticated.
-        let prepared: Vec<(&'static str, Mount, Arc<dyn Service>)> = self
+        let prepared: Vec<Prepared> = self
             .services
             .iter()
-            .map(|(svc, mount)| (svc.name(), mount.clone(), svc.clone()))
+            .map(|(svc, mount)| Prepared {
+                name: svc.name(),
+                mount: mount.clone(),
+                svc: svc.clone(),
+            })
             .collect();
 
-        // With every transport feature off nothing can be mounted, so this
-        // stays empty and `run` fails on "no mount is active".
-        #[cfg_attr(
-            not(any(feature = "ws", feature = "uds", feature = "iroh")),
-            allow(unused_mut)
-        )]
-        let mut serves: Vec<Serve> = Vec::new();
-        // Receives the iroh ticket once the endpoint binds, so the manager
-        // report can include it. Only wired when we're going to report.
-        #[cfg(feature = "iroh")]
-        let will_report = !matches!(self.report, ReportMode::Off);
-        #[cfg_attr(not(feature = "iroh"), allow(unused_mut))]
-        let mut ticket_rx: Option<oneshot::Receiver<String>> = None;
-
-        // WebSocket — paths on the shared port. Gated: without the
-        // feature `Mount::ws` does not exist, so nothing can be mounted
-        // here and the whole block is dead.
-        #[cfg(feature = "ws")]
-        if let Some(addr) = self.ws_bind {
-            let mut mounts: Vec<WsMount> = Vec::new();
-            for (name, mount, svc) in &prepared {
-                if let Some((path, policy)) = &mount.ws {
-                    // Explicit dial coordinates so a caller sees how to reach us.
-                    info!(service = name, url = %format!("ws://{addr}{path}"),
-                          "peerline-host: reachable (ws)");
-                    mounts.push((path.clone(), ws_acceptor(svc.clone(), policy.clone())));
-                }
-            }
-            reject_dupes("ws path", mounts.iter().map(|(p, _)| p.clone()))?;
-            if !mounts.is_empty() {
-                serves.push(ws_serve(addr, mounts)?);
-            }
-        }
-
-        // Unix sockets — one file per service.
-        #[cfg(feature = "uds")]
+        // A dependency with nowhere to resolve it is a configuration error, and
+        // it must be *loud*: the alternative is a service that binds, never
+        // becomes ready, and never says why.
+        if self.coordinator.is_none()
+            && let Some(p) = prepared.iter().find(|p| !p.svc.consumes().is_empty())
         {
-            let mut mounts: Vec<UdsMount> = Vec::new();
-            for (name, mount, svc) in &prepared {
-                if let Some((path, policy)) = &mount.uds {
-                    if let Some(dir) = path.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| {
-                            format!("peerline-host: uds dir {}: {e}", dir.display())
-                        })?;
-                    }
-                    info!(service = name, socket = %path.display(),
-                          "peerline-host: reachable (uds)");
-                    mounts.push((path.clone(), uds_acceptor(svc.clone(), policy.clone())));
-                }
-            }
-            reject_dupes(
-                "uds socket",
-                mounts.iter().map(|(p, _)| p.display().to_string()),
-            )?;
-            if !mounts.is_empty() {
-                serves.push(uds_serve(mounts)?);
-            }
+            return Err(format!(
+                "peerline-host: `{}` consumes contracts but no coordinator is \
+                 configured — call Host::coordinator(socket)",
+                p.name
+            ));
         }
 
-        // iroh — ALPNs on the shared endpoint. The ticket isn't known until
-        // the endpoint binds, so per-service dial info is printed from the
-        // bind callback (see `iroh_serve`); collect (name, alpn) for it.
-        #[cfg(feature = "iroh")]
-        if let Some(key_path) = &self.iroh_key {
-            let mut mounts: Vec<IrohMount> = Vec::new();
-            let mut dials: Vec<(String, String)> = Vec::new();
-            for (name, mount, svc) in &prepared {
-                if let Some((alpn, policy)) = &mount.iroh {
-                    dials.push((name.to_string(), String::from_utf8_lossy(alpn).into_owned()));
-                    mounts.push((alpn.clone(), iroh_acceptor(svc.clone(), policy.clone())));
-                }
-            }
-            reject_dupes("iroh alpn", mounts.iter().map(|(a, _)| a.clone()))?;
-            if !mounts.is_empty() {
-                // When reporting, capture the ticket (async, known at bind).
-                let ticket_tx = if will_report {
-                    let (tx, rx) = oneshot::channel();
-                    ticket_rx = Some(rx);
-                    Some(tx)
-                } else {
-                    None
-                };
-                serves.push(iroh_serve(
-                    key_path.clone(),
-                    self.iroh_relays.clone(),
-                    self.iroh_port,
-                    mounts,
-                    dials,
-                    ticket_tx,
-                )?);
-            }
-        }
-
-        if serves.is_empty() {
+        // Everything that can be decided without touching the network is
+        // decided here, so a bad key, a bad relay URL or two services sharing
+        // an address fails the run rather than racing the shutdown signal.
+        let plan = self.plan(&prepared)?;
+        if plan.is_empty() {
             return Err(
                 "peerline-host: no active mounts (configure ws_bind / iroh_endpoint \
                         and give each service a Mount)"
@@ -517,301 +686,544 @@ impl Host {
             );
         }
 
-        // Register with a manager unless opted out. Default: the canonical
-        // manager socket. The report loop is driven inside the `select!`
-        // below (never resolving), so it — and thus the manager connection
-        // that keeps us registered — is dropped when the host shuts down,
-        // which deregisters us.
-        let report_sock = match &self.report {
-            ReportMode::Off => None,
-            ReportMode::To(path) => Some(path.clone()),
-            ReportMode::Auto => Some(default_manager_sock()),
-        };
-        #[cfg(not(feature = "uds"))]
-        if matches!(self.report, ReportMode::To(_)) {
-            info!("peerline-host: report_to needs the `uds` feature; not registering");
-        }
-        let report = build_report_future(
-            report_sock,
-            &prepared,
-            self.ws_bind,
-            self.iroh_key.is_some(),
-            ticket_rx,
-        )?;
+        info!(services = self.services.len(), "peerline-host starting");
 
-        info!(
-            services = self.services.len(),
-            transports = serves.len(),
-            "peerline-host starting"
-        );
-
-        // Run every transport until one errors or shutdown fires. Dropping
-        // the serve futures (and the report loop) on shutdown tears the
-        // listeners and the manager registration down.
+        // Shutdown wins over everything to its right, including a bind that has
+        // not finished: an iroh endpoint takes seconds to bind and may fail,
+        // and a host asked to stop must not first wait that out.
+        tokio::pin!(shutdown);
         tokio::select! {
-            r = futures::future::try_join_all(serves) => r.map(|_| ()),
-            _ = report => Ok(()), // never resolves; here only to be driven
-            _ = shutdown => {
+            biased;
+            () = &mut shutdown => {
                 info!("peerline-host: shutdown signal received, stopping");
                 Ok(())
             }
+            r = self.lifecycle(&prepared, plan) => r,
         }
     }
-}
 
-// Transport dispatch, gated by feature. Each `*_serve` returns the accept
-// loop when the feature is on, or an error when a mount targets a transport
-// the binary wasn't built with — the public API is identical either way.
+    /// Everything from `Bind` rightwards. Returns only on failure, or when
+    /// every transport's accept loop has ended.
+    async fn lifecycle(&self, prepared: &[Prepared], plan: Plan) -> Result<(), String> {
+        let host = hostid::host_id().clone();
+        let listening = bind_all(plan).await?;
+        let endpoints = self.endpoints(prepared, &listening, &host);
+        let serves = listening.into_serves();
 
-#[cfg(feature = "ws")]
-fn ws_serve(
-    addr: SocketAddr,
-    mounts: Vec<(String, peerline_transport_ws::Acceptor)>,
-) -> Result<Serve, String> {
-    Ok(Box::pin(peerline_transport_ws::serve_mounted(addr, mounts)))
-}
-
-#[cfg(feature = "uds")]
-fn uds_serve(mounts: Vec<UdsMount>) -> Result<Serve, String> {
-    Ok(Box::pin(peerline_transport_uds::serve_mounted(mounts)))
-}
-
-#[cfg(feature = "iroh")]
-fn iroh_serve(
-    key_path: Option<PathBuf>,
-    relays: Vec<String>,
-    port: Option<u16>,
-    mounts: Vec<IrohMount>,
-    dials: Vec<(String, String)>,
-    ticket_tx: Option<oneshot::Sender<String>>,
-) -> Result<Serve, String> {
-    let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
-        .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
-    let mut config = peerline_transport_iroh::IrohConfig::from_relay_urls(relays)
-        .map_err(|e| format!("peerline-host: iroh relay: {e}"))?;
-    config.bind_port = port;
-    let serve = peerline_transport_iroh::serve_mounted(
-        key,
-        config,
-        // The one ticket addresses the shared endpoint; each service is
-        // reached by dialing it with that service's ALPN. Print both, and
-        // hand the ticket to the manager report if one is waiting.
-        move |ticket| {
-            for (name, alpn) in &dials {
-                info!(service = %name, ticket, alpn = %alpn,
-                      "peerline-host: reachable (iroh — dial ticket with this alpn)");
+        match &self.coordinator {
+            None => {
+                // No coordinator: `Bind -> Serve`, and nothing else. `bind` is
+                // still called, with an empty set, so a service can rely on it
+                // having run exactly once before any handler does.
+                let (bindings, _lost) = Bindings::new(host, Vec::new());
+                for p in prepared {
+                    p.svc.bind(&bindings);
+                }
+                futures::future::try_join_all(serves).await.map(|_| ())
             }
-            if let Some(tx) = ticket_tx {
-                let _ = tx.send(ticket.to_string());
+            Some(socket) => {
+                self.with_coordinator(prepared, endpoints, serves, host, socket.clone())
+                    .await
             }
-        },
-        mounts,
-    );
-    // iroh is best-effort: an endpoint that never becomes remotely reachable
-    // (no relay) fails ONLY the iroh transport, not the whole host — the other
-    // transports keep serving. Log the failure, then park so this slot never
-    // resolves and completes `try_join_all` (which would tear the rest down).
-    // Dropping the serve future here also drops `ticket_tx`, so the manager
-    // report proceeds without an iroh ticket instead of blocking on it.
-    Ok(Box::pin(async move {
-        if let Err(e) = serve.await {
-            tracing::error!(error = %e, "peerline-host: iroh transport failed; \
-                                         continuing without it");
         }
-        std::future::pending::<()>().await;
-        Ok(())
-    }))
-}
+    }
 
-// --- manager auto-registration (`report_to`) -------------------------------
+    #[cfg(feature = "uds")]
+    async fn with_coordinator(
+        &self,
+        prepared: &[Prepared],
+        endpoints: Vec<Endpoints>,
+        serves: Vec<Serve>,
+        host: HostId,
+        socket: PathBuf,
+    ) -> Result<(), String> {
+        use coordinator::CoordCtx;
 
-/// Build this host's endpoint report from its mounts and return the
-/// registration loop future. Gated on `uds` (the manager is dialed over uds).
-#[cfg(feature = "uds")]
-fn build_report(
-    manager_sock: PathBuf,
-    prepared: &[(&'static str, Mount, Arc<dyn Service>)],
-    ws_bind: Option<SocketAddr>,
-    iroh_enabled: bool,
-    ticket_rx: Option<oneshot::Receiver<String>>,
-) -> Result<BoxFuture<'static, ()>, String> {
-    use peerline_manager_protocol::Endpoints;
+        let entries: Vec<ServiceEntry> = prepared
+            .iter()
+            .zip(endpoints)
+            .map(|(p, endpoints)| ServiceEntry {
+                service: p.name.to_string(),
+                endpoints,
+                produces: p.svc.produces(),
+                consumes: p.svc.consumes(),
+            })
+            .collect();
+        let awaits = entries.iter().any(|e| !e.consumes.is_empty());
+        let ctx = Arc::new(CoordCtx {
+            socket: socket.clone(),
+            instance: self.instance_id(prepared),
+            pid: std::process::id(),
+            entries,
+            awaits,
+            await_timeout: self.await_timeout.unwrap_or(DEFAULT_AWAIT_READY),
+        });
 
-    // Each of these feeds exactly one transport's arm below, so with that
-    // transport compiled out it has no reader.
-    #[cfg(not(feature = "ws"))]
-    let _ = ws_bind;
-    #[cfg(not(feature = "iroh"))]
-    let _ = iroh_enabled;
+        let (bindings_tx, bindings_rx) = tokio::sync::oneshot::channel();
+        let (serving_tx, serving_rx) = tokio::sync::watch::channel(false);
+        // The client is a future rather than a task so that dropping this host
+        // — a shutdown signal — drops the coordinator connection and stops the
+        // heartbeat with it. The coordinator has no deregistration op: an
+        // instance leaves the registry by falling silent, and its TTL is what
+        // notices.
+        let client = coordinator::client(ctx.clone(), bindings_tx, serving_rx);
+        tokio::pin!(client);
 
-    let mut endpoints: std::collections::BTreeMap<String, Endpoints> =
-        std::collections::BTreeMap::new();
-    #[cfg_attr(not(feature = "iroh"), allow(unused_mut))]
-    let mut iroh_dials: Vec<(String, String)> = Vec::new();
-    for (name, mount, _) in prepared {
-        let e = endpoints.entry(name.to_string()).or_default();
+        // Register + AwaitReady, with the heartbeat already running beside them
+        // inside the client.
+        let resolved = tokio::select! {
+            e = &mut client => return Err(e),
+            b = bindings_rx => b.map_err(|_| {
+                "peerline-host: coordinator client stopped before resolving".to_string()
+            })?,
+        };
+
+        let (bindings, lost) = Bindings::new(host, resolved);
+        for p in prepared {
+            p.svc.bind(&bindings);
+        }
+
+        let watchdog = coordinator::watch_dependencies(
+            lost,
+            bindings.clone(),
+            socket,
+            ctx.instance.clone(),
+            self.dependency_budget.unwrap_or(DEFAULT_DEPENDENCY_BUDGET),
+        );
+
+        // Serving starts now; readiness is announced by the client as soon as
+        // it sees this. The listeners have been open since `Bind`, so anything
+        // that dialled during the resolving window is already queued.
+        let _ = serving_tx.send(true);
+
+        tokio::select! {
+            r = futures::future::try_join_all(serves) => r.map(|_| ()),
+            e = &mut client => Err(e),
+            e = watchdog => Err(e),
+        }
+    }
+
+    #[cfg(not(feature = "uds"))]
+    async fn with_coordinator(
+        &self,
+        _prepared: &[Prepared],
+        _endpoints: Vec<Endpoints>,
+        _serves: Vec<Serve>,
+        _host: HostId,
+        _socket: PathBuf,
+    ) -> Result<(), String> {
+        Err(
+            "peerline-host: Host::coordinator needs the `uds` feature (a coordinator \
+             is uds-only)"
+                .into(),
+        )
+    }
+
+    /// Assemble every transport's mount table. Sync: nothing here touches the
+    /// network, and everything here is a configuration error if it fails.
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "uds", feature = "iroh")),
+        allow(unused_variables, unused_mut)
+    )]
+    fn plan(&self, prepared: &[Prepared]) -> Result<Plan, String> {
+        let mut plan = Plan::default();
+
         #[cfg(feature = "ws")]
-        if let (Some(addr), Some((path, _))) = (ws_bind, &mount.ws) {
-            e.ws.push(format!("ws://{addr}{path}"));
+        if let Some(addr) = self.ws_bind {
+            let mut mounts: Vec<WsMount> = Vec::new();
+            for p in prepared {
+                if let Some((path, policy)) = &p.mount.ws {
+                    mounts.push((path.clone(), ws_acceptor(p.svc.clone(), policy.clone())));
+                }
+            }
+            reject_dupes("ws path", mounts.iter().map(|(p, _)| p.clone()))?;
+            if !mounts.is_empty() {
+                plan.ws = Some((addr, mounts));
+            }
         }
+
         #[cfg(feature = "uds")]
-        if let Some((path, _)) = &mount.uds {
-            e.uds.push(path.display().to_string());
+        {
+            let mut mounts: Vec<UdsMount> = Vec::new();
+            for p in prepared {
+                if let Some((path, policy)) = &p.mount.uds {
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir).map_err(|e| {
+                            format!("peerline-host: uds dir {}: {e}", dir.display())
+                        })?;
+                    }
+                    mounts.push((path.clone(), uds_acceptor(p.svc.clone(), policy.clone())));
+                }
+            }
+            reject_dupes(
+                "uds socket",
+                mounts.iter().map(|(p, _)| p.display().to_string()),
+            )?;
+            plan.uds = mounts;
         }
+
         #[cfg(feature = "iroh")]
-        if iroh_enabled && let Some((alpn, _)) = &mount.iroh {
-            iroh_dials.push((name.to_string(), String::from_utf8_lossy(alpn).into_owned()));
+        if let Some(key_path) = &self.iroh_key {
+            let mut mounts: Vec<IrohMount> = Vec::new();
+            for p in prepared {
+                if let Some((alpn, policy)) = &p.mount.iroh {
+                    mounts.push((alpn.clone(), iroh_acceptor(p.svc.clone(), policy.clone())));
+                }
+            }
+            reject_dupes("iroh alpn", mounts.iter().map(|(a, _)| a.clone()))?;
+            if !mounts.is_empty() {
+                // The identity is resolved here, not at bind: serving under a
+                // silently different key would invalidate every ticket ever
+                // handed out, so a broken key file must fail the run.
+                let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
+                    .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
+                let mut config =
+                    peerline_transport_iroh::IrohConfig::from_relay_urls(self.iroh_relays.clone())
+                        .map_err(|e| format!("peerline-host: iroh relay: {e}"))?;
+                config.bind_port = self.iroh_port;
+                config.reachability = self.iroh_reachability;
+                plan.iroh = Some(IrohPlan {
+                    key,
+                    config,
+                    mounts,
+                });
+            }
         }
+
+        Ok(plan)
     }
 
-    let host = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "peerline-host".into());
+    /// This host's dial coordinates, per mounted service — built from what
+    /// actually bound, which is the whole reason `Bind` comes first.
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "uds", feature = "iroh")),
+        allow(unused_variables, unused_mut)
+    )]
+    fn endpoints(
+        &self,
+        prepared: &[Prepared],
+        listening: &Listening,
+        host: &HostId,
+    ) -> Vec<Endpoints> {
+        let mut out: Vec<Endpoints> = prepared
+            .iter()
+            .map(|_| Endpoints::new(host.clone()))
+            .collect();
 
-    Ok(Box::pin(report_loop(
-        manager_sock,
-        host,
-        std::process::id(),
-        endpoints,
-        iroh_dials,
-        ticket_rx,
-    )))
-}
-
-/// Resolve the report target: `Some` ⇒ the registration loop, `None` ⇒ a
-/// no-op. Split on `uds` (the manager is dialed over uds); without it,
-/// reporting is a no-op.
-#[cfg(feature = "uds")]
-fn build_report_future(
-    report_sock: Option<PathBuf>,
-    prepared: &[(&'static str, Mount, Arc<dyn Service>)],
-    ws_bind: Option<SocketAddr>,
-    iroh_enabled: bool,
-    ticket_rx: Option<oneshot::Receiver<String>>,
-) -> Result<BoxFuture<'static, ()>, String> {
-    match report_sock {
-        Some(sock) => build_report(sock, prepared, ws_bind, iroh_enabled, ticket_rx),
-        None => Ok(Box::pin(std::future::pending())),
-    }
-}
-
-#[cfg(not(feature = "uds"))]
-fn build_report_future(
-    _report_sock: Option<PathBuf>,
-    _prepared: &[(&'static str, Mount, Arc<dyn Service>)],
-    _ws_bind: Option<SocketAddr>,
-    _iroh_enabled: bool,
-    _ticket_rx: Option<oneshot::Receiver<String>>,
-) -> Result<BoxFuture<'static, ()>, String> {
-    Ok(Box::pin(std::future::pending()))
-}
-
-/// Fill in the iroh ticket (once bound), then keep the host registered with
-/// the manager for as long as the process lives, reconnecting on failure.
-#[cfg(feature = "uds")]
-async fn report_loop(
-    manager_sock: PathBuf,
-    host: String,
-    pid: u32,
-    mut endpoints: std::collections::BTreeMap<String, peerline_manager_protocol::Endpoints>,
-    iroh_dials: Vec<(String, String)>,
-    ticket_rx: Option<oneshot::Receiver<String>>,
-) {
-    use peerline_manager_protocol::{IrohDial, Registration, ServiceEntry};
-
-    // The iroh ticket isn't known until the endpoint binds.
-    if let Some(rx) = ticket_rx
-        && let Ok(ticket) = rx.await
-    {
-        for (name, alpn) in iroh_dials {
-            endpoints.entry(name).or_default().iroh.push(IrohDial {
-                ticket: ticket.clone(),
-                alpn,
-            });
-        }
-    }
-
-    let services: Vec<ServiceEntry> = endpoints
-        .into_iter()
-        .map(|(service, endpoints)| ServiceEntry { service, endpoints })
-        .collect();
-    let registration = Registration {
-        host,
-        pid,
-        services,
-    };
-
-    loop {
-        if let Err(e) = report_once(&manager_sock, &registration).await {
-            tracing::debug!(error = %e, manager = %manager_sock.display(),
-                            "peerline-host: manager report failed; will retry");
-        }
-        // The connection ended (or never opened) — back off and re-register.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-
-/// How often the host heartbeats the manager. Well under the manager's TTL.
-#[cfg(feature = "uds")]
-const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// One registration session: dial the manager, register, then heartbeat for
-/// as long as the connection lives. Returns when the connection ends (manager
-/// gone / restarted) so [`report_loop`] can reconnect. Dropping this future
-/// (host shutdown) drops the connection; the manager then expires us on TTL.
-#[cfg(feature = "uds")]
-async fn report_once(
-    manager_sock: &std::path::Path,
-    registration: &peerline_manager_protocol::Registration,
-) -> Result<(), String> {
-    use peerline_manager_protocol::{Heartbeat, METHOD_HEARTBEAT, METHOD_REGISTER, RegisterAck};
-
-    // Connect, retrying briefly (~1s) so a socket that's about to appear — a
-    // service racing the manager at startup, or our own on self-registration
-    // — is picked up promptly instead of after a full backoff.
-    let (peer, driver) = 'connect: {
-        let mut last = String::new();
-        for _ in 0..20u32 {
-            match peerline_transport_uds::connect(manager_sock).await {
-                Ok(pair) => break 'connect pair,
-                Err(e) => {
-                    last = e;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        #[cfg(feature = "ws")]
+        if let Some(bound) = &listening.ws {
+            let addr = bound.addr();
+            for (i, p) in prepared.iter().enumerate() {
+                if let Some((path, _)) = &p.mount.ws {
+                    let url = format!("ws://{addr}{path}");
+                    info!(service = p.name, url = %url, "peerline-host: reachable (ws)");
+                    out[i].ws.push(url);
                 }
             }
         }
-        return Err(last);
-    };
 
-    let work = async {
-        let ack: RegisterAck = peer
-            .call(METHOD_REGISTER, registration)
-            .await
-            .map_err(|e| e.to_string())?;
-        info!(id = ack.id, manager = %manager_sock.display(),
-              "peerline-host: registered with manager");
-        loop {
-            tokio::time::sleep(HEARTBEAT).await;
-            // A failed enqueue means the peer is gone; the driver will also
-            // resolve, so either arm ends this session and triggers a retry.
-            if peer
-                .notify(METHOD_HEARTBEAT, &Heartbeat { id: ack.id })
-                .is_err()
-            {
-                break;
+        #[cfg(feature = "uds")]
+        if listening.uds.is_some() {
+            for (i, p) in prepared.iter().enumerate() {
+                if let Some((path, _)) = &p.mount.uds {
+                    info!(service = p.name, socket = %path.display(),
+                          "peerline-host: reachable (uds)");
+                    out[i].uds.push(path.display().to_string());
+                }
             }
         }
-        Ok::<(), String>(())
-    };
 
-    // Drive the connection and the register+heartbeat work together, both
-    // owned here — so host shutdown (dropping this future) closes the wire.
-    tokio::select! {
-        _ = driver => {}
-        r = work => r?,
+        #[cfg(feature = "iroh")]
+        if let Some(bound) = &listening.iroh {
+            let ticket = bound.ticket().to_string();
+            for (i, p) in prepared.iter().enumerate() {
+                if let Some((alpn, _)) = &p.mount.iroh {
+                    let alpn = String::from_utf8_lossy(alpn).into_owned();
+                    info!(service = p.name, ticket, alpn = %alpn,
+                          "peerline-host: reachable (iroh — dial ticket with this alpn)");
+                    out[i].iroh.push(peerline_contract::IrohDial {
+                        ticket: ticket.clone(),
+                        alpn,
+                    });
+                }
+            }
+        }
+
+        // A service whose every transport failed to bind is still registered —
+        // its `consumes` is part of what gates this host's readiness, and
+        // dropping the entry would silently drop that — but it is advertised
+        // with no coordinates, so nothing can bind to it by mistake. Say so:
+        // this is a service that is running and unreachable.
+        for (p, e) in prepared.iter().zip(&out) {
+            if e.ws.is_empty() && e.uds.is_empty() && e.iroh.is_empty() {
+                warn!(
+                    service = p.name,
+                    "peerline-host: no transport bound for this service; it is \
+                     registered but not reachable"
+                );
+            }
+        }
+
+        out
     }
+
+    /// A stable identity for this host: the services it mounts and the
+    /// addresses they were *configured* with.
+    ///
+    /// Configured rather than resolved, deliberately — an ephemeral ws port
+    /// changes every boot, and an id that changed with it would show one
+    /// service as a new instance after every restart, which is exactly what a
+    /// stable id exists to prevent.
+    #[cfg(feature = "uds")]
+    fn instance_id(&self, prepared: &[Prepared]) -> String {
+        if let Some(id) = &self.instance {
+            return id.clone();
+        }
+        let mut names: Vec<&str> = Vec::new();
+        let mut coords: Vec<String> = Vec::new();
+        for p in prepared {
+            names.push(p.name);
+            #[cfg(feature = "ws")]
+            if let Some((path, _)) = &p.mount.ws {
+                coords.push(format!("ws:{:?}{path}", self.ws_bind));
+            }
+            #[cfg(feature = "uds")]
+            if let Some((path, _)) = &p.mount.uds {
+                coords.push(format!("uds:{}", path.display()));
+            }
+            #[cfg(feature = "iroh")]
+            if let Some((alpn, _)) = &p.mount.iroh {
+                coords.push(format!("iroh:{}", String::from_utf8_lossy(alpn)));
+            }
+        }
+        coords.sort();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        names.hash(&mut hasher);
+        coords.hash(&mut hasher);
+        format!("{}-{:08x}", names.join("+"), hasher.finish() as u32)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bind
+// ---------------------------------------------------------------------------
+
+/// Every transport's mount table, assembled and ready to bind.
+#[derive(Default)]
+struct Plan {
+    #[cfg(feature = "ws")]
+    ws: Option<(SocketAddr, Vec<WsMount>)>,
+    #[cfg(feature = "uds")]
+    uds: Vec<UdsMount>,
+    #[cfg(feature = "iroh")]
+    iroh: Option<IrohPlan>,
+}
+
+#[cfg(feature = "iroh")]
+struct IrohPlan {
+    key: peerline_transport_iroh::SecretKey,
+    config: peerline_transport_iroh::IrohConfig,
+    mounts: Vec<IrohMount>,
+}
+
+impl Plan {
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "uds", feature = "iroh")),
+        allow(unused_mut)
+    )]
+    fn is_empty(&self) -> bool {
+        let mut empty = true;
+        #[cfg(feature = "ws")]
+        {
+            empty &= self.ws.is_none();
+        }
+        #[cfg(feature = "uds")]
+        {
+            empty &= self.uds.is_empty();
+        }
+        #[cfg(feature = "iroh")]
+        {
+            empty &= self.iroh.is_none();
+        }
+        empty
+    }
+}
+
+/// The listeners, bound and published but not yet accepting.
+#[derive(Default)]
+struct Listening {
+    #[cfg(feature = "ws")]
+    ws: Option<peerline_transport_ws::Bound>,
+    #[cfg(feature = "uds")]
+    uds: Option<peerline_transport_uds::Bound>,
+    #[cfg(feature = "iroh")]
+    iroh: Option<peerline_transport_iroh::Bound>,
+}
+
+impl Listening {
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "uds", feature = "iroh")),
+        allow(unused_mut)
+    )]
+    fn is_empty(&self) -> bool {
+        let mut empty = true;
+        #[cfg(feature = "ws")]
+        {
+            empty &= self.ws.is_none();
+        }
+        #[cfg(feature = "uds")]
+        {
+            empty &= self.uds.is_none();
+        }
+        #[cfg(feature = "iroh")]
+        {
+            empty &= self.iroh.is_none();
+        }
+        empty
+    }
+
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "uds", feature = "iroh")),
+        allow(unused_mut)
+    )]
+    fn into_serves(self) -> Vec<Serve> {
+        let mut serves: Vec<Serve> = Vec::new();
+        #[cfg(feature = "ws")]
+        if let Some(bound) = self.ws {
+            serves.push(Box::pin(bound.serve()));
+        }
+        #[cfg(feature = "uds")]
+        if let Some(bound) = self.uds {
+            serves.push(Box::pin(bound.serve()));
+        }
+        #[cfg(feature = "iroh")]
+        if let Some(bound) = self.iroh {
+            // The endpoint is bound and its ticket is already published, so an
+            // accept loop that dies later must not take the other transports
+            // with it. (A *bind* failure is different: it never becomes an
+            // advertised coordinate at all — see `bind_all`.)
+            serves.push(Box::pin(async move {
+                if let Err(e) = bound.serve().await {
+                    tracing::error!(error = %e, "peerline-host: iroh accept loop failed; \
+                                                 continuing without it");
+                }
+                std::future::pending::<()>().await;
+                Ok(())
+            }));
+        }
+        serves
+    }
+}
+
+/// Bind every planned transport.
+///
+/// **A transport that fails to bind is dropped**, and the host goes on with
+/// what did bind — so a ws+uds+iroh host on an offline machine still serves ws
+/// and uds. What it must never do is advertise a coordinate that does not work,
+/// which is why the endpoint report is built from this and not from the plan.
+/// If *nothing* bound there is nothing to serve, and that is the same failure
+/// as having configured no mounts at all.
+#[cfg_attr(
+    not(any(feature = "ws", feature = "uds", feature = "iroh")),
+    allow(unused_variables, unused_mut)
+)]
+async fn bind_all(plan: Plan) -> Result<Listening, String> {
+    let mut listening = Listening::default();
+    let mut failures: Vec<String> = Vec::new();
+
+    #[cfg(feature = "ws")]
+    if let Some((addr, mounts)) = plan.ws {
+        match peerline_transport_ws::bind_mounted(addr, mounts).await {
+            Ok(bound) => listening.ws = Some(bound),
+            Err(e) => failures.push(format!("ws {addr}: {e}")),
+        }
+    }
+
+    #[cfg(feature = "uds")]
+    if !plan.uds.is_empty() {
+        match peerline_transport_uds::bind_mounted(plan.uds).await {
+            Ok(bound) => listening.uds = Some(bound),
+            Err(e) => failures.push(format!("uds: {e}")),
+        }
+    }
+
+    #[cfg(feature = "iroh")]
+    if let Some(iroh) = plan.iroh {
+        // Under the default [`Reachability::Global`] this is seconds-scale
+        // and network-dependent: it waits for the endpoint to come online
+        // and then for a relay, and fails without one, because a ticket that
+        // cannot be dialed off-LAN is worse than an error. Under
+        // [`Host::iroh_reachability`]`(LocalOnly)` it is milliseconds and
+        // needs no network — the ticket is this machine's direct addresses.
+        match peerline_transport_iroh::bind_mounted(iroh.key, iroh.config, iroh.mounts).await {
+            Ok(bound) => listening.iroh = Some(bound),
+            Err(e) => failures.push(format!("iroh: {e}")),
+        }
+    }
+
+    if listening.is_empty() {
+        return Err(format!(
+            "peerline-host: no active mounts — every configured transport failed to \
+             bind ({})",
+            failures.join("; ")
+        ));
+    }
+    for failure in failures {
+        warn!(
+            transport = %failure,
+            "peerline-host: transport failed to bind; serving without it and not \
+             advertising it"
+        );
+    }
+    Ok(listening)
+}
+
+/// Write the probe's answer and exit — no binds, no coordinator, no
+/// coordinates. A file rather than stdout, which the service's own logging is
+/// already using by the time it reaches here.
+fn write_manifest(manifest: &Manifest, path: &Path) -> Result<(), String> {
+    let json = manifest
+        .to_json()
+        .map_err(|e| format!("peerline-host: cannot serialise manifest: {e}"))?;
+    std::fs::write(path, json)
+        .map_err(|e| format!("peerline-host: cannot write {}: {e}", path.display()))?;
+    info!(path = %path.display(), "peerline-host: wrote manifest and exiting");
     Ok(())
+}
+
+/// Resolve on `SIGINT` or, on unix, `SIGTERM` — whichever arrives first.
+///
+/// A supervisor sends `SIGTERM`; a terminal sends `SIGINT`. Both mean "stop",
+/// and the host's shutdown path is the same for either. Installing the
+/// `SIGTERM` handler is also what *disarms* its default disposition: without
+/// it the kernel terminates the process where it stands and none of the code
+/// below the signal ever runs.
+///
+/// A handler that cannot be installed is logged and dropped rather than
+/// failing the run: losing one of two signals is a degraded stop, and refusing
+/// to serve at all over it would be worse.
+async fn terminate() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "peerline-host: cannot listen for SIGTERM; SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Reject two services sharing one address on a transport — that would let

@@ -4,21 +4,31 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 The service layer for [peerline]: a composable `Service` trait, a
-multi-transport `Host` that mounts many services in one binary, and a live
-registry of what's running.
+multi-transport `Host`, and a live registry of what's running.
 
 The protocol itself — wire envelopes, the peer runtime and the WebSocket /
 Unix-socket / iroh transports — lives in the sibling [`peerline`][peerline]
-repository. The dependency arrow only points that way; nothing there depends
-on anything here.
+repository, and the cluster layer built on this one — the coordinator and the
+supervisor — lives in [`peerline-cluster`][peerline-cluster]. The dependency
+arrow only ever runs one way:
+
+```
+peerline-cluster → peerline-host → peerline
+```
 
 ## Crates
 
 | Crate | What it is |
 | --- | --- |
 | `peerline-host` | the `Service` trait and the `Host` builder |
-| `peerline-manager-protocol` | wire schema for the registry — pure JSON shapes, no transport, no runtime |
-| `peerline-manager` | the registry itself: a daemon, a web dashboard and the `peerline-mon` CLI |
+| `peerline-contract` | what a service produces and consumes, the `coord.*` wire and the probe envelope — pure JSON shapes, no transport, no runtime |
+
+`peerline-contract` lives here rather than with the coordinator that
+implements it, because `peerline-host` depends on it: `Host` is a coordinator
+client, and `Produced` / `Consumed` are on the `Service` trait. It is the
+vocabulary a host speaks in order to take part in a cluster, so it belongs
+with the host — and putting it in `peerline-cluster` would point an arrow back
+and make the two repositories circular.
 
 ## `Host`
 
@@ -35,7 +45,7 @@ let mut host = Host::new().mount(
         .uds(cfg.socket), // admits the same user (and root) by default
 );
 if let Some(addr) = cfg.ws_bind { host = host.ws_bind(addr); }
-host.run().await?;   // binds transports, serves until SIGINT
+host.run().await?;   // binds transports, serves until SIGINT / SIGTERM
 ```
 
 Each service is mounted at an address you configure, per transport, so a
@@ -76,42 +86,31 @@ mounted service exhibits is exactly the transport's, tested in the `peerline`
 repository. What is worth testing here is mount resolution — which path or
 socket reaches which service — and that is what `tests/host.rs` covers.
 
-## `peerline-manager`
+## Joining a cluster
 
-A live registry of the peerline services on a host, which is itself a peerline
-service. Hosts register their dial coordinates and heartbeat to stay live —
-anything not heard from within the TTL is expired lazily on the next query.
-Clients call `manager.list` / `manager.lookup` to discover who's up and how to
-reach them.
+A host is complete on its own: mount some services, serve them, done. It can
+also *take part in a cluster*, and the vocabulary for that is here even though
+the cluster itself is not.
 
-Heartbeat rather than a held-open stream because peerline drains in-flight
-handlers on connection close, so a parked handler cannot detect a hard crash.
+`Host::coordinator(path)` opts a host into a coordinator;
+`Host::coordinator_from_env()` takes the path from `PEERLINE_COORD_SOCK`,
+which is what a supervisor injects. A host that calls neither makes no
+outbound connection and waits for nobody — which is how the coordinator's own
+host avoids registering with itself. A host that does opt in registers what it
+produces and consumes, heartbeats against a TTL, and receives its
+dependencies' bindings as they resolve. The coordinator hands out coordinates
+and is never in the data path, so its death never interrupts established
+traffic.
 
-`Host::report_to` wires this up: a host auto-registers on start, with
-`Host::no_report` to opt out.
+When probed with `PEERLINE_MANIFEST_OUT` set, a `Host` writes what its
+services produce and consume to that path and exits, which is how a supervisor
+learns the dependency edges from the binaries rather than from a config file.
 
-```sh
-just install     # build, install binaries, load the launchd agent / systemd unit
-just status      # supervisor state, endpoints, log locations
-just logs        # tail
-just uninstall
-```
-
-The daemon is env-driven with canonical defaults — UDS socket, WS RPC on
-`127.0.0.1:6466`, dashboard on `http://127.0.0.1:6467/` — so nothing installs
-a config file. Set `PEERLINE_MANAGER_*` in the unit or plist to override:
-
-- `PEERLINE_MANAGER_SOCK=<path>` — Unix socket (default
-  `/tmp/peerline-manager.sock`).
-- `PEERLINE_MANAGER_WS=<addr:port>` — WebSocket RPC bind (default
-  `127.0.0.1:6466`; `off` to disable). Needed by browser clients.
-- `PEERLINE_MANAGER_UI=<addr:port>` — web dashboard bind (default
-  `127.0.0.1:6467`; `off` to disable). Connects back to the WS port.
-- `PEERLINE_MANAGER_ORIGINS=<url,url,…>` — browser origins admitted on the
-  RPC port, overriding the default (the loopback spellings of the dashboard
-  address). Required when the dashboard is exposed beyond loopback — set it
-  to the URL browsers will actually load it from, e.g.
-  `http://192.168.1.10:6467`.
+The other end of all of that — the coordinator daemon, `peerline-mon`, the
+dashboard, the cluster config and the supervisor — lives in
+[`peerline-cluster`][peerline-cluster], along with the host↔coordinator
+integration battery, which needs a real one of each and so belongs on the side
+of the arrow that can have both.
 
 ## Development
 
@@ -134,3 +133,4 @@ just fmt
 MIT.
 
 [peerline]: https://github.com/h-bar/peerline
+[peerline-cluster]: https://github.com/h-bar/peerline-cluster

@@ -2307,12 +2307,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerline-contract"
+version = "0.0.7"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "peerline-host"
 version = "0.0.7"
 dependencies = [
  "futures",
  "peerline",
- "peerline-manager-protocol",
+ "peerline-contract",
  "peerline-transport-iroh",
  "peerline-transport-uds",
  "peerline-transport-ws",
@@ -2320,30 +2328,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "peerline-manager"
-version = "0.0.7"
-dependencies = [
- "axum",
- "futures",
- "peerline",
- "peerline-host",
- "peerline-manager-protocol",
- "peerline-transport-uds",
- "peerline-transport-ws",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "peerline-manager-protocol"
-version = "0.0.7"
-dependencies = [
- "serde",
 ]
 
 [[package]]

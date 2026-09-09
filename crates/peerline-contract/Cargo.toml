@@ -1,0 +1,20 @@
+[package]
+name = "peerline-contract"
+description = "Contract types for the peerline cluster layer — what a service produces and consumes, and the binding a coordinator hands back: which producer was chosen and how to dial it. Pure JSON shapes, no transport, no runtime, so services, a coordinator, a CLI or a dashboard share one definition."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["rpc", "peer-to-peer", "service", "contract", "peerline"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# The manifest envelope is written by one process and read by another, so the
+# encoding is defined here once rather than spelled on each side.
+serde_json = "1"
+
+[dev-dependencies]
+# Only to assert the wire form: the field names are a cross-language contract.
+serde_json = "1"

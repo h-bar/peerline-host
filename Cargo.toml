@@ -1,14 +1,16 @@
-# The peerline service layer: a composable `Service` + multi-transport `Host`,
-# and a live registry (`peerline-manager`) that is itself a peerline service.
+# The peerline service layer: a composable `Service`, a multi-transport `Host`,
+# and the contract vocabulary a host speaks to take part in a cluster.
 #
 # The protocol itself — wire envelopes, the peer runtime and the WS / UDS /
-# iroh transports — lives in the `peerline` repository. The dependency arrow
-# only ever points that way; nothing here is depended on by peerline.
+# iroh transports — lives in the `peerline` repository, and the cluster layer
+# built on this one — the coordinator and the supervisor — lives in
+# `peerline-cluster`. The dependency arrow only ever runs
+# `peerline-cluster` → `peerline-host` → `peerline`; nothing here is depended
+# on by peerline, and nothing here depends on peerline-cluster.
 [workspace]
 members = [
+    "crates/peerline-contract",
     "crates/peerline-host",
-    "crates/peerline-manager-protocol",
-    "crates/peerline-manager",
 ]
 resolver = "2"
 
@@ -29,5 +31,5 @@ peerline-transport-ws = { path = "../peerline/crates/peerline-transport-ws", ver
 peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds", version = "0.0.7" }
 peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh", version = "0.0.7" }
 # Workspace members, same pattern.
+peerline-contract = { path = "crates/peerline-contract", version = "0.0.7" }
 peerline-host = { path = "crates/peerline-host", version = "0.0.7" }
-peerline-manager-protocol = { path = "crates/peerline-manager-protocol", version = "0.0.7" }

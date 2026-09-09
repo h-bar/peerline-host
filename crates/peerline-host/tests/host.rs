@@ -65,8 +65,7 @@ async fn host_mounts_two_services_by_path() {
             Echo { name: "beta" },
             Mount::new().ws("/beta", WsPolicy::allow_any()),
         )
-        .ws_bind(addr)
-        .no_report();
+        .ws_bind(addr);
     tokio::spawn(async move {
         let _ = host.run().await;
     });
@@ -177,7 +176,6 @@ async fn register_remote_varies_the_op_set_by_identity() {
     let host = tokio::spawn(async move {
         Host::new()
             .mount(Guarded, Mount::new().uds(&serve_sock))
-            .no_report()
             .run()
             .await
     });

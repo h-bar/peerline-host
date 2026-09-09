@@ -23,14 +23,26 @@ futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 peerline = { workspace = true }
-# Wire shapes for `Host::report_to` (auto-registration with a manager).
-peerline-manager-protocol = { workspace = true }
+# The cluster control path: what a service produces and consumes, the `coord.*`
+# wire it speaks to a coordinator, and the manifest envelope it writes when
+# probed. Types only — the coordinator's implementation is somewhere else.
+peerline-contract = { workspace = true }
 peerline-transport-ws = { workspace = true, optional = true }
 peerline-transport-uds = { workspace = true, optional = true }
 peerline-transport-iroh = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+# `process` is for the signal tests: `Host::run`'s SIGTERM handling and
+# `coordinator_from_env` are both properties of a real process, and the only
+# way to observe either is to spawn one, signal it and read its exit status.
+tokio = { version = "1", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+futures = "0.3"
 peerline-transport-ws = { workspace = true }
+# No dev-dependency on a coordinator. The end-to-end tests that needed a real
+# one — register, resolve, restart, the transport matrix, the signal battery —
+# live in `peerline-cluster`'s `peerline-coordinator` crate now, on the side of
+# the arrow that already depends on this one. What is left here is what a host
+# is on its own: mount resolution, shutdown, iroh key persistence, and the
+# manifest it writes when probed.
