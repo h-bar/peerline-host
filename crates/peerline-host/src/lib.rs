@@ -92,7 +92,8 @@ use peerline::runtime::Peer;
 #[cfg(feature = "uds")]
 use peerline_contract::coord::ServiceEntry;
 use peerline_contract::manifest::{MANIFEST_OUT_ENV, Manifest, ServiceManifest};
-use peerline_contract::{Consumed, Endpoints, HostId, Produced};
+// `Endpoints` and `HostId` are in scope through the re-export below.
+use peerline_contract::{Consumed, Produced};
 use tracing::{info, warn};
 
 mod bindings;
@@ -102,6 +103,12 @@ mod hostid;
 
 pub use bindings::{Bindings, Connection};
 pub use hostid::host_id;
+// The two types `Connection::dial` cannot be called without. Re-exported
+// because that entry point exists precisely for a caller who has *not* taken
+// part in contract resolution — and telling such a caller to add a second
+// crate to its manifest to name the arguments of the one function it wants
+// would put the tax back that the function was added to remove.
+pub use peerline_contract::{Endpoints, HostId};
 // The two variables a supervisor injects into every child it spawns (§10.4).
 // Re-exported here because this is the crate a service already depends on:
 // `Host::coordinator_from_env` reads the first, and a service picking its
@@ -715,7 +722,11 @@ impl Host {
                 // No coordinator: `Bind -> Serve`, and nothing else. `bind` is
                 // still called, with an empty set, so a service can rely on it
                 // having run exactly once before any handler does.
-                let (bindings, _lost) = Bindings::new(host, Vec::new());
+                //
+                // No declarations either, and that is exact rather than lazy:
+                // `run` has already refused any service that consumes anything
+                // when there is no coordinator to resolve it with.
+                let (bindings, _lost) = Bindings::new(host, &[], Vec::new());
                 for p in prepared {
                     p.svc.bind(&bindings);
                 }
@@ -778,7 +789,11 @@ impl Host {
             })?,
         };
 
-        let (bindings, lost) = Bindings::new(host, resolved);
+        // The declarations as well as the bindings: a contract's optionality
+        // is a property of what was *asked for*, and the watchdog below needs
+        // it to know whether a spent budget is an exit or a degradation.
+        let consumed: Vec<Consumed> = prepared.iter().flat_map(|p| p.svc.consumes()).collect();
+        let (bindings, lost) = Bindings::new(host, &consumed, resolved);
         for p in prepared {
             p.svc.bind(&bindings);
         }

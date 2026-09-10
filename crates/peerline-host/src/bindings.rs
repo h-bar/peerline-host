@@ -34,6 +34,42 @@
 //! immediately re-dialling races it and re-dials the dead coordinates.
 //! `refreshed` is how a service waits for the answer instead of racing it.
 //!
+//! # What `optional` means once a contract has resolved
+//!
+//! [`Consumed::optional`] used to govern *startup* alone: the coordinator's
+//! `await_ready` does not wait for one, so an optional contract with no
+//! producer yields no binding and the host becomes ready anyway. That left the
+//! name lying about the interesting half of its life. An optional contract that
+//! **did** resolve and then became unreachable reported exactly like a required
+//! one — the same re-resolve budget, and the same process exit when it ran out
+//! — so a consumer that declared a dependency optional precisely so it could
+//! survive losing it was killed by losing it.
+//!
+//! So [`Bindings`] carries the [`Consumed`] declarations, not only the
+//! [`Binding`]s they resolved to, and [`Bindings::is_optional`] is the answer.
+//! A lost optional contract is re-resolved on exactly the same schedule, and
+//! `connect` still returns `Err` while it is down — the caller always learns.
+//! What changes is only the end of the budget: a required contract that never
+//! comes back exits the host, an optional one degrades it.
+//!
+//! Optionality is **per host**, not per service: a host awaits the union of its
+//! services' `consumes`, so one service declaring a contract required makes it
+//! required for the process, whatever a second service in the same binary says.
+//! That is the same reading §6 already gives across hosts, applied within one.
+//!
+//! [`Consumed::optional`]: peerline_contract::Consumed::optional
+//!
+//! # Dialling something that is not a contract
+//!
+//! [`Connection::dial`] is the way in for coordinates that arrived out of band
+//! — from a parent process, a config file, another service's reply — rather
+//! than from a resolved contract. It is the same transport preference and the
+//! same [`HostId`] check, and it exists so that a caller in that position does
+//! not have to reimplement either. Such a connection reports **no** loss: there
+//! is no contract behind it, so there is nothing for the host to re-resolve and
+//! no budget to start. [`Connection::closed`] still fires, which is the whole
+//! signal such a caller has.
+//!
 //! # Transport preference, and the one rule that is not a preference
 //!
 //! uds, then ws, then iroh — cheapest first, and within a transport the first
@@ -44,14 +80,14 @@
 //! sits at that path. [`Endpoints::uds_usable_from`] is that comparison,
 //! spelled once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Duration;
 
 use peerline::runtime::Peer;
-use peerline_contract::{Binding, ContractId, Endpoints, HostId};
+use peerline_contract::{Binding, Consumed, ContractId, Endpoints, HostId};
 use tokio::sync::{mpsc, watch};
 
 /// A dependency's connection dropped: the contract it was for.
@@ -77,6 +113,12 @@ struct Inner {
     /// Resolved bindings, replaced in place by the host's re-resolve loop,
     /// each with the number of times it has been replaced.
     map: Mutex<BTreeMap<ContractId, Resolved>>,
+    /// Every contract this host consumes that **no** service of it declared
+    /// required. Losing one of these is survivable: see the module docs.
+    ///
+    /// Held separately from `map` because it answers a question about the
+    /// *declaration*, which exists whether or not the contract ever resolved.
+    optional: BTreeSet<ContractId>,
     /// Tells the host a dependency's connection ended — or could not be
     /// established in the first place.
     lost: Lost,
@@ -94,7 +136,17 @@ struct Resolved {
 impl Bindings {
     /// Build the set the host will hand to its services, together with the
     /// receiver it watches for dropped dependency connections.
-    pub(crate) fn new(host: HostId, resolved: Vec<Binding>) -> (Self, LostRx) {
+    ///
+    /// `consumed` is the union of every mounted service's
+    /// [`consumes`](crate::Service::consumes) — the *declarations*, not the
+    /// bindings they produced. It is what makes [`is_optional`](Self::is_optional)
+    /// answerable, and a contract is optional here only if no service in this
+    /// host asked for it required.
+    pub(crate) fn new(
+        host: HostId,
+        consumed: &[Consumed],
+        resolved: Vec<Binding>,
+    ) -> (Self, LostRx) {
         let (lost, rx) = mpsc::unbounded_channel();
         let map = resolved
             .into_iter()
@@ -108,11 +160,24 @@ impl Bindings {
                 )
             })
             .collect();
+        // One service declaring a contract required makes it required for the
+        // whole process: readiness, and the exit in §9, are both per-host.
+        let mut optional = BTreeSet::new();
+        let mut required = BTreeSet::new();
+        for c in consumed {
+            if c.optional {
+                optional.insert(c.contract.clone());
+            } else {
+                required.insert(c.contract.clone());
+            }
+        }
+        optional.retain(|c| !required.contains(c));
         (
             Self {
                 inner: Arc::new(Inner {
                     host,
                     map: Mutex::new(map),
+                    optional,
                     lost,
                     tick: watch::channel(0).0,
                 }),
@@ -245,6 +310,24 @@ impl Bindings {
         lock(&self.inner.map).keys().cloned().collect()
     }
 
+    /// Whether losing this contract is survivable — i.e. whether every service
+    /// in this host declared it
+    /// [`Consumed::optional`](peerline_contract::Consumed::optional).
+    ///
+    /// This is what the host's re-resolve budget consults when it runs out: a
+    /// required contract that never comes back exits the process, an optional
+    /// one leaves it running and degraded. A contract this host does not
+    /// consume at all answers `false`, which is the conservative reading and
+    /// costs nothing — there is no binding for it to lose.
+    pub fn is_optional(&self, name: &str, version: u32) -> bool {
+        self.optional(&ContractId::new(name, version))
+    }
+
+    /// [`is_optional`](Self::is_optional), for a `ContractId` already in hand.
+    pub(crate) fn optional(&self, contract: &ContractId) -> bool {
+        self.inner.optional.contains(contract)
+    }
+
     /// Dial the producer bound to a contract.
     ///
     /// Tries this host's coordinates in preference order (see the module docs)
@@ -257,7 +340,10 @@ impl Bindings {
     /// background — so the right response to `closed()` is to await
     /// [`refreshed`](Self::refreshed) and call `connect` again, not to give
     /// up. Only when the host's re-resolve budget is spent does the process
-    /// exit.
+    /// exit — and then only for a contract this host declared **required**.
+    /// Losing an optional one is re-resolved identically and reported here
+    /// identically; what it does not do is end the process. See
+    /// [`is_optional`](Self::is_optional).
     ///
     /// **A failed dial starts that same machinery.** It is not only a *lost*
     /// connection that means the coordinates are wrong: coordinates that never
@@ -291,8 +377,7 @@ impl Bindings {
         Ok(Connection::spawn(
             peer,
             driver,
-            contract,
-            self.inner.lost.clone(),
+            Some((contract, self.inner.lost.clone())),
         ))
     }
 }
@@ -316,11 +401,52 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Dial a producer whose coordinates arrived **out of band** — from a
+    /// parent process, a config file, another service's reply — rather than
+    /// from a contract this host resolved.
+    ///
+    /// The transport preference and the [`HostId`] locality rule are the ones
+    /// [`Bindings::connect`] uses, and that is the point: the alternative for a
+    /// caller in this position is to reimplement both, and the second one
+    /// cannot be got wrong safely — a uds path dialled across a namespace
+    /// boundary does not fail, it reaches an unrelated socket. `host` is
+    /// normally [`host_id()`](crate::host_id), this process's own tag.
+    ///
+    /// The connection reports **no loss**. There is no contract behind it, so
+    /// there is nothing for the host to re-resolve and no budget for it to
+    /// spend; [`closed`](Self::closed) still fires, and for such a caller it is
+    /// the whole signal.
+    ///
+    /// ```no_run
+    /// # async fn f(uds: &std::path::Path) -> Result<(), String> {
+    /// use peerline_contract::Endpoints;
+    /// use peerline_host::{Connection, host_id};
+    ///
+    /// let mut endpoints = Endpoints::new(host_id().clone());
+    /// endpoints.uds.push(uds.display().to_string());
+    /// let conn = Connection::dial(host_id(), &endpoints).await?;
+    /// conn.closed().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn dial(host: &HostId, endpoints: &Endpoints) -> Result<Connection, String> {
+        let (peer, driver) = dial(host, endpoints)
+            .await
+            .map_err(|e| format!("peerline-host: cannot reach that producer: {e}"))?;
+        Ok(Connection::spawn(peer, driver, None))
+    }
+
+    /// Own the driver, and — for a connection that stands for a contract —
+    /// report its end to the host.
+    ///
+    /// `report` is `None` for a [`dial`](Self::dial)ed connection, which is why
+    /// there is no second type for one: everything else about the two is
+    /// identical, and a `ConnectionWithoutALoss` would duplicate `peer`,
+    /// `closed`, `is_closed` and the `AbortOnDrop` to express one absent field.
     fn spawn(
         peer: Peer,
         driver: futures::future::BoxFuture<'static, ()>,
-        contract: ContractId,
-        lost: Lost,
+        report: Option<(ContractId, Lost)>,
     ) -> Self {
         let (tx, closed) = watch::channel(false);
         let task = tokio::spawn(async move {
@@ -333,7 +459,9 @@ impl Connection {
             // Reaching here at all means the task was not aborted, i.e. the
             // `Connection` is still held: the producer went away rather than
             // being deliberately let go.
-            let _ = lost.send(contract);
+            if let Some((contract, lost)) = report {
+                let _ = lost.send(contract);
+            }
             let _ = tx.send(true);
         });
         Self {
@@ -454,6 +582,35 @@ mod tests {
         }
     }
 
+    /// Optionality is a property of the *declaration*, and it is per host.
+    ///
+    /// A host awaits the union of its services' `consumes`, so two services in
+    /// one binary can disagree about one contract — and the strict reading has
+    /// to win, or a second service would silently remove the exit its
+    /// colleague's `Consumed::new` asked for. A contract this host does not
+    /// consume at all is not optional either: there is no binding to lose.
+    #[test]
+    fn required_by_any_service_makes_a_contract_required_for_the_host() {
+        let (bindings, _lost) = Bindings::new(
+            HostId::new("h"),
+            &[
+                Consumed::optional("storage", 1),
+                Consumed::new("storage", 1),
+                Consumed::optional("metrics", 1),
+            ],
+            Vec::new(),
+        );
+        assert!(
+            !bindings.is_optional("storage", 1),
+            "one service asked for it required, so the process needs it"
+        );
+        assert!(bindings.is_optional("metrics", 1));
+        assert!(
+            !bindings.is_optional("never-heard-of-it", 1),
+            "not consumed at all is not the same as survivable"
+        );
+    }
+
     /// The signal a service needs to stop racing the host's re-resolve.
     ///
     /// Without it the only correct-looking loop — react to `closed()` by
@@ -462,7 +619,11 @@ mod tests {
     /// indistinguishable from working until the producer genuinely moves.
     #[tokio::test]
     async fn refreshed_resolves_exactly_once_the_binding_has_moved() {
-        let (bindings, _lost) = Bindings::new(HostId::new("h"), vec![binding("storage-a")]);
+        let (bindings, _lost) = Bindings::new(
+            HostId::new("h"),
+            &[Consumed::new("storage", 1)],
+            vec![binding("storage-a")],
+        );
         let before = bindings.revision("storage", 1);
 
         // Already-fresh is not a wait: a re-resolve that finished before the
@@ -508,6 +669,7 @@ mod tests {
             .push("/nonexistent/peerline-test/nobody.sock".into());
         let (bindings, mut lost) = Bindings::new(
             HostId::new("h"),
+            &[Consumed::new("storage", 1)],
             vec![Binding {
                 contract: ContractId::new("storage", 1),
                 instance: "storage-a".into(),

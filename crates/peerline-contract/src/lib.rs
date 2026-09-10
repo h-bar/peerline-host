@@ -268,10 +268,23 @@ pub struct Consumed {
     pub contract: ContractId,
     /// Whether the service can run without it.
     ///
-    /// A required contract gates readiness: the consumer waits, and the
-    /// coordinator's timeout names it. An optional one that never resolves
-    /// simply yields no binding and the consumer becomes ready anyway — that is
-    /// the whole meaning of `optional`.
+    /// Two moments, and the word means the same thing at both.
+    ///
+    /// **At startup**, a required contract gates readiness: the consumer waits,
+    /// and the coordinator's timeout names it. An optional one that never
+    /// resolves yields no binding and the consumer becomes ready anyway.
+    ///
+    /// **After it has resolved**, losing a required contract exits the host
+    /// once its re-resolve budget is spent; losing an optional one does not.
+    /// The re-resolve is identical either way — the coordinates still have to
+    /// be put right, and `Bindings::connect` still fails while they are wrong —
+    /// but an optional dependency that never comes back leaves a degraded
+    /// process rather than a dead one.
+    ///
+    /// The second half used to be missing, and its absence was the more
+    /// dangerous kind of bug: a consumer that declared a dependency optional
+    /// *because* it could carry on without it was killed sixty seconds after
+    /// losing it, exactly like one that had declared it required.
     ///
     /// Defaults to `false` on the wire: omitting the field asks for the strict,
     /// safe reading rather than the permissive one.

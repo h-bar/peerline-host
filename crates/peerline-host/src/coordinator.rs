@@ -367,14 +367,27 @@ fn retry_or_fatal(op: &str, e: Error) -> End {
 /// Watch for dependencies becoming unreachable and put each one back,
 /// re-resolving through the coordinator with exponential backoff.
 ///
-/// Returns only when a contract has stayed unresolvable for the whole budget,
-/// and returns the message the host exits with.
+/// Returns only when a **required** contract has stayed unresolvable for the
+/// whole budget, and returns the message the host exits with.
 ///
 /// **Re-resolving rather than reconnecting is deliberate**: the restarted
 /// producer may have different coordinates, or the coordinator may now prefer a
 /// different producer entirely. And exiting only when the budget is spent is
 /// just as deliberate — exiting on the first drop would make a routine restart
 /// of a popular producer take down its whole downward closure.
+///
+/// # An optional contract is re-resolved, and never exits the host
+///
+/// `Consumed::optional` used to govern startup alone, so a consumer that
+/// declared a dependency optional exactly because it could survive losing it
+/// was nevertheless killed sixty seconds after losing it. Here an optional
+/// contract runs the identical re-resolve on the identical schedule — the
+/// coordinates must still be put right, and `Bindings::connect` still reports
+/// `Err` while they are wrong — but a spent budget logs and gives up on *that
+/// attempt* rather than on the process. The contract leaves `inflight`, so the
+/// next failed dial starts a fresh budget: a producer that returns after ten
+/// minutes is picked up, which is the whole point of degrading rather than
+/// dying.
 ///
 /// # Concurrent, and deduplicated
 ///
@@ -421,7 +434,12 @@ pub(crate) async fn watch_dependencies(
                         info!(%contract, instance = %producer,
                               "peerline-host: dependency re-resolved");
                     }
-                    Ok((_, Err(e))) => return e,
+                    Ok((contract, Err(why))) => match spent(&bindings, &contract, &why) {
+                        Some(fatal) => return fatal,
+                        // Optional: degraded, not dead. Forget the attempt so
+                        // the next failed dial can start another one.
+                        None => { inflight.remove(&contract); }
+                    },
                     // The task cannot panic — `re_resolve` returns its errors —
                     // but a lost JoinError must not be read as success.
                     Err(e) => return format!("peerline-host: re-resolve task failed: {e}"),
@@ -432,13 +450,40 @@ pub(crate) async fn watch_dependencies(
     while let Some(done) = tasks.join_next().await {
         match done {
             Ok((_, Ok(_))) => {}
-            Ok((_, Err(e))) => return e,
+            Ok((contract, Err(why))) => {
+                if let Some(fatal) = spent(&bindings, &contract, &why) {
+                    return fatal;
+                }
+            }
             Err(e) => return format!("peerline-host: re-resolve task failed: {e}"),
         }
     }
     std::future::pending().await
 }
 
+/// What a spent budget means for `contract`: `Some(message)` is the host's exit
+/// message, `None` is "optional, so carry on without it".
+///
+/// The two paths differ only here. Everything before it — the schedule, the
+/// backoff, the `coord.resolve` calls, the `Err` every `connect` returns
+/// meanwhile — is the same for both, because an optional dependency being
+/// missing is not an excuse to stop looking for it.
+fn spent(bindings: &Bindings, contract: &ContractId, why: &str) -> Option<String> {
+    if bindings.optional(contract) {
+        warn!(
+            %contract, reason = %why,
+            "peerline-host: optional dependency did not come back; continuing \
+             without it. This host will keep re-resolving it whenever a dial \
+             fails, and stays up meanwhile — that is what `optional` means."
+        );
+        return None;
+    }
+    Some(format!("peerline-host: `{contract}` {why}; exiting"))
+}
+
+/// Keep asking the coordinator for a producer until one answers or the budget
+/// runs out. `Ok` is the instance now bound; `Err` is why it never came back,
+/// as a bare reason — see [`spent`] for what is done with it.
 async fn re_resolve(
     socket: &Path,
     contract: &ContractId,
@@ -463,9 +508,10 @@ async fn re_resolve(
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(format!(
-                "peerline-host: `{contract}` did not come back within {budget:?} ({last}); exiting"
-            ));
+            // The *reason* only. Whether it is fatal is `spent`'s call, not
+            // this one's — an optional contract runs exactly this loop and
+            // must not be handed a string that says the host is exiting.
+            return Err(format!("did not come back within {budget:?} ({last})"));
         }
         tokio::time::sleep(backoff.min(deadline - now)).await;
         backoff = (backoff * 2).min(RECONNECT_MAX);
@@ -496,4 +542,113 @@ async fn resolve_once(
         r = &mut call => r.map_err(|e| e.to_string())?,
     };
     Ok(result.bindings.into_iter().next())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerline_contract::{Consumed, Endpoints, HostId};
+
+    /// A binding to a socket nobody is listening on, so the first `connect`
+    /// fails and reports the loss — the same report an established connection
+    /// makes when it drops.
+    fn unreachable(dir: &Path) -> Binding {
+        let mut endpoints = Endpoints::new(HostId::new("h"));
+        endpoints
+            .uds
+            .push(dir.join("nobody-home.sock").display().to_string());
+        Binding {
+            contract: ContractId::new("storage", 1),
+            instance: "gone".into(),
+            endpoints,
+        }
+    }
+
+    /// A path with no coordinator on it, so every re-resolve attempt fails and
+    /// the budget is certain to be spent.
+    fn no_coordinator(dir: &Path) -> PathBuf {
+        dir.join("no-coordinator.sock")
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pl-optional-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir scratch");
+        dir
+    }
+
+    /// The half of §9 that used to be missing.
+    ///
+    /// `optional` governed startup alone, so a consumer that declared a
+    /// dependency optional *because* it could carry on without it was killed
+    /// sixty seconds after losing it — with the same budget, the same
+    /// re-resolve and the same exit as a required one. The loss is still
+    /// reported and still re-resolved; what must not happen is the exit.
+    #[tokio::test]
+    async fn a_spent_budget_on_an_optional_contract_does_not_exit_the_host() {
+        let dir = scratch("optional");
+        let (bindings, lost) = Bindings::new(
+            HostId::new("h"),
+            &[Consumed::optional("storage", 1)],
+            vec![unreachable(&dir)],
+        );
+
+        let watchdog = watch_dependencies(
+            lost,
+            bindings.clone(),
+            no_coordinator(&dir),
+            "me".into(),
+            Duration::from_millis(200),
+        );
+        tokio::pin!(watchdog);
+
+        // The caller still learns: `connect` is `Err` whether or not the
+        // process survives it.
+        assert!(bindings.connect("storage", 1).await.is_err());
+
+        tokio::select! {
+            e = &mut watchdog => panic!(
+                "an optional dependency must not end the host: {e}"
+            ),
+            () = tokio::time::sleep(Duration::from_millis(900)) => {}
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and the required case is untouched, which is what makes the change
+    /// above a narrowing rather than a removal. Without this, "optional does
+    /// not exit" would be indistinguishable from "nothing exits".
+    #[tokio::test]
+    async fn a_spent_budget_on_a_required_contract_still_exits_the_host() {
+        let dir = scratch("required");
+        let (bindings, lost) = Bindings::new(
+            HostId::new("h"),
+            &[Consumed::new("storage", 1)],
+            vec![unreachable(&dir)],
+        );
+
+        let watchdog = watch_dependencies(
+            lost,
+            bindings.clone(),
+            no_coordinator(&dir),
+            "me".into(),
+            Duration::from_millis(200),
+        );
+        tokio::pin!(watchdog);
+
+        assert!(bindings.connect("storage", 1).await.is_err());
+
+        let err = tokio::select! {
+            e = &mut watchdog => e,
+            () = tokio::time::sleep(Duration::from_secs(10)) => {
+                panic!("a required dependency that never came back must exit the host")
+            }
+        };
+        assert!(err.contains("storage/1"), "{err}");
+        assert!(err.contains("did not come back"), "{err}");
+        assert!(err.contains("exiting"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
