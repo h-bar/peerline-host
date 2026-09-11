@@ -113,6 +113,28 @@
 //! written in, which would leave them undescribed — the opposite of the point.
 //! So both are expressible, the difference is stated rather than lost, and the
 //! recommendation is a recommendation rather than a silent limit.
+//!
+//! # Two integer widths are a portability fact, not a Rust one
+//!
+//! [`Scalar::I53`] and [`Scalar::U53`] are integers every target represents
+//! exactly, bounded at ±(2^53 − 1). [`Scalar::I64`] and [`Scalar::U64`] are
+//! the ones that may exceed that, and saying `i64` is therefore saying a
+//! target whose only number is a double must carry the value as an
+//! arbitrary-precision type or lose it.
+//!
+//! Both pairs exist because the distinction is only worth anything if a
+//! contract can decline it. A wall-clock millisecond count, a duration, a
+//! byte count and a tally all sit many orders of magnitude inside the safe
+//! bound; an opaque 64-bit id does not. Before this keyword existed, the
+//! second fact could only be written on the Rust side of a generator, as a
+//! per-field annotation in a language no other implementor reads — which is
+//! the same bias the manifest exists to remove, one layer down.
+//!
+//! Nothing about the wire changes: JSON has one number type, and a value
+//! declared `i53` is the same bytes as one declared `i64`. What changes is
+//! that a generator can *refuse*, or annotate, on the strength of what the
+//! file says rather than what somebody remembered. A [`Field::default`]
+//! outside the safe range is rejected here.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -321,7 +343,7 @@ impl Prose {
 ///
 /// Written as a bare string in the common case (`"string"`, `"Fault"`), as
 /// `{ "array": … }` for a list, and as `{ "nullable": … }` where the value
-/// may be JSON `null`. A bare string that is not one of the nine scalar
+/// may be JSON `null`. A bare string that is not one of the eleven scalar
 /// keywords is a reference to a [`TypeDef`] by name or to an imported type,
 /// and the validator rejects one that does not resolve — so a misspelled
 /// scalar fails loudly rather than becoming a dangling reference.
@@ -364,10 +386,42 @@ pub enum Scalar {
     I32,
     /// An unsigned 32-bit integer.
     U32,
-    /// A signed 64-bit integer. Beyond JavaScript's safe-integer range: see
-    /// the crate docs on `tsOnly`.
+    /// A signed integer every target represents exactly, bounded at
+    /// ±(2^53 − 1).
+    ///
+    /// The digit is the *magnitude* width, not a two's-complement field
+    /// width: `i53` is the symmetric range −9007199254740991 ..=
+    /// 9007199254740991, which is what a target whose only number is a
+    /// double actually guarantees. That is the whole content of the
+    /// keyword — a promise about the value, made in the contract, where
+    /// every implementor reads it.
+    ///
+    /// Say this, not [`Self::I64`], for a millisecond timestamp, a
+    /// duration, a byte count or a tally. All of them sit many orders of
+    /// magnitude inside the bound, and saying `i64` instead asks every
+    /// target with a 53-bit exact range to either lose precision silently
+    /// or promote the value to something the JSON cannot be compared
+    /// against. See the crate docs on the safe-integer scalars.
+    I53,
+    /// An unsigned integer every target represents exactly, bounded at
+    /// 2^53 − 1. The unsigned half of [`Self::I53`]; same reasoning.
+    U53,
+    /// A signed 64-bit integer, **whose value may exceed what a target
+    /// with a 53-bit exact range can hold**.
+    ///
+    /// This is a warning, not a default. A contract that says `i64` is
+    /// saying it genuinely needs the range past ±(2^53 − 1) — and is
+    /// therefore saying that a JavaScript implementor must carry the value
+    /// as a `bigint`, or lose it. peerline's own `vectors.json` marks two
+    /// entries `tsOnly` for exactly this reason: an id past 2^53 is a legal
+    /// `u64` and is not a JavaScript number.
+    ///
+    /// If the value is a timestamp, a duration, a count or a size, it does
+    /// not need the range and [`Self::I53`] is the honest declaration.
     I64,
-    /// An unsigned 64-bit integer. Same caveat as [`Self::I64`].
+    /// An unsigned 64-bit integer. Same warning as [`Self::I64`], with the
+    /// bound at 2^64 − 1; [`Self::U53`] is the one to reach for unless the
+    /// range is genuinely needed.
     U64,
     /// A double.
     F64,
@@ -387,6 +441,8 @@ impl Scalar {
             Self::Bool => "bool",
             Self::I32 => "i32",
             Self::U32 => "u32",
+            Self::I53 => "i53",
+            Self::U53 => "u53",
             Self::I64 => "i64",
             Self::U64 => "u64",
             Self::F64 => "f64",
@@ -402,6 +458,8 @@ impl Scalar {
             "bool" => Self::Bool,
             "i32" => Self::I32,
             "u32" => Self::U32,
+            "i53" => Self::I53,
+            "u53" => Self::U53,
             "i64" => Self::I64,
             "u64" => Self::U64,
             "f64" => Self::F64,
@@ -428,10 +486,25 @@ impl Scalar {
     pub fn is_small(self) -> bool {
         matches!(
             self,
-            Self::Bool | Self::I32 | Self::U32 | Self::I64 | Self::U64 | Self::F64
+            Self::Bool
+                | Self::I32
+                | Self::U32
+                | Self::I53
+                | Self::U53
+                | Self::I64
+                | Self::U64
+                | Self::F64
         )
     }
 }
+
+/// The largest magnitude a [`Scalar::I53`] or [`Scalar::U53`] may carry:
+/// 2^53 − 1, the last integer a double represents exactly.
+///
+/// Public because a generator validating its own literals wants the same
+/// number this crate validates defaults against, and two copies of it would
+/// be two chances to write one of them wrong.
+pub const SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
 
 impl fmt::Display for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

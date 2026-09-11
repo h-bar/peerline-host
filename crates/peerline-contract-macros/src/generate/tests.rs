@@ -37,7 +37,7 @@ const FIXTURE: &str = r#"{
 
 /// Expand a manifest with nothing said at the call site.
 fn expand(json: &str) -> String {
-    tokens(json, &[], &[])
+    tokens(json, &[], &[], &[])
         .expect("the fixture expands")
         .to_string()
 }
@@ -46,6 +46,7 @@ fn tokens(
     json: &str,
     imports: &[(&str, TokenStream)],
     supports: &[(&str, Support)],
+    typescript: &[&str],
 ) -> syn::Result<TokenStream> {
     let manifest = Manifest::parse(json).expect("the fixture is a valid manifest");
     let imports: Vec<(LitStr, TokenStream)> = imports
@@ -56,7 +57,11 @@ fn tokens(
         .iter()
         .map(|(name, level)| (format_ident!("{}", name), *level))
         .collect();
-    let bindings = Bindings::resolve(&manifest, &imports, &supports)?;
+    let typescript: Vec<Ident> = typescript
+        .iter()
+        .map(|name| format_ident!("{}", name))
+        .collect();
+    let bindings = Bindings::resolve(&manifest, &imports, &supports, &typescript)?;
     contract(
         &manifest,
         &bindings,
@@ -70,7 +75,7 @@ fn expansion() -> String {
 }
 
 fn rejection(json: &str, imports: &[(&str, TokenStream)], supports: &[(&str, Support)]) -> String {
-    tokens(json, imports, supports)
+    tokens(json, imports, supports, &[])
         .expect_err("this call site must be rejected")
         .to_string()
 }
@@ -202,9 +207,14 @@ const IMPORTING: &str = r#"{
 /// never heard of a crate.
 #[test]
 fn an_imported_type_takes_the_path_the_call_site_gave_it() {
-    let tokens = tokens(IMPORTING, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
-        .expect("expands")
-        .to_string();
+    let tokens = tokens(
+        IMPORTING,
+        &[("demo.vocab/1", quote!(::demo_vocab))],
+        &[],
+        &[],
+    )
+    .expect("expands")
+    .to_string();
     assert!(tokens.contains(":: demo_vocab :: Shared"), "{tokens}");
 }
 
@@ -254,6 +264,7 @@ fn an_imported_shapes_rung_decides_its_containers_derives() {
             IMPORTING,
             &[("demo.vocab/1", quote!(::demo_vocab))],
             &[("Shared", level)],
+            &[],
         )
         .expect("expands")
         .to_string()
@@ -279,9 +290,14 @@ fn an_imported_shapes_rung_decides_its_containers_derives() {
 /// fails to compile naming the trait rather than comparing wrongly.
 #[test]
 fn an_imported_shape_nobody_spoke_about_is_assumed_totally_comparable() {
-    let tokens = tokens(IMPORTING, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
-        .expect("expands")
-        .to_string();
+    let tokens = tokens(
+        IMPORTING,
+        &[("demo.vocab/1", quote!(::demo_vocab))],
+        &[],
+        &[],
+    )
+    .expect("expands")
+    .to_string();
     assert!(tokens.contains("cmp :: Eq"), "{tokens}");
     assert!(!tokens.contains("marker :: Copy"), "{tokens}");
 }
@@ -361,7 +377,7 @@ fn a_flattened_field_writes_its_types_keys_beside_its_siblings() {
         r#"{ "name": "shared", "type": "Shared","#,
         r#"{ "name": "shared", "type": "Shared", "flatten": true,"#,
     );
-    let tokens = tokens(&json, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
+    let tokens = tokens(&json, &[("demo.vocab/1", quote!(::demo_vocab))], &[], &[])
         .expect("expands")
         .to_string();
     assert!(tokens.contains("# [serde (flatten)]"), "{tokens}");
@@ -433,4 +449,154 @@ fn a_nullable_result_reads_as_an_option() {
     );
     let tokens = expand(&json);
     assert!(tokens.contains("Result: `Option<i64>`."), "{tokens}");
+}
+
+// --- the safe-integer scalars, and the clause that reads them ------------
+
+/// A manifest carrying every shape the `typescript` clause has an opinion
+/// about: a safe integer, a wide one, passthrough JSON, an absent-able
+/// field, and a closed set whose wire spelling is not its name.
+const BROWSER: &str = r#"{
+    "contract": "demo.thing", "version": 1,
+    "description": "Why this contract exists.",
+    "types": [
+        { "form": "struct", "name": "Row", "description": "One row.",
+          "fields": [
+            { "name": "at_ms", "type": "i53", "description": "When." },
+            { "name": "size", "type": "u53", "description": "How much." },
+            { "name": "opaque_id", "type": "u64", "description": "Somebody else's id." },
+            { "name": "config", "type": "json", "description": "Uninterpreted." },
+            { "name": "kind", "type": "Kind", "description": "Which sort." },
+            { "name": "since_ms", "type": "i53", "optional": true,
+              "description": "From when." },
+            { "name": "until_ms", "type": "i53", "nullable": true,
+              "description": "Until when." } ] },
+        { "form": "enum", "name": "Kind", "description": "Which sort.",
+          "variants": [ { "name": "full_message", "wire": "full-message",
+                          "description": "All of it." } ] }
+    ],
+    "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Row",
+               "description": "Do the thing." } ]
+}"#;
+
+fn browser_tokens(names: &[&str]) -> String {
+    tokens(BROWSER, &[], &[], names)
+        .expect("expands")
+        .to_string()
+}
+
+/// The whole point of the keyword: in Rust it is the same integer it always
+/// was, so nothing about equality, hashing or a database column moves.
+#[test]
+fn a_safe_integer_generates_the_same_rust_the_wide_one_does() {
+    let tokens = expand(BROWSER);
+    assert!(tokens.contains("pub at_ms : i64"), "{tokens}");
+    assert!(tokens.contains("pub size : u64"), "{tokens}");
+    assert!(tokens.contains("pub opaque_id : u64"), "{tokens}");
+}
+
+/// A shape of exact fixed-size scalars is copyable, and a safe integer is
+/// one — the same rung an `i64` reaches, read off the manifest.
+#[test]
+fn a_safe_integer_is_an_exact_fixed_size_scalar() {
+    let json = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "types": [
+            { "form": "struct", "name": "Stamp", "description": "When.",
+              "fields": [ { "name": "at_ms", "type": "i53", "description": "When." } ] }
+        ],
+        "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Stamp",
+                   "description": "Do the thing." } ]
+    }"#;
+    let tokens = expand(json);
+    assert!(tokens.contains("marker :: Copy"), "{tokens}");
+    assert!(tokens.contains("cmp :: Eq"), "{tokens}");
+}
+
+/// Without the clause there is no mention of `ts_rs` anywhere in the
+/// expansion — which is what lets a crate with no business linking a
+/// TypeScript generator expand the same manifest.
+#[test]
+fn a_call_site_that_does_not_ask_emits_no_typescript_at_all() {
+    let tokens = expand(BROWSER);
+    assert!(!tokens.contains("ts_rs"), "{tokens}");
+    assert!(!tokens.contains("# [ts ("), "{tokens}");
+}
+
+/// The derive, and the three mappings `ts_rs` could not make for itself:
+/// a safe integer is a `number` where the wide one is left as the `bigint`
+/// it honestly is, passthrough JSON is `unknown`, and an absent-able key is
+/// `key?: T`.
+#[test]
+fn the_clause_emits_the_derive_and_the_mappings_ts_rs_cannot_infer() {
+    let tokens = browser_tokens(&["Row", "Kind"]);
+    assert!(tokens.contains("derive (:: ts_rs :: TS)"), "{tokens}");
+    assert_eq!(
+        tokens.matches(r#"# [ts (type = "number")]"#).count(),
+        2,
+        "the two safe integers, and not the `u64`: {tokens}",
+    );
+    assert!(tokens.contains(r#"# [ts (type = "unknown")]"#), "{tokens}");
+    assert!(
+        tokens.contains(r#"# [ts (optional , type = "number")]"#),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains(r#"# [ts (type = "number | null")]"#),
+        "a nullable key is written, and may be null: {tokens}",
+    );
+}
+
+/// The wire spelling of a value reaches `ts_rs` in its own attribute rather
+/// than through its optional serde compatibility, because which Cargo
+/// features a downstream crate turns on is not something a contract may
+/// depend on.
+#[test]
+fn a_variants_wire_spelling_does_not_depend_on_a_cargo_feature() {
+    let tokens = browser_tokens(&["Row", "Kind"]);
+    assert!(
+        tokens.contains(r#"# [ts (rename = "full-message")]"#),
+        "{tokens}"
+    );
+}
+
+/// `ts_rs` derives through a shape's members, so a member left out of the
+/// clause fails to compile somewhere that does not mention the clause. The
+/// macro says it instead, naming what to add.
+#[test]
+fn a_member_left_out_of_the_clause_is_named_rather_than_left_to_ts_rs() {
+    let err = tokens(BROWSER, &[], &[], &["Row"])
+        .expect_err("Row holds a Kind")
+        .to_string();
+    assert!(err.contains("add `Kind` to the clause"), "{err}");
+}
+
+#[test]
+fn the_clause_may_only_name_shapes_the_manifest_declares() {
+    let err = tokens(BROWSER, &[], &[], &["Nonesuch"])
+        .expect_err("there is no such shape")
+        .to_string();
+    assert!(err.contains("not a shape this manifest declares"), "{err}");
+
+    let err = tokens(BROWSER, &[], &[], &["Kind", "Kind"])
+        .expect_err("named twice")
+        .to_string();
+    assert!(err.contains("named twice"), "{err}");
+}
+
+/// An imported shape's Rust type belongs to the expansion of the manifest it
+/// came from, so its TypeScript is asked for there.
+#[test]
+fn the_clause_may_not_name_an_imported_shape() {
+    let manifest = Manifest::parse(IMPORTING).expect("valid");
+    let imports = vec![(
+        LitStr::new("demo.vocab/1", Span::call_site()),
+        quote!(::demo_vocab),
+    )];
+    let err = match Bindings::resolve(&manifest, &imports, &[], &[format_ident!("Shared")]) {
+        Ok(_) => panic!("`Shared` is imported, so the clause may not name it"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("imported from another manifest"), "{err}");
 }

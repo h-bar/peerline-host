@@ -830,3 +830,61 @@ fn args_may_not_be_nullable() {
     let err = reject(&json);
     assert!(err.contains("a field says"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// The safe-integer scalars
+// ---------------------------------------------------------------------------
+
+/// The keyword's whole content is a promise about the value, so a default
+/// that breaks it is the manifest contradicting itself — and this is the one
+/// place the format can see a value at all.
+#[test]
+fn a_default_outside_the_safe_integer_range_is_rejected() {
+    for field in [
+        r#"{ "name": "at_ms", "type": "i53", "default": 9007199254740992,
+             "description": "When." }"#,
+        r#"{ "name": "at_ms", "type": "i53", "default": -9007199254740992,
+             "description": "When." }"#,
+        r#"{ "name": "size", "type": "u53", "default": 9007199254740992,
+             "description": "How much." }"#,
+    ] {
+        let err = reject(&with_field(field));
+        assert!(err.contains("outside"), "{err}");
+        assert!(err.contains("9007199254740991"), "{err}");
+        assert!(
+            err.contains("an `i64` or a `u64`"),
+            "the message must name the escape hatch: {err}",
+        );
+    }
+}
+
+/// The boundary is inclusive, and the wide keywords still take whatever
+/// their own range allows — keeping both pairs is what makes the narrow one
+/// mean anything.
+#[test]
+fn the_bound_is_inclusive_and_the_wide_keywords_are_unaffected() {
+    for field in [
+        r#"{ "name": "at_ms", "type": "i53", "default": 9007199254740991,
+             "description": "When." }"#,
+        r#"{ "name": "at_ms", "type": "i53", "default": -9007199254740991,
+             "description": "When." }"#,
+        r#"{ "name": "size", "type": "u53", "default": 9007199254740991,
+             "description": "How much." }"#,
+        r#"{ "name": "size", "type": "u53", "default": 0, "description": "How much." }"#,
+        r#"{ "name": "id", "type": "u64", "default": 9007199254740992,
+             "description": "Somebody else's id." }"#,
+    ] {
+        Manifest::parse(&with_field(field)).unwrap_or_else(|err| panic!("{field}: {err}"));
+    }
+}
+
+/// A negative default for an unsigned safe integer is the ordinary type
+/// mismatch, not a range complaint: the two are different mistakes and the
+/// message says which.
+#[test]
+fn a_wrongly_signed_safe_integer_is_a_type_mismatch_not_a_range_one() {
+    let err = reject(&with_field(
+        r#"{ "name": "size", "type": "u53", "default": -1, "description": "How much." }"#,
+    ));
+    assert!(err.contains("not a `u53`"), "{err}");
+}

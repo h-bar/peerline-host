@@ -913,16 +913,40 @@ fn check_scalar_value(owner: &str, value: &Value, scalar: Scalar) -> Result<(), 
         Scalar::F64 => value.is_f64() || value.is_i64() || value.is_u64(),
         Scalar::I32 => value.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
         Scalar::U32 => value.as_u64().is_some_and(|n| u32::try_from(n).is_ok()),
+        // The bound is the contract's own claim about the value, so a
+        // default outside it is the manifest contradicting itself in the
+        // one place the format can catch it.
+        Scalar::I53 => value
+            .as_i64()
+            .is_some_and(|n| n.unsigned_abs() <= crate::SAFE_INTEGER_MAX.unsigned_abs()),
+        Scalar::U53 => value
+            .as_u64()
+            .is_some_and(|n| n <= crate::SAFE_INTEGER_MAX.unsigned_abs()),
         Scalar::I64 => value.as_i64().is_some(),
         Scalar::U64 => value.as_u64().is_some(),
     };
     if ok {
-        Ok(())
-    } else {
-        Err(Error::new(format!(
-            "{owner} is `{value}`, which is not a `{scalar}`"
-        )))
+        return Ok(());
     }
+    // An integer of the right sign that is merely too large gets the reason
+    // rather than the bare type name: `-1` is not a `u53` for a different
+    // reason than 2^60 is, and only one of the two is about the safe range.
+    let too_large = match scalar {
+        Scalar::I53 => value.as_i64().is_some(),
+        Scalar::U53 => value.as_u64().is_some(),
+        _ => false,
+    };
+    if too_large {
+        return Err(Error::new(format!(
+            "{owner} is `{value}`, which is outside `{scalar}`'s exact range of ±{max} — a \
+             value needing more than that is an `i64` or a `u64`, and declaring it so is what \
+             tells an implementor whose numbers have the same limit that it has a problem",
+            max = crate::SAFE_INTEGER_MAX,
+        )));
+    }
+    Err(Error::new(format!(
+        "{owner} is `{value}`, which is not a `{scalar}`"
+    )))
 }
 
 /// A type that contains itself by value has no size, in Rust and in most

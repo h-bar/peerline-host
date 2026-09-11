@@ -101,6 +101,70 @@
 //! manifest, and letting the call site overrule it would let the Rust
 //! contradict the contract.
 //!
+//! # `typescript`, and why the derive is not in the manifest
+//!
+//! Some contracts are read by a browser. `ts_rs` turns a Rust type into a
+//! TypeScript declaration, and a crate that publishes bindings needs the
+//! derive on the shapes it publishes. Which shapes those are is a fact about
+//! *this* target — a Python generator has no opinion on it, and a service
+//! that speaks the same contract over a socket does not want `ts_rs` linked
+//! at all — so it is said at the call site, exactly like `imports` and
+//! `supports`:
+//!
+//! ```ignore
+//! peerline_contract::contract!(
+//!     "contracts/coagent.rpc.v1.json",
+//!     typescript { BackendKind, CoagentEventKind, SessionInfo },
+//! );
+//! ```
+//!
+//! Each named shape gains `#[derive(::ts_rs::TS)]`, the wire spelling of
+//! each of its variants as an explicit `#[ts(rename = …)]`, and — this is
+//! the part a human otherwise has to remember — the TypeScript type of every
+//! field whose Rust spelling has lost something the manifest knows:
+//!
+//! - A field declared `i53` or `u53` generates an `i64` or a `u64`, which
+//!   `ts_rs` maps to `bigint`. The manifest says the value is exact in every
+//!   target, so the expansion writes `#[ts(type = "number")]`. A field
+//!   declared `i64` or `u64` gets no such attribute, because for those the
+//!   `bigint` is the truth and the warning.
+//! - A field declared `json` generates a `serde_json::Value`, which `ts_rs`
+//!   maps to a named `JsonValue` import. The manifest says the value is
+//!   passed through uninterpreted, which TypeScript spells `unknown`.
+//! - A field the manifest marks absent-able gets `#[ts(optional)]`, so it is
+//!   `key?: T` rather than `key: T | null`. The manifest distinguishes the
+//!   two states; this is where the distinction reaches the browser.
+//!
+//! Before this clause those three lived as per-field attributes in a
+//! hand-written Rust crate — a portability fact about the *value*, written
+//! in one language, where no other implementor could see it. `i53` moves the
+//! fact into the contract; this clause is what reads it.
+//!
+//! ## `ts_rs` stays optional, by construction rather than by feature
+//!
+//! Neither this crate nor `peerline-contract` depends on `ts_rs`. The derive
+//! is emitted as the path `::ts_rs::TS`, which resolves in the crate the
+//! macro expanded into — so a crate that writes the clause declares `ts-rs`
+//! in its own `Cargo.toml` like any other dependency, and a crate that does
+//! not write it emits no mention of `ts_rs` and links nothing.
+//!
+//! ## What it does not carry
+//!
+//! No output path. `ts_rs`'s own `export_to` names a file relative to an
+//! output directory, and the mechanism that actually writes bindings here
+//! passes that directory at run time (`Config::with_out_dir`) and exports
+//! each root with `TS::export_all`. A path in the clause would be a second
+//! place for the destination to be decided, and the first one already wins.
+//! If a target ever needs bundling into a shared file, that is the clause to
+//! extend.
+//!
+//! An imported shape may not be named: its Rust type belongs to the crate
+//! that expands the manifest it came from, and that crate's call site is
+//! where its TypeScript is asked for. A shape that *holds* an unexported
+//! local shape is rejected too, because `ts_rs` derives through members and
+//! the failure would otherwise land somewhere that does not mention the
+//! clause.
+//!
 //! # Why a manifest edit forces a rebuild
 //!
 //! A proc macro that reads a file does not, by itself, tell cargo that the
@@ -135,8 +199,9 @@ use syn::{Ident, LitStr, Token, braced};
 /// Crate-relative rather than file-relative because a manifest is a property
 /// of the crate, not of whichever module happened to invoke the macro.
 ///
-/// Two optional clauses follow it, `imports` and `supports`; see the crate
-/// docs for what each is for and why neither is in the manifest.
+/// Three optional clauses follow it — `imports`, `supports` and
+/// `typescript`; see the crate docs for what each is for and why none of
+/// them is in the manifest.
 #[proc_macro]
 pub fn contract(input: TokenStream) -> TokenStream {
     let invocation = syn::parse_macro_input!(input as Invocation);
@@ -152,6 +217,7 @@ struct Invocation {
     manifest: LitStr,
     imports: Vec<(LitStr, TokenStream2)>,
     supports: Vec<(Ident, generate::Support)>,
+    typescript: Vec<Ident>,
 }
 
 impl Parse for Invocation {
@@ -159,8 +225,10 @@ impl Parse for Invocation {
         let manifest: LitStr = input.parse()?;
         let mut imports = Vec::new();
         let mut supports = Vec::new();
+        let mut typescript = Vec::new();
         let mut seen_imports = false;
         let mut seen_supports = false;
+        let mut seen_typescript = false;
         while !input.is_empty() {
             input.parse::<Token![,]>()?;
             if input.is_empty() {
@@ -188,12 +256,22 @@ impl Parse for Invocation {
                     seen_supports = true;
                     supports = parse_supports(input)?;
                 }
+                "typescript" => {
+                    if seen_typescript {
+                        return Err(syn::Error::new(
+                            keyword.span(),
+                            "`typescript` is given twice; one clause carries every shape",
+                        ));
+                    }
+                    seen_typescript = true;
+                    typescript = parse_typescript(input)?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         keyword.span(),
                         format!(
-                            "`{other}` is not a clause of `contract!`; the two are `imports` and \
-                             `supports`"
+                            "`{other}` is not a clause of `contract!`; the three are `imports`, \
+                             `supports` and `typescript`"
                         ),
                     ));
                 }
@@ -203,6 +281,7 @@ impl Parse for Invocation {
             manifest,
             imports,
             supports,
+            typescript,
         })
     }
 }
@@ -279,6 +358,21 @@ fn parse_supports(input: ParseStream) -> syn::Result<Vec<(Ident, generate::Suppo
     Ok(out)
 }
 
+/// `typescript { SessionInfo, BackendKind, … }`
+fn parse_typescript(input: ParseStream) -> syn::Result<Vec<Ident>> {
+    let body;
+    braced!(body in input);
+    let mut out = Vec::new();
+    while !body.is_empty() {
+        out.push(body.parse()?);
+        if body.is_empty() {
+            break;
+        }
+        body.parse::<Token![,]>()?;
+    }
+    Ok(out)
+}
+
 fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
     let literal = &invocation.manifest;
     let span = literal.span();
@@ -301,7 +395,11 @@ fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
     let manifest = peerline_contract_spec::Manifest::parse(&json)
         .map_err(|err| syn::Error::new(span, format!("`{}`: {err}", path.display())))?;
 
-    let bindings =
-        generate::Bindings::resolve(&manifest, &invocation.imports, &invocation.supports)?;
+    let bindings = generate::Bindings::resolve(
+        &manifest,
+        &invocation.imports,
+        &invocation.supports,
+        &invocation.typescript,
+    )?;
     generate::contract(&manifest, &bindings, &path, span)
 }

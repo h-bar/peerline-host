@@ -51,6 +51,10 @@ pub(crate) struct Bindings {
     /// Imported type name to what the Rust type supports, where the call
     /// site said. Absent means [`Support::Total`].
     supports: BTreeMap<String, Support>,
+    /// The shapes the call site asked to be exported to TypeScript. Empty
+    /// when the clause is absent, which is the case for every crate that
+    /// has no business linking `ts_rs`.
+    typescript: BTreeSet<String>,
 }
 
 impl Bindings {
@@ -65,6 +69,7 @@ impl Bindings {
         manifest: &Manifest,
         imports: &[(LitStr, TokenStream)],
         supports: &[(Ident, Support)],
+        typescript: &[Ident],
     ) -> syn::Result<Self> {
         let span = Span::call_site();
         let mut given: BTreeMap<String, (&LitStr, &TokenStream)> = BTreeMap::new();
@@ -131,10 +136,18 @@ impl Bindings {
             }
         }
 
+        let exported = resolve_typescript(manifest, &paths, typescript)?;
+
         Ok(Self {
             paths,
             supports: levels,
+            typescript: exported,
         })
+    }
+
+    /// Whether this shape carries a `ts_rs::TS` derive.
+    fn is_exported(&self, name: &str) -> bool {
+        self.typescript.contains(name)
     }
 
     fn is_imported(&self, name: &str) -> bool {
@@ -153,6 +166,153 @@ impl Bindings {
 
     fn imported_support(&self, name: &str) -> Support {
         self.supports.get(name).copied().unwrap_or(Support::Total)
+    }
+}
+
+/// Match the `typescript` clause against the manifest's own shapes.
+///
+/// Three ways the clause can be wrong, and all three are a mistake worth a
+/// message rather than a trait error inside `ts_rs`: naming a shape this
+/// manifest does not declare, naming one twice, and naming one that holds a
+/// shape the clause left out — the last because `ts_rs` derives recursively
+/// and a member without the derive fails to compile somewhere that does not
+/// mention the clause at all.
+fn resolve_typescript(
+    manifest: &Manifest,
+    imported: &BTreeMap<String, TokenStream>,
+    asked: &[Ident],
+) -> syn::Result<BTreeSet<String>> {
+    let local: BTreeMap<&str, &TypeDef> = manifest.type_map();
+    let mut exported: BTreeSet<String> = BTreeSet::new();
+    for name in asked {
+        let key = name.to_string();
+        if imported.contains_key(&key) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{key}` is imported from another manifest, so the Rust type is the one that \
+                     manifest's own expansion declares; ask for its TypeScript at that call site"
+                ),
+            ));
+        }
+        if !local.contains_key(key.as_str()) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!("`{key}` is not a shape this manifest declares"),
+            ));
+        }
+        if !exported.insert(key.clone()) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!("`{key}` is named twice; one clause carries every shape"),
+            ));
+        }
+    }
+
+    for name in asked {
+        let def = local[name.to_string().as_str()];
+        for member in member_names(def) {
+            if imported.contains_key(&member) || exported.contains(&member) {
+                continue;
+            }
+            if !local.contains_key(member.as_str()) {
+                continue;
+            }
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{name}` is exported to TypeScript and holds a `{member}`, which is not; \
+                     `ts_rs` derives through a shape's members, so add `{member}` to the clause"
+                ),
+            ));
+        }
+    }
+    Ok(exported)
+}
+
+/// Every named shape a definition reaches directly.
+fn member_names(def: &TypeDef) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |schema: &Schema| collect_named(schema, &mut out);
+    match def {
+        TypeDef::Struct { fields, .. } => fields.iter().for_each(|f| push(&f.ty)),
+        TypeDef::Enum { .. } => {}
+        TypeDef::Union { variants, .. } => {
+            for variant in variants {
+                variant.fields.iter().for_each(|f| push(&f.ty));
+                if let Some(payload) = &variant.payload {
+                    push(payload);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_named(schema: &Schema, out: &mut Vec<String>) {
+    match schema {
+        Schema::Array { array } => collect_named(array, out),
+        Schema::Nullable { nullable } => collect_named(nullable, out),
+        Schema::Named(name) => {
+            if Scalar::from_keyword(name).is_none() {
+                out.push(name.clone());
+            }
+        }
+    }
+}
+
+/// The TypeScript a schema maps to, in the cases where `ts_rs` reading the
+/// Rust alone would get it wrong.
+///
+/// Two of them, and both are the manifest knowing something the Rust type no
+/// longer carries. A safe integer generates an `i64`, which `ts_rs` maps to
+/// `bigint` — correct for a value that may exceed the safe range and wrong
+/// for one the contract says cannot. Passthrough JSON generates a
+/// `serde_json::Value`, which `ts_rs` maps to a named `JsonValue` import;
+/// the contract says the value is uninterpreted, and `unknown` is how
+/// TypeScript spells that.
+///
+/// Everything else is left alone deliberately: `i64` really is a `bigint` in
+/// TypeScript, and saying so is the warning the keyword exists to give.
+fn ts_override(schema: &Schema) -> Option<String> {
+    match schema {
+        Schema::Array { array } => ts_override(array).map(|inner| format!("Array<{inner}>")),
+        Schema::Nullable { nullable } => {
+            ts_override(nullable).map(|inner| format!("{inner} | null"))
+        }
+        Schema::Named(name) => match Scalar::from_keyword(name) {
+            Some(Scalar::I53 | Scalar::U53) => Some("number".to_owned()),
+            Some(Scalar::Json) => Some("unknown".to_owned()),
+            _ => None,
+        },
+    }
+}
+
+/// The `#[ts(…)]` attributes one field needs, given that its owner is
+/// exported.
+///
+/// A field's key needs nothing said about it: the generated Rust identifier
+/// is the manifest's field name, and `ts_rs` strips the `r#` from a raw one.
+/// What it cannot work out for itself is the mapping above, and which keys
+/// may be absent — an absent-able key is `key?: T` and not `key: T | null`,
+/// a distinction the manifest makes and a Rust `Option` does not.
+fn ts_field_attrs(field: &Field) -> TokenStream {
+    if field.flatten {
+        // A flattened field has no key of its own, and `ts_rs` rejects both
+        // of these on one. Its type is a shape, never a scalar, so there is
+        // nothing here it would have wanted.
+        return TokenStream::new();
+    }
+    let base = ts_override(&field.ty);
+    match (field.optional, field.nullable, base) {
+        (true, _, Some(ts)) => quote! { #[ts(optional, type = #ts)] },
+        (true, _, None) => quote! { #[ts(optional)] },
+        (false, true, Some(ts)) => {
+            let nullable = format!("{ts} | null");
+            quote! { #[ts(type = #nullable)] }
+        }
+        (false, false, Some(ts)) => quote! { #[ts(type = #ts)] },
+        (false, _, None) => TokenStream::new(),
     }
 }
 
@@ -340,17 +500,20 @@ fn shape(
         } => {
             let ty = ident(name, span)?;
             let prose = docs(description);
+            let exported = bindings.is_exported(name);
             let decls = fields
                 .iter()
-                .map(|f| field_decl(&ty, "", f, bindings, span, Visibility::Public))
+                .map(|f| field_decl(&ty, "", f, bindings, span, Visibility::Public, exported))
                 .collect::<syn::Result<Vec<_>>>()?;
             let derives = comparison_derives(support_of(def, types, bindings));
+            let ts = ts_derive(exported);
             let ctor = constructor(&ty, name, fields, types, bindings, span)?;
             let defaults = default_fns(&ty, "", fields, types, bindings, span)?;
             let default_impl = default_impl(&ty, name, fields, types, bindings, span)?;
             Ok(quote! {
                 #prose
                 #[derive(::core::fmt::Debug, ::core::clone::Clone, #derives ::serde::Serialize, ::serde::Deserialize)]
+                #ts
                 pub struct #ty { #(#decls),* }
                 #defaults
                 #ctor
@@ -364,19 +527,23 @@ fn shape(
         } => {
             let ty = ident(name, span)?;
             let prose = docs(description);
+            let exported = bindings.is_exported(name);
             let arms: Vec<TokenStream> = variants
                 .iter()
                 .map(|v| {
                     let arm = format_ident!("{}", pascal_case(&v.name), span = span);
                     let wire = LitStr::new(v.wire(), span);
                     let prose = docs(&v.description);
+                    let ts = ts_variant_rename(exported, &wire);
                     quote! {
                         #prose
                         #[serde(rename = #wire)]
+                        #ts
                         #arm
                     }
                 })
                 .collect();
+            let ts = ts_derive(exported);
             Ok(quote! {
                 #prose
                 #[derive(
@@ -384,6 +551,7 @@ fn shape(
                     ::core::cmp::PartialEq, ::core::cmp::Eq, ::core::hash::Hash,
                     ::serde::Serialize, ::serde::Deserialize
                 )]
+                #ts
                 #[non_exhaustive]
                 pub enum #ty { #(#arms),* }
             })
@@ -397,6 +565,7 @@ fn shape(
         } => {
             let ty = ident(name, span)?;
             let prose = docs(description);
+            let exported = bindings.is_exported(name);
             let mut arms = Vec::new();
             let mut ctors = Vec::new();
             let mut defaults = Vec::new();
@@ -404,12 +573,14 @@ fn shape(
                 let arm = format_ident!("{}", pascal_case(&v.name), span = span);
                 let wire = LitStr::new(v.wire(), span);
                 let prose = docs(&v.description);
+                let ts_rename = ts_variant_rename(exported, &wire);
                 match (&v.payload, v.fields.is_empty()) {
                     (Some(payload), _) => {
                         let inner = rust_type(payload, bindings, span);
                         arms.push(quote! {
                             #prose
                             #[serde(rename = #wire)]
+                            #ts_rename
                             #arm(#inner)
                         });
                     }
@@ -417,6 +588,7 @@ fn shape(
                         arms.push(quote! {
                             #prose
                             #[serde(rename = #wire)]
+                            #ts_rename
                             #arm
                         });
                     }
@@ -432,12 +604,14 @@ fn shape(
                                     bindings,
                                     span,
                                     Visibility::Inherited,
+                                    exported,
                                 )
                             })
                             .collect::<syn::Result<Vec<_>>>()?;
                         arms.push(quote! {
                             #prose
                             #[serde(rename = #wire)]
+                            #ts_rename
                             #arm { #(#decls),* }
                         });
                         defaults.push(default_fns(
@@ -464,15 +638,22 @@ fn shape(
                         tag.as_deref().expect("validation requires an internal tag"),
                         span,
                     );
-                    quote! { #[serde(tag = #tag_literal)] }
+                    let ts_tag = if exported {
+                        quote! { #[ts(tag = #tag_literal)] }
+                    } else {
+                        TokenStream::new()
+                    };
+                    quote! { #[serde(tag = #tag_literal)] #ts_tag }
                 }
                 // Externally tagged is serde's default for an enum: the arm's
                 // name is the key and its payload is the value.
                 Tagging::External => TokenStream::new(),
             };
+            let ts = ts_derive(exported);
             Ok(quote! {
                 #prose
                 #[derive(::core::fmt::Debug, ::core::clone::Clone, #derives ::serde::Serialize, ::serde::Deserialize)]
+                #ts
                 #container
                 #[non_exhaustive]
                 pub enum #ty { #(#arms),* }
@@ -480,6 +661,35 @@ fn shape(
                 #impl_block
             })
         }
+    }
+}
+
+/// The derive that makes a shape a TypeScript type.
+///
+/// Written as `::ts_rs::TS`, resolved in the *invoking* crate: this crate
+/// has no `ts_rs` dependency and neither does `peerline-contract`, so a
+/// crate that never writes the clause never links it, and a crate that does
+/// declares it for itself like any other dependency.
+fn ts_derive(exported: bool) -> TokenStream {
+    if exported {
+        quote! { #[derive(::ts_rs::TS)] }
+    } else {
+        TokenStream::new()
+    }
+}
+
+/// A variant's wire spelling, said to `ts_rs` in its own attribute rather
+/// than left to it to read off the serde one.
+///
+/// `ts_rs` does read serde attributes, but only with its `serde-compat`
+/// feature on, and which features a downstream crate enables is not
+/// something this expansion can see. The wire spelling of a value is the
+/// contract; it must not depend on a Cargo feature.
+fn ts_variant_rename(exported: bool, wire: &LitStr) -> TokenStream {
+    if exported {
+        quote! { #[ts(rename = #wire)] }
+    } else {
+        TokenStream::new()
     }
 }
 
@@ -505,10 +715,16 @@ fn field_decl(
     bindings: &Bindings,
     span: Span,
     vis: Visibility,
+    exported: bool,
 ) -> syn::Result<TokenStream> {
     let name = ident(&field.name, span)?;
     let ty = rust_type(&field.ty, bindings, span);
     let prose = docs(&field.description);
+    let ts = if exported {
+        ts_field_attrs(field)
+    } else {
+        TokenStream::new()
+    };
     // A struct's fields are `pub`; an enum variant's inherit the enum's
     // visibility and may not be spelled.
     let vis = match vis {
@@ -521,6 +737,7 @@ fn field_decl(
         return Ok(quote! {
             #prose
             #[serde(flatten)]
+            #ts
             #vis #name: #ty
         });
     }
@@ -530,6 +747,7 @@ fn field_decl(
         return Ok(quote! {
             #prose
             #[serde(default = #path)]
+            #ts
             #vis #name: #ty
         });
     }
@@ -540,6 +758,7 @@ fn field_decl(
         return Ok(quote! {
             #prose
             #[serde(default, skip_serializing_if = "::core::option::Option::is_none")]
+            #ts
             #vis #name: ::core::option::Option<#ty>
         });
     }
@@ -550,11 +769,13 @@ fn field_decl(
         return Ok(quote! {
             #prose
             #[serde(default)]
+            #ts
             #vis #name: ::core::option::Option<#ty>
         });
     }
     Ok(quote! {
         #prose
+        #ts
         #vis #name: #ty
     })
 }
@@ -768,12 +989,12 @@ fn scalar_default(value: &Value, scalar: Scalar) -> TokenStream {
             let literal = Literal::f64_unsuffixed(number);
             quote! { #literal }
         }
-        Scalar::I32 | Scalar::I64 => {
+        Scalar::I32 | Scalar::I53 | Scalar::I64 => {
             let number = value.as_i64().expect("validated as an integer");
             let literal = Literal::i64_unsuffixed(number);
             quote! { #literal }
         }
-        Scalar::U32 | Scalar::U64 => {
+        Scalar::U32 | Scalar::U53 | Scalar::U64 => {
             let number = value.as_u64().expect("validated as an integer");
             let literal = Literal::u64_unsuffixed(number);
             quote! { #literal }
@@ -1044,8 +1265,14 @@ fn rust_type(schema: &Schema, bindings: &Bindings, span: Span) -> TokenStream {
             Some(Scalar::Bool) => quote! { bool },
             Some(Scalar::I32) => quote! { i32 },
             Some(Scalar::U32) => quote! { u32 },
-            Some(Scalar::I64) => quote! { i64 },
-            Some(Scalar::U64) => quote! { u64 },
+            // A safe integer is the same Rust as the wide one: the bound
+            // is a promise about the value, and Rust's narrowest exact
+            // integer that holds it is still 64 bits. What the keyword
+            // buys is that a target whose numbers are doubles can be told
+            // the truth, and that a generator can annotate on the strength
+            // of the file instead of a remembered per-field attribute.
+            Some(Scalar::I53) | Some(Scalar::I64) => quote! { i64 },
+            Some(Scalar::U53) | Some(Scalar::U64) => quote! { u64 },
             Some(Scalar::F64) => quote! { f64 },
             Some(Scalar::Path) => quote! { ::std::path::PathBuf },
             Some(Scalar::Json) => quote! { ::serde_json::Value },
@@ -1063,6 +1290,10 @@ fn rust_type_name(schema: &Schema) -> String {
             Some(Scalar::String) => "String".into(),
             Some(Scalar::Path) => "PathBuf".into(),
             Some(Scalar::Json) => "serde_json::Value".into(),
+            // The doc line names the Rust spelling a caller writes, which
+            // for the safe-integer keywords is the wide type they generate.
+            Some(Scalar::I53) => "i64".into(),
+            Some(Scalar::U53) => "u64".into(),
             Some(other) => other.keyword().into(),
             None => name.clone(),
         },
