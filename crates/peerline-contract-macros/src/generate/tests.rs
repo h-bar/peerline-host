@@ -126,16 +126,33 @@ fn the_expansion_declares_the_manifest_as_a_source_input() {
     assert!(tokens.contains("\"/tmp/demo.v1.json\""), "{tokens}");
 }
 
-/// A contract version is additive, so a reader must tolerate a value it
-/// has not heard of. Structs are not marked, because a caller has to be
-/// able to write one out field by field.
+/// Nothing the expansion emits is marked open, and that is the point.
+///
+/// This assertion used to run the other way: every generated enum and
+/// union carried `#[non_exhaustive]`, on the reasoning that a contract
+/// version is additive and a reader must tolerate a value it has not heard
+/// of. The reasoning does not survive contact with the other half of the
+/// same expansion. There is no catch-all variant, so serde rejects an
+/// unknown value at the decode boundary — a Rust program cannot hold one
+/// unless it was compiled against the newer manifest, and then it has the
+/// variant. The attribute bought nothing on the wire and cost the
+/// compile error: outside the crate that expanded the manifest it turns
+/// "a new value is a build failure you must handle" into a wildcard arm
+/// nobody revisits.
+///
+/// So the assertion is that the token never appears at all — for a
+/// struct, for an enum, and for a union alike. If the format ever gains a
+/// way for a *manifest* to declare a set open, this test changes together
+/// with the emission of a catch-all variant, because the two have to
+/// arrive together or the halves disagree again.
 #[test]
-fn enums_are_open_and_structs_are_not() {
+fn nothing_generated_is_marked_open() {
     let tokens = expansion();
     assert_eq!(
         tokens.matches("non_exhaustive").count(),
-        2,
-        "one for each of `Level` and `Note`, and none for `Args`: {tokens}",
+        0,
+        "`Level`, `Note` and `Args` are all closed sets, and a manifest is \
+         the only thing that could say otherwise: {tokens}",
     );
 }
 

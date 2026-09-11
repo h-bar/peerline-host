@@ -165,6 +165,42 @@
 //! the failure would otherwise land somewhere that does not mention the
 //! clause.
 //!
+//! # A generated set is closed, and no attribute says otherwise
+//!
+//! A generated enum or union carries no `#[non_exhaustive]`. A reader who
+//! expects one on a versioned wire type should read this paragraph as the
+//! answer rather than as an oversight.
+//!
+//! The two halves of the generated code have to agree. `#[non_exhaustive]`
+//! buys source-level tolerance for a variant the reader has not heard of —
+//! but the expansion emits no catch-all variant, so serde **rejects** an
+//! unknown value at the decode boundary, and a manifest's own prose is
+//! usually explicit that this is intended (`coagent.rpc/1`'s `BackendKind`
+//! says "an absent or unrecognised tag is a decoding failure at the
+//! boundary"). So a Rust program can never *hold* a value outside its
+//! compiled set unless it was built against the newer manifest — in which
+//! case it has the variant, and the tolerance was never needed.
+//!
+//! What the attribute does buy is a cost. The claim above — the types **are**
+//! the manifest, so a manifest edit either changes the Rust or fails to
+//! compile — holds only inside the crate that expanded it, because
+//! `non_exhaustive` is a no-op there. The moment generated types cross a
+//! crate boundary, which is what a **vocabulary** is for, every exhaustive
+//! match in every consumer would have to grow a wildcard arm, and a contract
+//! that grew a value would stop being a compile error and become a runtime
+//! one — or, for a store that encodes a variant as a column value, a silently
+//! wrong integer in an on-disk format.
+//!
+//! If openness is ever wanted it belongs in the **manifest**, not here. Not
+//! as a manifest key spelled after a Rust attribute — that would be a
+//! Rust-shaped hole in a language-neutral file — but as something the format
+//! can *say* about a set, in its own terms, the way it already says `optional`
+//! and `nullable`. And not as a call-site clause either: openness is a
+//! property of the contract, not of this build, which is the same rule that
+//! confines `supports` to imported shapes. When the format can say it, the
+//! generator emits the catch-all variant **and** the attribute together, so
+//! the wire and the Rust go on agreeing.
+//!
 //! # Why a manifest edit forces a rebuild
 //!
 //! A proc macro that reads a file does not, by itself, tell cargo that the

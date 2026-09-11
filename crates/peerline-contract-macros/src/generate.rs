@@ -10,6 +10,29 @@
 //! say, both supplied at the call site and both about *this* target rather
 //! than about the contract: which Rust module supplies an imported shape, and
 //! what that Rust type supports. See [`Bindings`].
+//!
+//! # A generated set is closed
+//!
+//! No generated enum or union carries `#[non_exhaustive]`, and that is a
+//! decision rather than an omission. The attribute buys a reader
+//! source-level tolerance for a variant it has not heard of — but the
+//! expansion emits no catch-all variant, so serde **rejects** an unknown
+//! value at the decode boundary. A Rust program can therefore never *hold* a
+//! value outside its compiled set, unless it was built against the newer
+//! manifest, in which case it has the variant. The attribute purchases
+//! nothing, and pays for it by turning "a manifest edit changes the Rust or
+//! fails to compile" into a silent wildcard for every consumer outside the
+//! crate that expanded the manifest. The compile error is the property; it
+//! stays.
+//!
+//! Where openness would have to be said, if it were ever wanted, is the
+//! manifest — not a Rust attribute name in a language-neutral file, and not
+//! a call-site clause, because openness is a property of the contract and not
+//! of this build. (`supports` may only speak about *imported* shapes for
+//! exactly that reason.) The format has one answer for closedness today and
+//! the wire agrees with it. If it ever gains a way to say the other, the
+//! generator emits the catch-all variant **and** the attribute together, so
+//! that both halves of the generated code say the same thing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -544,6 +567,8 @@ fn shape(
                 })
                 .collect();
             let ts = ts_derive(exported);
+            // No `#[non_exhaustive]`: a generated set is closed, and the module
+            // docs above say why.
             Ok(quote! {
                 #prose
                 #[derive(
@@ -552,7 +577,6 @@ fn shape(
                     ::serde::Serialize, ::serde::Deserialize
                 )]
                 #ts
-                #[non_exhaustive]
                 pub enum #ty { #(#arms),* }
             })
         }
@@ -650,12 +674,12 @@ fn shape(
                 Tagging::External => TokenStream::new(),
             };
             let ts = ts_derive(exported);
+            // Closed for the same reason an enum is; see the module docs.
             Ok(quote! {
                 #prose
                 #[derive(::core::fmt::Debug, ::core::clone::Clone, #derives ::serde::Serialize, ::serde::Deserialize)]
                 #ts
                 #container
-                #[non_exhaustive]
                 pub enum #ty { #(#arms),* }
                 #(#defaults)*
                 #impl_block
