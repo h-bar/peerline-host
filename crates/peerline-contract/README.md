@@ -44,7 +44,12 @@ peerline_contract::contract!("contracts/codex.server.v1.json");
 Op constants, the argument and result types, the error codes and the
 documentation all come from that file, so they cannot drift from it — and
 a service in another language reads the same file rather than reading the
-Rust. Note that two different things here are called a manifest:
+Rust.
+
+A manifest may also be a *vocabulary*: named shapes and no ops, which other
+manifests import by contract name and version. The Rust module supplying an
+imported shape is named at the macro call site, not in the file, because a
+crate name means nothing to an implementor who is not writing Rust. Note that two different things here are called a manifest:
 `manifest` is what a *binary* reports when probed, `spec` is what a
 *contract* is.
 

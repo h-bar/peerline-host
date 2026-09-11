@@ -5,29 +5,179 @@
 //! description exists, and every op's kind agrees with its shape. What is
 //! left is one mapping — manifest spelling to Rust spelling — and it is the
 //! same mapping a checker in another language would make into its own.
+//!
+//! The two exceptions are the two things a manifest deliberately does not
+//! say, both supplied at the call site and both about *this* target rather
+//! than about the contract: which Rust module supplies an imported shape, and
+//! what that Rust type supports. See [`Bindings`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use peerline_contract_spec::{
-    ErrorDef, Field, Manifest, OpDef, OpKind, Prose, Scalar, Schema, TypeDef, pascal_case,
+    ErrorDef, Field, Manifest, OpDef, OpKind, Prose, Role, Scalar, Schema, Tagging, TypeDef,
+    UnionVariant, Value, pascal_case,
 };
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{Literal, Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Ident, LitStr};
 
+/// How far up the comparison ladder a shape goes.
+///
+/// One ordered scale rather than a set of trait names, because the rungs are
+/// nested: a shape that can be copied can be compared for total equality, and
+/// one that can be compared totally can be compared partially. A struct's
+/// rung is the lowest of its fields', which is the whole computation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Support {
+    /// Not comparable at all — a hand-written Rust type that deliberately
+    /// has no `PartialEq`.
+    None,
+    /// `PartialEq`. What a shape holding an `f64` or passthrough JSON
+    /// reaches.
+    Partial,
+    /// `PartialEq + Eq`. What most wire shapes are, and the assumption for an
+    /// imported type nobody spoke about.
+    Total,
+    /// `PartialEq + Eq + Copy`. Fixed-size scalars only, and never through a
+    /// list.
+    Copy,
+}
+
+/// What the call site says about this target, which the manifest does not.
+pub(crate) struct Bindings {
+    /// Imported type name to the Rust module path supplying it.
+    paths: BTreeMap<String, TokenStream>,
+    /// Imported type name to what the Rust type supports, where the call
+    /// site said. Absent means [`Support::Total`].
+    supports: BTreeMap<String, Support>,
+}
+
+impl Bindings {
+    /// Match the call site's clauses against the manifest's imports.
+    ///
+    /// Both directions are checked. An import the call site did not map
+    /// cannot be generated at all; a mapping for an import the manifest does
+    /// not declare is a mapping that silently does nothing, which is how a
+    /// renamed vocabulary would go unnoticed until a type failed to resolve
+    /// somewhere else.
+    pub(crate) fn resolve(
+        manifest: &Manifest,
+        imports: &[(LitStr, TokenStream)],
+        supports: &[(Ident, Support)],
+    ) -> syn::Result<Self> {
+        let span = Span::call_site();
+        let mut given: BTreeMap<String, (&LitStr, &TokenStream)> = BTreeMap::new();
+        for (id, path) in imports {
+            if given.insert(id.value(), (id, path)).is_some() {
+                return Err(syn::Error::new(
+                    id.span(),
+                    format!("`{}` is mapped twice", id.value()),
+                ));
+            }
+        }
+
+        let declared: BTreeMap<String, &peerline_contract_spec::Import> = manifest
+            .imports
+            .iter()
+            .map(|import| (import.id(), import))
+            .collect();
+        for (id, (literal, _)) in &given {
+            if !declared.contains_key(id) {
+                return Err(syn::Error::new(
+                    literal.span(),
+                    format!(
+                        "`{id}` is mapped here but the manifest imports nothing of that name; \
+                         the manifest is the contract, so the mapping is what is wrong"
+                    ),
+                ));
+            }
+        }
+
+        let mut paths = BTreeMap::new();
+        for (id, import) in &declared {
+            let Some((_, path)) = given.get(id) else {
+                return Err(syn::Error::new(
+                    span,
+                    format!(
+                        "the manifest imports `{id}`, and nothing here says which Rust module \
+                         supplies its types; add `imports {{ \"{id}\" => ::some_crate }}`"
+                    ),
+                ));
+            };
+            for name in &import.types {
+                paths.insert(name.clone(), (*path).clone());
+            }
+        }
+
+        let mut levels = BTreeMap::new();
+        for (name, support) in supports {
+            let key = name.to_string();
+            if !paths.contains_key(&key) {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!(
+                        "`{key}` is not an imported type; a shape declared in the manifest has \
+                         its support read off its fields, and saying otherwise here would let \
+                         the Rust contradict the contract"
+                    ),
+                ));
+            }
+            if levels.insert(key.clone(), *support).is_some() {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!("`{key}` is given a support level twice"),
+                ));
+            }
+        }
+
+        Ok(Self {
+            paths,
+            supports: levels,
+        })
+    }
+
+    fn is_imported(&self, name: &str) -> bool {
+        self.paths.contains_key(name)
+    }
+
+    /// The Rust path for a named shape: a local ident, or the call site's
+    /// module path plus the ident.
+    fn type_path(&self, name: &str, span: Span) -> TokenStream {
+        let ident = format_ident!("{}", name, span = span);
+        match self.paths.get(name) {
+            Some(prefix) => quote! { #prefix::#ident },
+            None => quote! { #ident },
+        }
+    }
+
+    fn imported_support(&self, name: &str) -> Support {
+        self.supports.get(name).copied().unwrap_or(Support::Total)
+    }
+}
+
 /// The whole expansion, in the order it reads best: what the contract is,
 /// what its ops are, what can go wrong, and what shapes travel.
-pub(crate) fn contract(manifest: &Manifest, path: &Path, span: Span) -> syn::Result<TokenStream> {
+pub(crate) fn contract(
+    manifest: &Manifest,
+    bindings: &Bindings,
+    path: &Path,
+    span: Span,
+) -> syn::Result<TokenStream> {
     let types = manifest.type_map();
 
     let header = header(manifest, span);
-    let ops = ops(manifest, span)?;
+    let ops = match manifest.role {
+        // A vocabulary has no producer, so there is no registration for
+        // either list to feed and nothing to put in them.
+        Role::Vocabulary => TokenStream::new(),
+        Role::Contract => ops(manifest, span)?,
+    };
     let errors = errors(manifest, span);
     let shapes = manifest
         .types
         .iter()
-        .map(|def| shape(def, &types, span))
+        .map(|def| shape(def, &types, bindings, span))
         .collect::<syn::Result<Vec<_>>>()?;
     let tracker = rebuild_tracker(path, span);
 
@@ -176,7 +326,12 @@ fn errors(manifest: &Manifest, span: Span) -> TokenStream {
     quote! { #(#consts)* }
 }
 
-fn shape(def: &TypeDef, types: &BTreeMap<&str, &TypeDef>, span: Span) -> syn::Result<TokenStream> {
+fn shape(
+    def: &TypeDef,
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    span: Span,
+) -> syn::Result<TokenStream> {
     match def {
         TypeDef::Struct {
             name,
@@ -187,15 +342,19 @@ fn shape(def: &TypeDef, types: &BTreeMap<&str, &TypeDef>, span: Span) -> syn::Re
             let prose = docs(description);
             let decls = fields
                 .iter()
-                .map(|f| field_decl(f, span, Visibility::Public))
+                .map(|f| field_decl(&ty, "", f, bindings, span, Visibility::Public))
                 .collect::<syn::Result<Vec<_>>>()?;
-            let eq = eq_derive(&fields_schemas(fields), types);
-            let ctor = constructor(&ty, name, fields, span)?;
+            let derives = comparison_derives(support_of(def, types, bindings));
+            let ctor = constructor(&ty, name, fields, types, bindings, span)?;
+            let defaults = default_fns(&ty, "", fields, types, bindings, span)?;
+            let default_impl = default_impl(&ty, name, fields, types, bindings, span)?;
             Ok(quote! {
                 #prose
-                #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, #eq ::serde::Serialize, ::serde::Deserialize)]
+                #[derive(::core::fmt::Debug, ::core::clone::Clone, #derives ::serde::Serialize, ::serde::Deserialize)]
                 pub struct #ty { #(#decls),* }
+                #defaults
                 #ctor
+                #default_impl
             })
         }
         TypeDef::Enum {
@@ -209,7 +368,7 @@ fn shape(def: &TypeDef, types: &BTreeMap<&str, &TypeDef>, span: Span) -> syn::Re
                 .iter()
                 .map(|v| {
                     let arm = format_ident!("{}", pascal_case(&v.name), span = span);
-                    let wire = LitStr::new(&v.name, span);
+                    let wire = LitStr::new(v.wire(), span);
                     let prose = docs(&v.description);
                     quote! {
                         #prose
@@ -232,63 +391,123 @@ fn shape(def: &TypeDef, types: &BTreeMap<&str, &TypeDef>, span: Span) -> syn::Re
         TypeDef::Union {
             name,
             description,
+            tagging,
             tag,
             variants,
         } => {
             let ty = ident(name, span)?;
             let prose = docs(description);
-            let tag_literal = LitStr::new(tag, span);
             let mut arms = Vec::new();
             let mut ctors = Vec::new();
-            let mut schemas = Vec::new();
+            let mut defaults = Vec::new();
             for v in variants {
                 let arm = format_ident!("{}", pascal_case(&v.name), span = span);
-                let wire = LitStr::new(&v.name, span);
+                let wire = LitStr::new(v.wire(), span);
                 let prose = docs(&v.description);
-                schemas.extend(fields_schemas(&v.fields));
-                if v.fields.is_empty() {
-                    arms.push(quote! {
-                        #prose
-                        #[serde(rename = #wire)]
-                        #arm
-                    });
-                } else {
-                    let decls = v
-                        .fields
-                        .iter()
-                        .map(|f| field_decl(f, span, Visibility::Inherited))
-                        .collect::<syn::Result<Vec<_>>>()?;
-                    arms.push(quote! {
-                        #prose
-                        #[serde(rename = #wire)]
-                        #arm { #(#decls),* }
-                    });
+                match (&v.payload, v.fields.is_empty()) {
+                    (Some(payload), _) => {
+                        let inner = rust_type(payload, bindings, span);
+                        arms.push(quote! {
+                            #prose
+                            #[serde(rename = #wire)]
+                            #arm(#inner)
+                        });
+                    }
+                    (None, true) => {
+                        arms.push(quote! {
+                            #prose
+                            #[serde(rename = #wire)]
+                            #arm
+                        });
+                    }
+                    (None, false) => {
+                        let decls = v
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                field_decl(
+                                    &ty,
+                                    &format!("{}_", v.name),
+                                    f,
+                                    bindings,
+                                    span,
+                                    Visibility::Inherited,
+                                )
+                            })
+                            .collect::<syn::Result<Vec<_>>>()?;
+                        arms.push(quote! {
+                            #prose
+                            #[serde(rename = #wire)]
+                            #arm { #(#decls),* }
+                        });
+                        defaults.push(default_fns(
+                            &ty,
+                            &format!("{}_", v.name),
+                            &v.fields,
+                            types,
+                            bindings,
+                            span,
+                        )?);
+                    }
                 }
-                if let Some(ctor) = variant_constructor(&ty, &arm, v, span)? {
-                    ctors.push(ctor);
-                }
+                ctors.extend(variant_members(&ty, &arm, v, types, bindings, span)?);
             }
-            let eq = eq_derive(&schemas, types);
+            let derives = comparison_derives(support_of(def, types, bindings));
             let impl_block = if ctors.is_empty() {
                 TokenStream::new()
             } else {
                 quote! { impl #ty { #(#ctors)* } }
             };
+            let container = match tagging {
+                Tagging::Internal => {
+                    let tag_literal = LitStr::new(
+                        tag.as_deref().expect("validation requires an internal tag"),
+                        span,
+                    );
+                    quote! { #[serde(tag = #tag_literal)] }
+                }
+                // Externally tagged is serde's default for an enum: the arm's
+                // name is the key and its payload is the value.
+                Tagging::External => TokenStream::new(),
+            };
             Ok(quote! {
                 #prose
-                #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, #eq ::serde::Serialize, ::serde::Deserialize)]
-                #[serde(tag = #tag_literal)]
+                #[derive(::core::fmt::Debug, ::core::clone::Clone, #derives ::serde::Serialize, ::serde::Deserialize)]
+                #container
                 #[non_exhaustive]
                 pub enum #ty { #(#arms),* }
+                #(#defaults)*
                 #impl_block
             })
         }
     }
 }
 
-fn field_decl(field: &Field, span: Span, vis: Visibility) -> syn::Result<TokenStream> {
+/// The derives a rung admits, in the order they have always been written.
+fn comparison_derives(support: Support) -> TokenStream {
+    let mut out = TokenStream::new();
+    if support >= Support::Copy {
+        out.extend(quote! { ::core::marker::Copy, });
+    }
+    if support >= Support::Partial {
+        out.extend(quote! { ::core::cmp::PartialEq, });
+    }
+    if support >= Support::Total {
+        out.extend(quote! { ::core::cmp::Eq, });
+    }
+    out
+}
+
+fn field_decl(
+    owner: &Ident,
+    prefix: &str,
+    field: &Field,
+    bindings: &Bindings,
+    span: Span,
+    vis: Visibility,
+) -> syn::Result<TokenStream> {
     let name = ident(&field.name, span)?;
-    let ty = rust_type(&field.ty, span);
+    let ty = rust_type(&field.ty, bindings, span);
     let prose = docs(&field.description);
     // A struct's fields are `pub`; an enum variant's inherit the enum's
     // visibility and may not be spelled.
@@ -296,21 +515,48 @@ fn field_decl(field: &Field, span: Span, vis: Visibility) -> syn::Result<TokenSt
         Visibility::Public => quote! { pub },
         Visibility::Inherited => TokenStream::new(),
     };
+    if field.flatten {
+        // No key of its own: the shape's keys are written beside this
+        // field's siblings, which is what the wire already does.
+        return Ok(quote! {
+            #prose
+            #[serde(flatten)]
+            #vis #name: #ty
+        });
+    }
+    if field.default.is_some() {
+        let getter = default_fn_ident(owner, prefix, &field.name);
+        let path = LitStr::new(&format!("{owner}::{getter}"), span);
+        return Ok(quote! {
+            #prose
+            #[serde(default = #path)]
+            #vis #name: #ty
+        });
+    }
     if field.optional {
         // Absent, not null: `skip_serializing_if` is what makes an omitted
         // optional field omitted on the way out too, which is the form the
         // manifest describes and the form another language's decoder expects.
-        Ok(quote! {
+        return Ok(quote! {
             #prose
             #[serde(default, skip_serializing_if = "::core::option::Option::is_none")]
             #vis #name: ::core::option::Option<#ty>
-        })
-    } else {
-        Ok(quote! {
-            #prose
-            #vis #name: #ty
-        })
+        });
     }
+    if field.nullable {
+        // Null, not absent: no `skip_serializing_if`, so the key is always
+        // written. `default` is still here because a decoder that tolerates
+        // less than it emits helps nobody.
+        return Ok(quote! {
+            #prose
+            #[serde(default)]
+            #vis #name: ::core::option::Option<#ty>
+        });
+    }
+    Ok(quote! {
+        #prose
+        #vis #name: #ty
+    })
 }
 
 /// Whether a generated field may be spelled `pub`.
@@ -322,27 +568,239 @@ enum Visibility {
     Inherited,
 }
 
+fn default_fn_ident(owner: &Ident, prefix: &str, field: &str) -> Ident {
+    format_ident!(
+        "default_{prefix}{field}",
+        span = owner.span(),
+        prefix = prefix,
+        field = field
+    )
+}
+
+/// One function per defaulted field, because that is what serde's `default`
+/// attribute takes: a path to something that produces the value.
+fn default_fns(
+    owner: &Ident,
+    prefix: &str,
+    fields: &[Field],
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    span: Span,
+) -> syn::Result<TokenStream> {
+    let mut fns = Vec::new();
+    for field in fields {
+        let Some(value) = &field.default else {
+            continue;
+        };
+        let name = default_fn_ident(owner, prefix, &field.name);
+        let ty = rust_type(&field.ty, bindings, span);
+        let expr = default_expr(value, &field.ty, types, bindings, span)?;
+        let prose = doc_lines(&[format!(
+            "What the manifest says an absent `{}` means.",
+            field.name
+        )]);
+        fns.push(quote! {
+            #prose
+            #[doc(hidden)]
+            #[must_use]
+            pub fn #name() -> #ty { #expr }
+        });
+    }
+    if fns.is_empty() {
+        return Ok(TokenStream::new());
+    }
+    Ok(quote! { impl #owner { #(#fns)* } })
+}
+
+/// A shape every one of whose fields has a value when nobody supplied one has
+/// a canonical empty form, and that is what `Default` is.
+///
+/// Written out rather than derived, because a derive would use each Rust
+/// type's own default and the manifest's answer is not always that — an
+/// absent `include_history` is `true`, and `bool::default()` is not.
+fn default_impl(
+    ty: &Ident,
+    name: &str,
+    fields: &[Field],
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    span: Span,
+) -> syn::Result<TokenStream> {
+    if fields.iter().any(Field::is_required) {
+        return Ok(TokenStream::new());
+    }
+    let mut inits = Vec::new();
+    for field in fields {
+        let member = ident(&field.name, span)?;
+        let value = unspecified_value(field, types, bindings, span)?;
+        inits.push(quote! { #member: #value });
+    }
+    let prose = doc_lines(&[format!("A `{name}` in which nothing has been said.",)]);
+    Ok(quote! {
+        #prose
+        impl ::core::default::Default for #ty {
+            fn default() -> Self {
+                Self { #(#inits),* }
+            }
+        }
+    })
+}
+
+/// The value of a field nobody supplied: absent, null, or the manifest's
+/// default.
+fn unspecified_value(
+    field: &Field,
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    span: Span,
+) -> syn::Result<TokenStream> {
+    match &field.default {
+        Some(value) => default_expr(value, &field.ty, types, bindings, span),
+        None => Ok(quote! { ::core::option::Option::None }),
+    }
+}
+
+/// The manifest's JSON default, as the Rust value it describes.
+///
+/// Validation has already checked the JSON against the declared type, so
+/// every branch a manifest can reach is here and none of them can fail on the
+/// value's shape.
+fn default_expr(
+    value: &Value,
+    schema: &Schema,
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    span: Span,
+) -> syn::Result<TokenStream> {
+    match schema {
+        Schema::Nullable { nullable } => {
+            if value.is_null() {
+                Ok(quote! { ::core::option::Option::None })
+            } else {
+                let inner = default_expr(value, nullable, types, bindings, span)?;
+                Ok(quote! { ::core::option::Option::Some(#inner) })
+            }
+        }
+        Schema::Array { array } => {
+            let items = value.as_array().expect("validated as a list");
+            if items.is_empty() {
+                return Ok(quote! { ::std::vec::Vec::new() });
+            }
+            let elements = items
+                .iter()
+                .map(|item| default_expr(item, array, types, bindings, span))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote! { ::std::vec::Vec::from([#(#elements),*]) })
+        }
+        Schema::Named(name) => {
+            if let Some(scalar) = Scalar::from_keyword(name) {
+                return Ok(scalar_default(value, scalar));
+            }
+            let path = bindings.type_path(name, span);
+            match types.get(name.as_str()).copied() {
+                Some(TypeDef::Enum { variants, .. }) => {
+                    let text = value.as_str().expect("validated as an enum value");
+                    let variant = variants
+                        .iter()
+                        .find(|v| v.wire() == text)
+                        .expect("validated as a declared value");
+                    let arm = format_ident!("{}", pascal_case(&variant.name), span = span);
+                    Ok(quote! { #path::#arm })
+                }
+                Some(TypeDef::Struct { fields, .. }) => {
+                    let object = value.as_object().expect("validated as an object");
+                    let mut inits = Vec::new();
+                    for field in fields {
+                        let member = ident(&field.name, span)?;
+                        let init = match object.get(&field.name) {
+                            Some(inner) => {
+                                let expr = default_expr(inner, &field.ty, types, bindings, span)?;
+                                if field.optional || field.nullable {
+                                    quote! { ::core::option::Option::Some(#expr) }
+                                } else {
+                                    expr
+                                }
+                            }
+                            None => unspecified_value(field, types, bindings, span)?,
+                        };
+                        inits.push(quote! { #member: #init });
+                    }
+                    Ok(quote! { #path { #(#inits),* } })
+                }
+                // Validation rejects a default on a union and on an imported
+                // shape, so neither reaches here.
+                _ => Err(syn::Error::new(
+                    span,
+                    format!("`{name}` cannot carry a default"),
+                )),
+            }
+        }
+    }
+}
+
+fn scalar_default(value: &Value, scalar: Scalar) -> TokenStream {
+    match scalar {
+        Scalar::Bool => {
+            let flag = value.as_bool().expect("validated as a bool");
+            quote! { #flag }
+        }
+        Scalar::String => {
+            let text = value.as_str().expect("validated as a string");
+            quote! { ::std::string::String::from(#text) }
+        }
+        Scalar::Path => {
+            let text = value.as_str().expect("validated as a string");
+            quote! { ::std::path::PathBuf::from(#text) }
+        }
+        Scalar::Json => {
+            // The only scalar whose value has no Rust literal, so it is
+            // written as the JSON it is and parsed once. Validation accepted
+            // anything here, so nothing but the parse could fail, and the
+            // text came out of a parsed document.
+            let text = value.to_string();
+            quote! {
+                ::serde_json::from_str(#text)
+                    .expect("the manifest's default is JSON this file was parsed from")
+            }
+        }
+        Scalar::F64 => {
+            let number = value.as_f64().expect("validated as a number");
+            let literal = Literal::f64_unsuffixed(number);
+            quote! { #literal }
+        }
+        Scalar::I32 | Scalar::I64 => {
+            let number = value.as_i64().expect("validated as an integer");
+            let literal = Literal::i64_unsuffixed(number);
+            quote! { #literal }
+        }
+        Scalar::U32 | Scalar::U64 => {
+            let number = value.as_u64().expect("validated as an integer");
+            let literal = Literal::u64_unsuffixed(number);
+            quote! { #literal }
+        }
+    }
+}
+
 /// A struct's constructor, taking exactly what the shape requires.
 ///
 /// Generated only when there is something to require: a `new()` that takes
-/// nothing says less than the literal it replaces, and trips
-/// `clippy::new_without_default` on the way.
+/// nothing says less than the literal it replaces, and a shape with nothing
+/// required has a `Default` instead.
 fn constructor(
     ty: &Ident,
     name: &str,
     fields: &[Field],
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
     span: Span,
 ) -> syn::Result<Option<TokenStream>> {
-    let required: Vec<&Field> = fields.iter().filter(|f| !f.optional).collect();
+    let required: Vec<&Field> = fields.iter().filter(|f| f.is_required()).collect();
     if required.is_empty() {
         return Ok(None);
     }
-    let (params, inits) = ctor_parts(&required, fields, span)?;
+    let (params, inits) = ctor_parts(&required, fields, types, bindings, span)?;
     let mut lines = vec![format!("A `{name}`, given everything it requires.")];
-    if required.len() < fields.len() {
-        lines.push(String::new());
-        lines.push("Its optional fields start absent.".into());
-    }
+    lines.extend(rest_note(fields));
     let prose = doc_lines(&lines);
     Ok(Some(quote! {
         impl #ty {
@@ -356,46 +814,98 @@ fn constructor(
     }))
 }
 
-/// One constructor per union variant, named after the variant.
-fn variant_constructor(
+/// What a constructor says about the fields it did not take.
+fn rest_note(fields: &[Field]) -> Vec<String> {
+    let rest: Vec<&Field> = fields.iter().filter(|f| !f.is_required()).collect();
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    let line = if rest.iter().all(|f| f.optional) {
+        "Its optional fields start absent.".to_string()
+    } else {
+        "Its remaining fields start at what the manifest says an unspecified one means.".to_string()
+    };
+    vec![String::new(), line]
+}
+
+/// A union variant's constructor, and — for a variant carrying one whole
+/// shape — the accessor that gets it back out.
+///
+/// The accessor exists because a payload variant is the form a consumer
+/// chose in order to keep holding the shape: taking it apart to put it on the
+/// stream and rebuilding it at the far end is exactly what the payload form
+/// avoids.
+fn variant_members(
     ty: &Ident,
     arm: &Ident,
-    variant: &peerline_contract_spec::UnionVariant,
+    variant: &UnionVariant,
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
     span: Span,
-) -> syn::Result<Option<TokenStream>> {
-    let required: Vec<&Field> = variant.fields.iter().filter(|f| !f.optional).collect();
+) -> syn::Result<Vec<TokenStream>> {
     let name = ident(&variant.name, span)?;
+    if let Some(payload) = &variant.payload {
+        let inner = rust_type(payload, bindings, span);
+        let getter = format_ident!("as_{}", variant.name, span = span);
+        let ctor_docs = doc_lines(&[format!(
+            "The `{}` variant of `{ty}`, carrying one `{}`.",
+            variant.name,
+            rust_type_name(payload)
+        )]);
+        let getter_docs = doc_lines(&[format!(
+            "The payload, when this is the `{}` variant.",
+            variant.name
+        )]);
+        return Ok(vec![quote! {
+            #ctor_docs
+            #[must_use]
+            pub fn #name(#name: #inner) -> Self { Self::#arm(#name) }
+
+            #getter_docs
+            #[must_use]
+            pub fn #getter(&self) -> ::core::option::Option<&#inner> {
+                match self {
+                    Self::#arm(payload) => ::core::option::Option::Some(payload),
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }]);
+    }
     if variant.fields.is_empty() {
         let prose = doc_lines(&[format!("The `{}` variant of `{ty}`.", variant.name)]);
-        return Ok(Some(quote! {
+        return Ok(vec![quote! {
             #prose
             #[must_use]
             pub fn #name() -> Self { Self::#arm }
-        }));
+        }]);
     }
-    let (params, inits) = ctor_parts(&required, &variant.fields, span)?;
+    let required: Vec<&Field> = variant.fields.iter().filter(|f| f.is_required()).collect();
+    let (params, inits) = ctor_parts(&required, &variant.fields, types, bindings, span)?;
     let mut lines = vec![format!(
         "The `{}` variant of `{ty}`, given everything it requires.",
         variant.name
     )];
-    if required.len() < variant.fields.len() {
-        lines.push(String::new());
-        lines.push("Its optional fields start absent.".into());
-    }
+    lines.extend(rest_note(&variant.fields));
     let prose = doc_lines(&lines);
-    Ok(Some(quote! {
+    Ok(vec![quote! {
         #prose
         #[must_use]
         #[allow(clippy::too_many_arguments)]
         pub fn #name(#(#params),*) -> Self {
             Self::#arm { #(#inits),* }
         }
-    }))
+    }])
 }
 
 type CtorParts = (Vec<TokenStream>, Vec<TokenStream>);
 
-fn ctor_parts(required: &[&Field], all: &[Field], span: Span) -> syn::Result<CtorParts> {
+fn ctor_parts(
+    required: &[&Field],
+    all: &[Field],
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    span: Span,
+) -> syn::Result<CtorParts> {
     let mut params = Vec::new();
     for field in required {
         let name = ident(&field.name, span)?;
@@ -409,7 +919,7 @@ fn ctor_parts(required: &[&Field], all: &[Field], span: Span) -> syn::Result<Cto
                 quote! { #name: impl ::core::convert::Into<::std::path::PathBuf> }
             }
             other => {
-                let ty = rust_type(other, span);
+                let ty = rust_type(other, bindings, span);
                 quote! { #name: #ty }
             }
         };
@@ -418,71 +928,116 @@ fn ctor_parts(required: &[&Field], all: &[Field], span: Span) -> syn::Result<Cto
     let mut inits = Vec::new();
     for field in all {
         let name = ident(&field.name, span)?;
-        if field.optional {
-            inits.push(quote! { #name: ::core::option::Option::None });
-        } else {
-            match &field.ty {
-                Schema::Named(n)
-                    if matches!(Scalar::from_keyword(n), Some(Scalar::String | Scalar::Path)) =>
-                {
-                    inits.push(quote! { #name: #name.into() });
-                }
-                _ => inits.push(quote! { #name }),
+        if !field.is_required() {
+            let value = unspecified_value(field, types, bindings, span)?;
+            inits.push(quote! { #name: #value });
+            continue;
+        }
+        match &field.ty {
+            Schema::Named(n)
+                if matches!(Scalar::from_keyword(n), Some(Scalar::String | Scalar::Path)) =>
+            {
+                inits.push(quote! { #name: #name.into() });
             }
+            _ => inits.push(quote! { #name }),
         }
     }
     Ok((params, inits))
 }
 
-fn fields_schemas(fields: &[Field]) -> Vec<Schema> {
-    fields.iter().map(|f| f.ty.clone()).collect()
+/// How far up the ladder a shape goes, read off the manifest.
+///
+/// Not a cosmetic question: a type that can be a `HashMap` key or compared
+/// with `assert_eq!` on both halves of a seam is more useful than one that
+/// cannot, and what rules it out is an `f64` or a passthrough `json`
+/// somewhere in the shape. The manifest already says which, so the derives
+/// follow from it rather than from somebody remembering — the one exception
+/// being an imported shape, whose fields are in another file. See
+/// [`Bindings`].
+fn support_of(def: &TypeDef, types: &BTreeMap<&str, &TypeDef>, bindings: &Bindings) -> Support {
+    let mut seen = BTreeSet::new();
+    type_support(def, types, bindings, &mut seen)
 }
 
-/// `Eq` where the shape admits it.
-///
-/// Not a cosmetic derive: a type that can be a `HashMap` key or compared with
-/// `assert_eq!` on both halves of a seam is more useful than one that cannot,
-/// and the only thing that can rule it out is a `f64` or a passthrough `json`
-/// somewhere in the shape. The manifest already says which, so the derive
-/// follows from it rather than from somebody remembering.
-fn eq_derive(schemas: &[Schema], types: &BTreeMap<&str, &TypeDef>) -> TokenStream {
-    let mut seen = BTreeSet::new();
-    if schemas.iter().all(|s| exact(s, types, &mut seen)) {
-        quote! { ::core::cmp::Eq, }
-    } else {
-        TokenStream::new()
+fn type_support(
+    def: &TypeDef,
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    seen: &mut BTreeSet<String>,
+) -> Support {
+    match def {
+        TypeDef::Enum { .. } => Support::Copy,
+        TypeDef::Struct { fields, .. } => fields
+            .iter()
+            .map(|f| schema_support(&f.ty, types, bindings, seen))
+            .min()
+            .unwrap_or(Support::Copy),
+        TypeDef::Union { variants, .. } => {
+            // A union is never `Copy` today and nothing here changes that: a
+            // payload variant holds whatever the payload is, and a shape that
+            // gained a `Copy` it did not have would be an API change made by
+            // a field nobody touched.
+            let inner = variants
+                .iter()
+                .flat_map(|v| {
+                    v.fields
+                        .iter()
+                        .map(|f| &f.ty)
+                        .chain(v.payload.iter())
+                        .map(|s| schema_support(s, types, bindings, seen))
+                        .collect::<Vec<_>>()
+                })
+                .min()
+                .unwrap_or(Support::Total);
+            inner.min(Support::Total)
+        }
     }
 }
 
-fn exact(schema: &Schema, types: &BTreeMap<&str, &TypeDef>, seen: &mut BTreeSet<String>) -> bool {
+fn schema_support(
+    schema: &Schema,
+    types: &BTreeMap<&str, &TypeDef>,
+    bindings: &Bindings,
+    seen: &mut BTreeSet<String>,
+) -> Support {
     match schema {
-        Schema::Array { array } => exact(array, types, seen),
+        // A list is never `Copy`, whatever it holds.
+        Schema::Array { array } => schema_support(array, types, bindings, seen).min(Support::Total),
+        // An absent-or-null value supports exactly what the value does.
+        Schema::Nullable { nullable } => schema_support(nullable, types, bindings, seen),
         Schema::Named(name) => {
             if let Some(scalar) = Scalar::from_keyword(name) {
-                return scalar.is_exact();
+                return match (scalar.is_exact(), scalar.is_small()) {
+                    (true, true) => Support::Copy,
+                    (true, false) => Support::Total,
+                    (false, _) => Support::Partial,
+                };
             }
+            if bindings.is_imported(name) {
+                return bindings.imported_support(name);
+            }
+            // A cycle can only be through a list, which the validator
+            // insisted on, and a list has already capped the rung.
             if !seen.insert(name.clone()) {
-                return true;
+                return Support::Copy;
             }
-            match types.get(name.as_str()) {
-                Some(TypeDef::Struct { fields, .. }) => {
-                    fields.iter().all(|f| exact(&f.ty, types, seen))
-                }
-                Some(TypeDef::Union { variants, .. }) => variants
-                    .iter()
-                    .all(|v| v.fields.iter().all(|f| exact(&f.ty, types, seen))),
-                Some(TypeDef::Enum { .. }) => true,
-                None => true,
+            match types.get(name.as_str()).copied() {
+                Some(def) => type_support(def, types, bindings, seen),
+                None => Support::Total,
             }
         }
     }
 }
 
-fn rust_type(schema: &Schema, span: Span) -> TokenStream {
+fn rust_type(schema: &Schema, bindings: &Bindings, span: Span) -> TokenStream {
     match schema {
         Schema::Array { array } => {
-            let inner = rust_type(array, span);
+            let inner = rust_type(array, bindings, span);
             quote! { ::std::vec::Vec<#inner> }
+        }
+        Schema::Nullable { nullable } => {
+            let inner = rust_type(nullable, bindings, span);
+            quote! { ::core::option::Option<#inner> }
         }
         Schema::Named(name) => match Scalar::from_keyword(name) {
             Some(Scalar::String) => quote! { ::std::string::String },
@@ -494,10 +1049,7 @@ fn rust_type(schema: &Schema, span: Span) -> TokenStream {
             Some(Scalar::F64) => quote! { f64 },
             Some(Scalar::Path) => quote! { ::std::path::PathBuf },
             Some(Scalar::Json) => quote! { ::serde_json::Value },
-            None => {
-                let ident = format_ident!("{}", name, span = span);
-                quote! { #ident }
-            }
+            None => bindings.type_path(name, span),
         },
     }
 }
@@ -506,6 +1058,7 @@ fn rust_type(schema: &Schema, span: Span) -> TokenStream {
 fn rust_type_name(schema: &Schema) -> String {
     match schema {
         Schema::Array { array } => format!("Vec<{}>", rust_type_name(array)),
+        Schema::Nullable { nullable } => format!("Option<{}>", rust_type_name(nullable)),
         Schema::Named(name) => match Scalar::from_keyword(name) {
             Some(Scalar::String) => "String".into(),
             Some(Scalar::Path) => "PathBuf".into(),
@@ -576,123 +1129,4 @@ fn ident(name: &str, span: Span) -> syn::Result<Ident> {
 }
 
 #[cfg(test)]
-mod tests {
-    //! What the expansion *says*, as tokens.
-    //!
-    //! Reachable only from here: a doc comment leaves no runtime trace, so
-    //! the only place the manifest's prose can be checked to have arrived is
-    //! against the token stream, before it is handed to the compiler.
-
-    use super::*;
-
-    const FIXTURE: &str = r#"{
-        "contract": "demo.thing", "version": 1,
-        "description": "Why this contract exists.",
-        "types": [
-            { "form": "struct", "name": "Args", "description": "What a call carries.",
-              "fields": [
-                { "name": "id", "type": "string", "description": "Which one." },
-                { "name": "extra", "type": "json", "optional": true,
-                  "description": "Anything else." } ] },
-            { "form": "enum", "name": "Level", "description": "How bad.",
-              "variants": [ { "name": "gone_away", "description": "It left." } ] },
-            { "form": "union", "name": "Note", "tag": "kind", "description": "One item.",
-              "variants": [ { "name": "line", "description": "Something was said.",
-                              "fields": [ { "name": "text", "type": "string",
-                                            "description": "What was said." } ] } ] }
-        ],
-        "errors": [ { "name": "demo", "code": 9, "data": "Args",
-                      "description": "It did not work." } ],
-        "ops": [
-            { "name": "demo.thing.go", "kind": "unary", "args": "Args",
-              "description": "Do the thing." },
-            { "name": "demo.thing.watch", "kind": "stream", "args": "Args", "item": "Note",
-              "errors": ["demo"], "description": "Watch the thing." }
-        ]
-    }"#;
-
-    fn expansion() -> String {
-        let manifest = Manifest::parse(FIXTURE).expect("the fixture is valid");
-        contract(&manifest, Path::new("/tmp/demo.v1.json"), Span::call_site())
-            .expect("the fixture expands")
-            .to_string()
-    }
-
-    /// The reasoning moves. A generator that dropped the manifest's prose
-    /// would leave the contract's documentation in a file nobody reading the
-    /// Rust ever opens, which is the failure this whole format exists to fix.
-    #[test]
-    fn every_description_in_the_manifest_becomes_a_doc_comment() {
-        let tokens = expansion();
-        for expected in [
-            "Why this contract exists.",
-            "What a call carries.",
-            "Which one.",
-            "Anything else.",
-            "How bad.",
-            "It left.",
-            "One item.",
-            "Something was said.",
-            "What was said.",
-            "It did not work.",
-            "Do the thing.",
-            "Watch the thing.",
-        ] {
-            assert!(
-                tokens.contains(&format!("doc = \" {expected}\"")),
-                "`{expected}` did not reach the expansion",
-            );
-        }
-    }
-
-    /// The kind is in the docs as well as in the table, because the first
-    /// thing a caller needs to know about an op is which call to make.
-    #[test]
-    fn an_ops_docs_name_its_kind_and_its_shapes() {
-        let tokens = expansion();
-        assert!(tokens.contains("Kind: unary. Args: `Args`. Result: empty."));
-        assert!(tokens.contains("Kind: stream. Args: `Args`. Items: `Note`."));
-        assert!(tokens.contains("Raises: `ERR_DEMO`."));
-    }
-
-    /// Without this the compiled types outlive the file they came from — the
-    /// one failure a design whose claim is "they cannot drift" cannot afford.
-    #[test]
-    fn the_expansion_declares_the_manifest_as_a_source_input() {
-        let tokens = expansion();
-        assert!(tokens.contains("include_bytes"), "{tokens}");
-        assert!(tokens.contains("\"/tmp/demo.v1.json\""), "{tokens}");
-    }
-
-    /// A contract version is additive, so a reader must tolerate a value it
-    /// has not heard of. Structs are not marked, because a caller has to be
-    /// able to write one out field by field.
-    #[test]
-    fn enums_are_open_and_structs_are_not() {
-        let tokens = expansion();
-        assert_eq!(
-            tokens.matches("non_exhaustive").count(),
-            2,
-            "one for each of `Level` and `Note`, and none for `Args`: {tokens}",
-        );
-    }
-
-    /// An optional field is absent on the way out, not null.
-    #[test]
-    fn optional_fields_are_omitted_rather_than_nulled() {
-        assert!(expansion().contains("skip_serializing_if = \"::core::option::Option::is_none\""));
-    }
-
-    /// A manifest is not a Rust file, and another target would take a name
-    /// Rust reserves without complaint — so Rust takes it too, as a raw
-    /// identifier, and the wire name is unchanged.
-    #[test]
-    fn a_field_named_after_a_rust_keyword_becomes_a_raw_identifier() {
-        let json = FIXTURE.replace(r#""name": "id""#, r#""name": "type""#);
-        let manifest = Manifest::parse(&json).expect("`type` is a fine wire name");
-        let tokens = contract(&manifest, Path::new("/tmp/demo.v1.json"), Span::call_site())
-            .expect("expands")
-            .to_string();
-        assert!(tokens.contains("r#type"), "{tokens}");
-    }
-}
+mod tests;

@@ -15,6 +15,27 @@ expansion declares the manifest as a source input, so editing the file
 rebuilds the crate rather than leaving compiled types describing a
 contract that no longer exists.
 
+A manifest that imports shapes from another names it by contract and
+version. Which Rust module supplies those shapes is a fact about the build
+rather than about the contract, so it is written at the call site — as is
+`supports`, which answers the one question an imported shape leaves open:
+how far up the comparison ladder the Rust type goes, since its fields are in
+a file this expansion never opens.
+
+```rust,ignore
+peerline_contract::contract!(
+    "contracts/coagent.runtime.v1.json",
+    imports { "coagent.rpc/1" => ::coagent_rpc },
+    supports { SessionInfo: none },
+);
+```
+
+Everything else about the generated derives is read off the manifest: a
+record of exact scalars carries `Eq`, one holding an `f64` does not, and one
+whose fields are all fixed-size is `Copy`. None of those is a key, because
+none of them is something the contract says — they follow from what it
+already said.
+
 Reach it through
 [peerline-contract](https://crates.io/crates/peerline-contract), which
 re-exports both this macro and the format it reads

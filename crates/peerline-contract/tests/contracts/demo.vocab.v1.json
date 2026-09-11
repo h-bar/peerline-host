@@ -1,0 +1,35 @@
+{
+  "contract": "demo.vocab",
+  "version": 1,
+  "role": "vocabulary",
+  "description": [
+    "Shapes that travel in more than one contract.",
+    "",
+    "Nobody produces this file and nobody calls it: it exists so that a shape carried by two contracts is one declaration rather than two, and so that an implementor reading either contract is told they are the same shape rather than left to notice."
+  ],
+
+  "types": [
+    {
+      "form": "enum",
+      "name": "Direction",
+      "description": ["Which way an event travelled."],
+      "variants": [
+        { "name": "input", "wire": "in",
+          "description": ["From the caller. The wire value is shorter than the name, which is the whole reason the two are separate keys."] },
+        { "name": "output", "wire": "out",
+          "description": ["From the producer."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Meta",
+      "description": ["When an event happened and which way it went. Fixed-size throughout, so a target that distinguishes copyable values may treat it as one."],
+      "fields": [
+        { "name": "timestamp_ms", "type": "i64",
+          "description": ["Milliseconds since the epoch, assigned by the producer."] },
+        { "name": "direction", "type": "Direction",
+          "description": ["Which way it went."] }
+      ]
+    }
+  ]
+}

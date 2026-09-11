@@ -82,6 +82,21 @@
 //! manifest too, because it is contract documentation rather than Rust
 //! documentation, and it is emitted as doc comments on whatever is generated.
 //!
+//! A manifest may also be a **vocabulary**: named shapes and no ops, for
+//! other manifests to import. It exists because a shape can travel in
+//! several contracts, and three restatements of one shape are three things
+//! that can drift with nothing saying they were ever the same. An import
+//! names a contract and a version — never a Rust path, which would mean
+//! nothing to an implementor who is not writing Rust — and the call site
+//! says which module supplies it:
+//!
+//! ```ignore
+//! peerline_contract::contract!(
+//!     "contracts/coagent.runtime.v1.json",
+//!     imports { "coagent.rpc/1" => ::coagent_rpc },
+//! );
+//! ```
+//!
 //! **Two things here are called a manifest, and they are different.**
 //! [`manifest`] is what a *binary* reports when probed: which contracts each
 //! of its mounted services produces and consumes. [`spec`] is what a
@@ -116,8 +131,12 @@ pub use peerline_contract_spec as spec;
 /// result and item types, the error codes, and the manifest's own prose as
 /// doc comments.
 ///
-/// Takes one string literal — the manifest's path, relative to the invoking
-/// crate's `Cargo.toml`. See the crate docs.
+/// Takes the manifest's path, relative to the invoking crate's `Cargo.toml`,
+/// and two optional clauses — `imports`, binding each imported contract to
+/// the Rust module that supplies it, and `supports`, answering for what an
+/// imported Rust type can do. Both are at the call site rather than in the
+/// file because both are facts about this target and not about the contract.
+/// See the crate docs.
 pub use peerline_contract_macros::contract;
 
 use std::fmt;

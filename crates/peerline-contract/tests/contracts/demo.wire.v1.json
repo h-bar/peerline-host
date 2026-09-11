@@ -1,0 +1,147 @@
+{
+  "contract": "demo.wire",
+  "version": 1,
+  "description": [
+    "A contract that exists to exercise the wire forms the format grew keys for.",
+    "",
+    "Every shape here is one that could not be written before: a value whose wire spelling is not an identifier, a field that is null rather than absent, a field whose absence has a value, a union tagged by its key rather than inside itself, an arm that carries a whole shape, a field whose keys are its parent's, and a shape imported from somewhere else."
+  ],
+
+  "imports": [
+    { "contract": "demo.vocab", "version": 1, "types": ["Meta"],
+      "description": ["The event envelope, shared with every other contract that carries events. Restating it here would be a second definition with nothing saying the two are the same."] }
+  ],
+
+  "types": [
+    {
+      "form": "enum",
+      "name": "Backend",
+      "description": ["Which backend a session runs against."],
+      "variants": [
+        { "name": "claude_code", "wire": "claude-code",
+          "description": ["Two words on the wire, hyphenated. A live TypeScript consumer reads this exact spelling, so it is the contract and not a rendering choice."] },
+        { "name": "codex",
+          "description": ["One word, so the name and the wire value are the same and only one of them is written."] }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "KindFilter",
+      "tagging": "external",
+      "description": [
+        "Which backends a read keeps.",
+        "",
+        "Externally tagged because each arm carries a list, and there is nowhere inside a JSON array to put a discriminator key."
+      ],
+      "variants": [
+        { "name": "only", "payload": { "array": "Backend" },
+          "description": ["Keep rows whose backend is in the set. An empty set keeps nothing."] },
+        { "name": "except", "payload": { "array": "Backend" },
+          "description": ["Drop rows whose backend is in the set. An empty set drops nothing."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Filter",
+      "description": ["The row predicate for one read. Every field is null rather than absent, because that is the form this wire already had before it was written down."],
+      "fields": [
+        { "name": "since_ms", "type": "i64", "nullable": true,
+          "description": ["Exclusive lower bound, or null for the start of the log."] },
+        { "name": "kinds", "type": "KindFilter", "nullable": true,
+          "description": ["The backend filter, or null for no filtering."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "ListParams",
+      "description": ["What a listing takes. Both fields have a value when nobody said, which is what makes the empty object a complete request."],
+      "fields": [
+        { "name": "include_history", "type": "bool", "default": true,
+          "description": [
+            "Whether to merge ended sessions into the answer.",
+            "",
+            "Absent means true, which is what a person looking at a list wants. A caller that only needs the live population sets it false; a reader who assumed false would quietly get a different answer than the contract gives."
+          ] },
+        { "name": "filter", "type": "Filter", "default": {},
+          "description": ["The row predicate. Absent means the filter that selects everything."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Session",
+      "description": ["What starting a session takes."],
+      "fields": [
+        { "name": "backend", "type": "Backend",
+          "description": ["Which backend to run."] },
+        { "name": "working_dir", "type": "path",
+          "description": ["Where the backend runs. Resolved on the producer's machine."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "StartArgs",
+      "description": [
+        "What this contract's start takes: the caller's own request, plus what this producer needs on top of it.",
+        "",
+        "The request is carried whole and its keys are the ones on the wire. Re-spelling them here would be a second definition of a shape the caller already sends."
+      ],
+      "fields": [
+        { "name": "session", "type": "Session", "flatten": true,
+          "description": ["The caller's request. Not a key: its own keys are written here."] },
+        { "name": "max_event_ts", "type": "i64", "optional": true,
+          "description": ["The resume seed, when the caller has one. Absent rather than null, because there is nothing to say and this field was written after the recommendation."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Event",
+      "description": ["One thing that happened."],
+      "fields": [
+        { "name": "meta", "type": "Meta",
+          "description": ["When it happened and which way it went."] },
+        { "name": "line", "type": "string",
+          "description": ["The raw line that crossed."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Cursor",
+      "description": ["Where a reader has got to. Nothing here is larger than a machine word, which is what decides whether a target passes it by value."],
+      "fields": [
+        { "name": "meta", "type": "Meta",
+          "description": ["The last envelope seen."] }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "Item",
+      "tag": "item",
+      "description": [
+        "One item on the watch stream.",
+        "",
+        "The event arm carries the event whole rather than restating its keys: a consumer that already holds one puts it on the stream and takes it off again, instead of taking it apart at one end and rebuilding it at the other."
+      ],
+      "variants": [
+        { "name": "event", "payload": "Event",
+          "description": ["One event. Its keys sit beside the discriminator."] },
+        { "name": "gap",
+          "description": ["Events this reader will never receive, reported rather than skipped."],
+          "fields": [
+            { "name": "lost", "type": "u64",
+              "description": ["How many, as an upper bound."] }
+          ] }
+      ]
+    }
+  ],
+
+  "ops": [
+    { "name": "demo.wire.list", "kind": "unary", "args": "ListParams", "result": { "array": "Event" },
+      "description": ["Every matching event."] },
+    { "name": "demo.wire.latest", "kind": "unary", "args": "ListParams", "result": { "nullable": "Event" },
+      "description": ["The newest matching event, or nothing at all when there is none. Not an absent result: this op answers, and sometimes the answer is that there is none."] },
+    { "name": "demo.wire.start", "kind": "unary", "args": "StartArgs", "result": "Cursor",
+      "description": ["Start a session and answer where its stream begins."] },
+    { "name": "demo.wire.watch", "kind": "stream", "args": "StartArgs", "item": "Item",
+      "description": ["The session's items, as they happen."] }
+  ]
+}
