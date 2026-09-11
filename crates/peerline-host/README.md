@@ -46,6 +46,14 @@ any of the shutdown path ran. A service that also honours
 `PEERLINE_SERVICE_UDS` when choosing its mount address binds the address the
 cluster config says it does.
 
+It also stops when its **lifeline** closes. A supervisor may hand a child an
+inherited pipe and name its descriptor in `PEERLINE_LIFELINE_FD`; EOF on it
+means the supervisor is gone, and takes the same shutdown path as `SIGTERM`.
+That is what makes it impossible for a supervised service to outlive its
+supervisor, including when the supervisor was `SIGKILL`ed and ran no cleanup
+of its own. **No variable, no lifeline, no change:** a service run by hand or
+by systemd behaves exactly as before.
+
 See the [peerline-host repository](https://github.com/h-bar/peerline-host)
 for the coordinator, and the
 [peerline repository](https://github.com/h-bar/peerline) for the wire

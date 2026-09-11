@@ -63,11 +63,21 @@
 //! declares, and the environment variable that asks. It is here for the same
 //! reason: a host writes it, a supervisor reads it, and neither may depend on
 //! the other.
+//!
+//! # The lifeline
+//!
+//! [`lifeline`] carries the one variable that travels the other way round the
+//! same loop: a supervisor hands each child an inherited pipe and names its
+//! descriptor there, and the child stops when that pipe reports EOF — which is
+//! what makes it impossible for a supervised child to outlive its supervisor,
+//! however the supervisor died. Here for the third time for the same reason,
+//! and stated once so that the two ends cannot drift.
 
 #![forbid(unsafe_code)]
 
 pub mod coord;
 pub mod env;
+pub mod lifeline;
 pub mod manifest;
 
 use std::fmt;

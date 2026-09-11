@@ -20,7 +20,10 @@ iroh = ["dep:peerline-transport-iroh"]
 
 [dependencies]
 futures = "0.3"
-tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
+# `net` is not for a transport — the transports bring their own. It is what
+# puts `tokio::net::unix::pipe` in scope, which is how the lifeline is watched
+# for EOF on the reactor rather than on a thread of its own.
+tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 peerline = { workspace = true }
 # The cluster control path: what a service produces and consumes, the `coord.*`

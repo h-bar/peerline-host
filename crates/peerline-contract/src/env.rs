@@ -32,6 +32,10 @@
 //!   that ignores it silently disagrees with the file an operator is reading.
 //! - [`MANIFEST_OUT_ENV`] — the probe (see [`crate::manifest`]). Named here
 //!   too so that every variable a supervisor sets is in one list.
+//! - [`LIFELINE_FD_ENV`] — the descriptor whose EOF means *your supervisor is
+//!   gone, stop* (see [`crate::lifeline`]). **Unset means no supervisor is
+//!   watching**, which is how a service run by hand or by systemd always runs,
+//!   and changes nothing else about it.
 //!
 //! Injected values **win over an entry's own `env`**: the supervisor is
 //! asserting where things actually are, and a config that also sets one of
@@ -40,6 +44,7 @@
 //! An empty value is treated as unset everywhere. An exported-but-blank
 //! variable is a shell or supervisor artefact, never a request to dial `""`.
 
+pub use crate::lifeline::LIFELINE_FD_ENV;
 pub use crate::manifest::MANIFEST_OUT_ENV;
 
 /// The Unix socket of the coordinator a service should register with.

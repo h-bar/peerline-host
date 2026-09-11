@@ -73,8 +73,32 @@
 //! exits 0 without binding anything. That is how a supervisor learns the
 //! contract graph: from the binary, which is the only thing that cannot drift
 //! from the code. See [`peerline_contract::manifest`].
+//!
+//! # A host cannot outlive its supervisor
+//!
+//! A supervisor that spawns a host may hand it a **lifeline**: an inherited
+//! pipe, named in `PEERLINE_LIFELINE_FD`, whose write end only the supervisor
+//! holds. [`Host::run_until`] watches it, and EOF — which the kernel produces
+//! when the last write end closes, whatever killed the supervisor — takes the
+//! same shutdown path as `SIGTERM`. That is a *structural* guarantee rather
+//! than a cooperative one: a supervisor cannot skip it by dying in a way that
+//! skips its own cleanup, which is exactly how orphaned clusters happen. See
+//! [`peerline_contract::lifeline`].
+//!
+//! **No variable, no lifeline, no difference.** A service run by hand, by
+//! systemd or by a test behaves precisely as it always has.
+//!
+//! # `unsafe`
+//!
+//! One module, [`lifeline`], adopts a file descriptor the kernel handed this
+//! process across an `exec` — the one thing in this crate that cannot be
+//! spelled safely, since only the caller can know that an integer names a
+//! descriptor it owns. It stats the descriptor before claiming it, so the
+//! claim is checked rather than asserted. That is why the crate says `deny`
+//! rather than `forbid`, and nothing else in it is permitted the same
+//! latitude.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 // Only `reject_dupes` needs it, and that exists only when some transport
 // can actually be mounted.
@@ -100,6 +124,8 @@ mod bindings;
 #[cfg(feature = "uds")]
 mod coordinator;
 mod hostid;
+#[cfg(unix)]
+mod lifeline;
 
 pub use bindings::{Bindings, Connection};
 pub use hostid::host_id;
@@ -621,6 +647,10 @@ impl Host {
     /// a human pressing Ctrl-C. Both signals resolve the same future and
     /// [`Host::run`] returns `Ok(())`: a clean stop, distinct from the
     /// non-zero "restart me" of an error.
+    ///
+    /// A **lifeline**, if this process was given one, is a third way to reach
+    /// that same path — and unlike the signals it does not depend on anybody
+    /// remembering to send anything. See [`Host::run_until`].
     pub async fn run(self) -> Result<(), String> {
         self.run_until(terminate()).await
     }
@@ -638,6 +668,21 @@ impl Host {
     ///
     /// With `PEERLINE_MANIFEST_OUT` set it binds nothing, writes the manifest
     /// to that path and returns `Ok(())`.
+    ///
+    /// # The lifeline is not one of the caller's choices
+    ///
+    /// `shutdown` replaces the *signals* [`Host::run`] would have waited on,
+    /// because which signal means "stop" is the caller's business. The
+    /// lifeline is watched here regardless, because it is not a policy: it is
+    /// the answer to "is the process that started me still alive", and a host
+    /// that supplied its own shutdown future has not thereby volunteered to
+    /// outlive its supervisor. A caller that wants a drain on the way out gets
+    /// it either way — the lifeline resolves this method exactly as its own
+    /// future would, with the same `Ok(())`.
+    ///
+    /// With no `PEERLINE_LIFELINE_FD` in the environment there is no lifeline
+    /// and this is `shutdown` alone, which is how every host not started by a
+    /// supervisor runs.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> Result<(), String> {
         if self.services.is_empty() {
             return Err("peerline-host: no services registered".into());
@@ -695,14 +740,25 @@ impl Host {
 
         info!(services = self.services.len(), "peerline-host starting");
 
+        // Taken *after* the probe and the plan, so that a manifest probe and a
+        // misconfiguration both still behave exactly as they did — and before
+        // anything binds, so a supervisor that is already gone is discovered
+        // before this process claims an address.
+        let lifeline = lifeline_closed();
+
         // Shutdown wins over everything to its right, including a bind that has
         // not finished: an iroh endpoint takes seconds to bind and may fail,
         // and a host asked to stop must not first wait that out.
         tokio::pin!(shutdown);
+        tokio::pin!(lifeline);
         tokio::select! {
             biased;
             () = &mut shutdown => {
                 info!("peerline-host: shutdown signal received, stopping");
+                Ok(())
+            }
+            () = &mut lifeline => {
+                info!("peerline-host: the supervisor is gone, stopping");
                 Ok(())
             }
             r = self.lifecycle(&prepared, plan) => r,
@@ -1205,6 +1261,33 @@ fn write_manifest(manifest: &Manifest, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("peerline-host: cannot write {}: {e}", path.display()))?;
     info!(path = %path.display(), "peerline-host: wrote manifest and exiting");
     Ok(())
+}
+
+/// Resolve when the supervisor that spawned this process goes away — or
+/// never, if nothing is supervising it.
+///
+/// A property of the *process*, not of any one [`Host`]: the descriptor is
+/// taken once, and a second host in the same process sees the same "absent"
+/// it would see on a machine with no supervisor.
+///
+/// The `unix` gate is the one the module carries. A platform without file
+/// descriptors has no lifeline, which is the supported absent case and not a
+/// degradation.
+async fn lifeline_closed() {
+    #[cfg(unix)]
+    match lifeline::take() {
+        lifeline::Lifeline::Held(fd) => return lifeline::closed(fd).await,
+        lifeline::Lifeline::Absent => {}
+        lifeline::Lifeline::Unusable(why) => warn!(
+            reason = %why,
+            variable = peerline_contract::lifeline::LIFELINE_FD_ENV,
+            "peerline-host: the lifeline variable is set but unusable; running without one"
+        ),
+    }
+    // Absent, unusable, or not unix. Waiting on nothing is the whole of
+    // "behaves exactly as it always has": a future that resolved instead would
+    // stop the host the moment it started.
+    std::future::pending::<()>().await;
 }
 
 /// Resolve on `SIGINT` or, on unix, `SIGTERM` — whichever arrives first.
