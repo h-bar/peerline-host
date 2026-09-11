@@ -2310,6 +2310,26 @@ dependencies = [
 name = "peerline-contract"
 version = "0.0.7"
 dependencies = [
+ "peerline-contract-macros",
+ "peerline-contract-spec",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "peerline-contract-macros"
+version = "0.0.7"
+dependencies = [
+ "peerline-contract-spec",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "peerline-contract-spec"
+version = "0.0.7"
+dependencies = [
  "serde",
  "serde_json",
 ]

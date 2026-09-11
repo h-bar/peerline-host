@@ -11,6 +11,12 @@ categories = ["network-programming", "encoding"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# The contract manifest format and the macro that compiles one into Rust.
+# Both are re-exported, so a crate that implements a contract names this one
+# dependency rather than three — and cannot end up with a macro and a format
+# from two different versions.
+peerline-contract-macros = { workspace = true }
+peerline-contract-spec = { workspace = true }
 # The manifest envelope is written by one process and read by another, so the
 # encoding is defined here once rather than spelled on each side.
 serde_json = "1"

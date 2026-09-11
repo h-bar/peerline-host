@@ -1,0 +1,16 @@
+[package]
+name = "peerline-contract-spec"
+description = "The contract manifest format: a language-neutral JSON description of one peerline contract — its ops, their kind (unary or stream), their argument / result / item shapes, its error codes, and the prose explaining why each is what it is. Parsing and validation only; `peerline-contract-macros` turns one into Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["rpc", "peer-to-peer", "service", "contract", "peerline"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# A manifest is a JSON file on disk written by whoever owns the contract, so
+# this crate reads one rather than being handed a parsed value.
+serde_json = "1"

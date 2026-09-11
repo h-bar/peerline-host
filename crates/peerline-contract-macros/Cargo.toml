@@ -1,0 +1,22 @@
+[package]
+name = "peerline-contract-macros"
+description = "The `contract!` proc macro: expands a peerline contract manifest into the Rust that implements it — op name constants, argument / result / item types, error codes, and the manifest's own prose as doc comments. Use it through `peerline-contract`, which re-exports it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["rpc", "peer-to-peer", "service", "contract", "peerline"]
+categories = ["network-programming", "development-tools"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", default-features = false, features = ["parsing", "printing", "proc-macro"] }
+# The manifest format itself. Defined in its own crate rather than here
+# because a proc-macro crate can export nothing but macros, and the format has
+# to be readable by a conformance checker and by tooling that is not a macro.
+peerline-contract-spec = { workspace = true }

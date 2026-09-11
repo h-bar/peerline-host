@@ -10,6 +10,8 @@
 [workspace]
 members = [
     "crates/peerline-contract",
+    "crates/peerline-contract-macros",
+    "crates/peerline-contract-spec",
     "crates/peerline-host",
 ]
 resolver = "2"
@@ -32,4 +34,6 @@ peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds", v
 peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh", version = "0.0.7" }
 # Workspace members, same pattern.
 peerline-contract = { path = "crates/peerline-contract", version = "0.0.7" }
+peerline-contract-macros = { path = "crates/peerline-contract-macros", version = "0.0.7" }
+peerline-contract-spec = { path = "crates/peerline-contract-spec", version = "0.0.7" }
 peerline-host = { path = "crates/peerline-host", version = "0.0.7" }

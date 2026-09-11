@@ -64,6 +64,29 @@
 //! reason: a host writes it, a supervisor reads it, and neither may depend on
 //! the other.
 //!
+//! # Contract manifests
+//!
+//! Everything above is the *control* path: what a service declares and what a
+//! coordinator hands back. A contract's own vocabulary — its ops, their
+//! argument and result shapes, its error codes — is not spelled in Rust at
+//! all. It is a **contract manifest**: a language-neutral JSON file, described
+//! by [`spec`], from which [`contract!`] generates the Rust at compile time.
+//!
+//! ```ignore
+//! peerline_contract::contract!("contracts/codex.server.v1.json");
+//! ```
+//!
+//! The generated types *are* the manifest, so they cannot drift from it; a
+//! service in another language reads the same file and is checked against the
+//! same thing. The reasoning that would otherwise be rustdoc lives in the
+//! manifest too, because it is contract documentation rather than Rust
+//! documentation, and it is emitted as doc comments on whatever is generated.
+//!
+//! **Two things here are called a manifest, and they are different.**
+//! [`manifest`] is what a *binary* reports when probed: which contracts each
+//! of its mounted services produces and consumes. [`spec`] is what a
+//! *contract* is, independent of any process that implements it.
+//!
 //! # The lifeline
 //!
 //! [`lifeline`] carries the one variable that travels the other way round the
@@ -79,6 +102,23 @@ pub mod coord;
 pub mod env;
 pub mod lifeline;
 pub mod manifest;
+
+/// The contract manifest format: what a contract's manifest file may say, and
+/// what makes one valid.
+///
+/// Re-exported rather than defined here because a proc-macro crate can export
+/// nothing but macros, so [`contract!`] cannot own the format it reads — and
+/// a second copy of the format, one for the macro and one for everybody else,
+/// is exactly the drift this design exists to make impossible.
+pub use peerline_contract_spec as spec;
+
+/// Expand a contract manifest into Rust: op name constants, the argument,
+/// result and item types, the error codes, and the manifest's own prose as
+/// doc comments.
+///
+/// Takes one string literal — the manifest's path, relative to the invoking
+/// crate's `Cargo.toml`. See the crate docs.
+pub use peerline_contract_macros::contract;
 
 use std::fmt;
 

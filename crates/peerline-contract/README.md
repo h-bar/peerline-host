@@ -29,6 +29,25 @@ serve on, and the manifest probe. Both ends of each of those live outside
 this crate and neither may depend on the other, so a name spelled in either
 one would have to be re-spelled in the other.
 
+## Contract manifests
+
+The types above are the *control* path — what a service declares and what
+a coordinator answers. A contract's own vocabulary is not written in Rust
+at all. It is a **contract manifest**: a language-neutral JSON file whose
+format is `peerline-contract-spec`, from which the re-exported
+`contract!` macro generates the Rust at compile time.
+
+```rust,ignore
+peerline_contract::contract!("contracts/codex.server.v1.json");
+```
+
+Op constants, the argument and result types, the error codes and the
+documentation all come from that file, so they cannot drift from it — and
+a service in another language reads the same file rather than reading the
+Rust. Note that two different things here are called a manifest:
+`manifest` is what a *binary* reports when probed, `spec` is what a
+*contract* is.
+
 See [peerline-host](https://crates.io/crates/peerline-host) for the
 service layer, and the
 [peerline repository](https://github.com/h-bar/peerline) for the wire

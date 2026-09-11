@@ -1,0 +1,91 @@
+{
+  "contract": "demo.thing",
+  "version": 2,
+  "description": [
+    "A contract that exists to exercise the macro.",
+    "",
+    "It has one of everything the format can say, so that what the expansion does with each is a test rather than a claim."
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "OpenArgs",
+      "description": ["What it takes to open one thing."],
+      "fields": [
+        { "name": "label", "type": "string",
+          "description": ["What to call it.", "", "Required, so it is the one thing the constructor takes."] },
+        { "name": "root", "type": "path", "optional": true,
+          "description": ["Where it lives, if anywhere."] },
+        { "name": "settings", "type": "json", "optional": true,
+          "description": ["Passed through uninterpreted, which is what stops this shape carrying total equality."] },
+        { "name": "tags", "type": { "array": "string" }, "optional": true,
+          "description": ["Anything else to hang off it."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "OpenResult",
+      "description": ["What was opened."],
+      "fields": [
+        { "name": "id", "type": "string", "description": ["Its identifier."] },
+        { "name": "slot", "type": "u32", "description": ["Which slot it took."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "WatchArgs",
+      "description": ["Which thing to watch."],
+      "fields": [
+        { "name": "id", "type": "string", "description": ["Its identifier."] }
+      ]
+    },
+    {
+      "form": "enum",
+      "name": "Severity",
+      "description": ["How bad a note is."],
+      "variants": [
+        { "name": "info", "description": ["Nothing is wrong."] },
+        { "name": "gone_away", "description": ["It is no longer there. Two words, so the spelling of the wire value is a test of the mapping."] }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "Note",
+      "tag": "kind",
+      "description": ["One item on the watch stream."],
+      "variants": [
+        { "name": "line", "description": ["Something was said."],
+          "fields": [ { "name": "text", "type": "string", "description": ["What was said."] } ] },
+        { "name": "level", "description": ["The severity changed."],
+          "fields": [ { "name": "severity", "type": "Severity", "description": ["The new severity."] } ] },
+        { "name": "done", "description": ["Nothing more will follow. Carries no fields, so the constructor for it takes none."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Trouble",
+      "description": ["What went wrong, in a form a caller can branch on."],
+      "fields": [
+        { "name": "severity", "type": "Severity", "description": ["How bad."] },
+        { "name": "detail", "type": "string", "description": ["The particulars."] }
+      ]
+    }
+  ],
+
+  "errors": [
+    { "name": "demo", "code": 4242, "data": "Trouble",
+      "description": ["Something a producer of this contract could not do."] }
+  ],
+
+  "ops": [
+    { "name": "demo.thing.open", "kind": "unary", "args": "OpenArgs", "result": "OpenResult",
+      "errors": ["demo"],
+      "description": ["Open one thing."] },
+    { "name": "demo.thing.watch", "kind": "stream", "args": "WatchArgs", "item": "Note",
+      "errors": ["demo"],
+      "description": ["Watch one thing, until it stops."] },
+    { "name": "demo.thing.close", "kind": "unary", "args": "WatchArgs",
+      "description": ["Close one thing. Answers nothing at all, which is a shape in its own right."] }
+  ]
+}
