@@ -139,6 +139,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod directory;
 mod names;
 mod validate;
 
@@ -147,6 +148,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub use directory::Directory;
 pub use names::{const_name, pascal_case, screaming_case};
 pub use validate::Error;
 

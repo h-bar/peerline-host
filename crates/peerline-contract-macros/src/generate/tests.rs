@@ -37,7 +37,7 @@ const FIXTURE: &str = r#"{
 
 /// Expand a manifest with nothing said at the call site.
 fn expand(json: &str) -> String {
-    tokens(json, &[], &[], &[])
+    tokens(json, &[], &[])
         .expect("the fixture expands")
         .to_string()
 }
@@ -45,37 +45,49 @@ fn expand(json: &str) -> String {
 fn tokens(
     json: &str,
     imports: &[(&str, TokenStream)],
-    supports: &[(&str, Support)],
     typescript: &[&str],
 ) -> syn::Result<TokenStream> {
-    let manifest = Manifest::parse(json).expect("the fixture is a valid manifest");
+    alongside(json, &[], imports, typescript)
+}
+
+/// Expand `json` with `others` sitting in the same directory, which is the
+/// unit `contract!` loads: an imported shape is read out of the file that
+/// declares it, so a fixture that imports needs that file present.
+fn alongside(
+    json: &str,
+    others: &[&str],
+    imports: &[(&str, TokenStream)],
+    typescript: &[&str],
+) -> syn::Result<TokenStream> {
+    let mut all = vec![Manifest::parse(json).expect("the fixture is a valid manifest")];
+    let wanted = all[0].id();
+    for other in others {
+        all.push(Manifest::parse(other).expect("the fixture is a valid manifest"));
+    }
+    let directory = Directory::new(all).expect("the fixtures agree with each other");
+    let manifest = directory
+        .manifests()
+        .iter()
+        .find(|m| m.id() == wanted)
+        .expect("the one just put there");
     let imports: Vec<(LitStr, TokenStream)> = imports
         .iter()
         .map(|(id, path)| (LitStr::new(id, Span::call_site()), path.clone()))
-        .collect();
-    let supports: Vec<(Ident, Support)> = supports
-        .iter()
-        .map(|(name, level)| (format_ident!("{}", name), *level))
         .collect();
     let typescript: Vec<Ident> = typescript
         .iter()
         .map(|name| format_ident!("{}", name))
         .collect();
-    let bindings = Bindings::resolve(&manifest, &imports, &supports, &typescript)?;
-    contract(
-        &manifest,
-        &bindings,
-        Path::new("/tmp/demo.v1.json"),
-        Span::call_site(),
-    )
+    let bindings = Bindings::resolve(manifest, &imports, &typescript)?;
+    contract(manifest, &directory, &bindings, Span::call_site())
 }
 
 fn expansion() -> String {
     expand(FIXTURE)
 }
 
-fn rejection(json: &str, imports: &[(&str, TokenStream)], supports: &[(&str, Support)]) -> String {
-    tokens(json, imports, supports, &[])
+fn rejection(json: &str, imports: &[(&str, TokenStream)]) -> String {
+    importing(json, imports, &[])
         .expect_err("this call site must be rejected")
         .to_string()
 }
@@ -117,13 +129,58 @@ fn an_ops_docs_name_its_kind_and_its_shapes() {
     assert!(tokens.contains("Raises: `ERR_DEMO`."));
 }
 
-/// Without this the compiled types outlive the file they came from — the
+/// Without this the compiled types outlive the files they came from — the
 /// one failure a design whose claim is "they cannot drift" cannot afford.
+///
+/// One edge per file in the directory, and not just the manifest asked for:
+/// every file was read, so an edit to any of them can change what this
+/// expansion says or invalidate a check made while producing it.
+///
+/// The only test here that goes through [`Directory::load`], because the
+/// paths are the thing being asserted and an in-memory directory has none.
 #[test]
-fn the_expansion_declares_the_manifest_as_a_source_input() {
-    let tokens = expansion();
-    assert!(tokens.contains("include_bytes"), "{tokens}");
-    assert!(tokens.contains("\"/tmp/demo.v1.json\""), "{tokens}");
+fn the_expansion_declares_every_manifest_in_the_directory_as_a_source_input() {
+    let dir = std::env::temp_dir().join(format!("peerline-contract-macros-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory to load");
+    std::fs::write(dir.join("demo.thing.v1.json"), IMPORTING).expect("written");
+    std::fs::write(dir.join("demo.vocab.v1.json"), vocab("string")).expect("written");
+
+    let directory = Directory::load(&dir).expect("the two manifests agree");
+    let manifest = directory.get("demo.thing", 1).expect("just written");
+    let imports = vec![(
+        LitStr::new("demo.vocab/1", Span::call_site()),
+        quote!(::demo_vocab),
+    )];
+    let bindings = Bindings::resolve(manifest, &imports, &[]).expect("mapped");
+    let tokens = contract(manifest, &directory, &bindings, Span::call_site())
+        .expect("expands")
+        .to_string();
+
+    assert_eq!(tokens.matches("include_bytes").count(), 2, "{tokens}");
+    assert!(tokens.contains("demo.thing.v1.json"), "{tokens}");
+    assert!(
+        tokens.contains("demo.vocab.v1.json"),
+        "the vocabulary is an input too: {tokens}"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleaned up");
+}
+
+/// A file whose name disagrees with what it declares is one an implementor
+/// who is not reading Rust cannot find from an import, which names a
+/// contract and a version and never a path.
+#[test]
+fn a_misnamed_file_is_rejected_by_the_directory() {
+    let dir =
+        std::env::temp_dir().join(format!("peerline-contract-misnamed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory to load");
+    std::fs::write(dir.join("vocab.json"), vocab("string")).expect("written");
+    let err = Directory::load(&dir)
+        .expect_err("the name disagrees")
+        .to_string();
+    assert!(err.contains("demo.vocab.v1.json"), "{err}");
+    std::fs::remove_dir_all(&dir).expect("cleaned up");
 }
 
 /// Nothing the expansion emits is marked open, and that is the point.
@@ -219,19 +276,41 @@ const IMPORTING: &str = r#"{
                "description": "Do the thing." } ]
 }"#;
 
+/// The vocabulary `IMPORTING` imports from, which sits in the same
+/// directory. `{shape}` is substituted so that one fixture can declare
+/// `Shared` at each rung of the comparison ladder in turn.
+const VOCAB: &str = r#"{
+    "contract": "demo.vocab", "version": 1, "role": "vocabulary",
+    "description": "The shapes more than one contract carries.",
+    "types": [
+        { "form": "struct", "name": "Shared", "description": "The shared shape.",
+          "fields": [ { "name": "value", "type": "{shape}",
+                        "description": "Whatever it holds." } ] }
+    ]
+}"#;
+
+fn vocab(shape: &str) -> String {
+    VOCAB.replace("{shape}", shape)
+}
+
+/// Expand a manifest that imports `demo.vocab/1`, with the vocabulary in the
+/// directory beside it.
+fn importing(
+    json: &str,
+    imports: &[(&str, TokenStream)],
+    typescript: &[&str],
+) -> syn::Result<TokenStream> {
+    alongside(json, &[&vocab("string")], imports, typescript)
+}
+
 /// The manifest says `Shared`; the call site says where Rust keeps it. That
 /// split is the point: the manifest stays readable by an implementor who has
 /// never heard of a crate.
 #[test]
 fn an_imported_type_takes_the_path_the_call_site_gave_it() {
-    let tokens = tokens(
-        IMPORTING,
-        &[("demo.vocab/1", quote!(::demo_vocab))],
-        &[],
-        &[],
-    )
-    .expect("expands")
-    .to_string();
+    let tokens = importing(IMPORTING, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
+        .expect("expands")
+        .to_string();
     assert!(tokens.contains(":: demo_vocab :: Shared"), "{tokens}");
 }
 
@@ -239,7 +318,7 @@ fn an_imported_type_takes_the_path_the_call_site_gave_it() {
 /// write rather than leaving a type that does not resolve.
 #[test]
 fn an_import_the_call_site_did_not_map_is_a_compile_error() {
-    let err = rejection(IMPORTING, &[], &[]);
+    let err = rejection(IMPORTING, &[]);
     assert!(err.contains("which Rust module supplies"), "{err}");
 }
 
@@ -253,70 +332,39 @@ fn a_mapping_the_manifest_does_not_declare_is_rejected() {
             ("demo.vocab/1", quote!(::demo_vocab)),
             ("demo.other/1", quote!(::demo_other)),
         ],
-        &[],
     );
     assert!(err.contains("imports nothing of that name"), "{err}");
 }
 
-/// `supports` answers for shapes this expansion cannot see. A local shape is
-/// not one of them, and letting the call site overrule the manifest there
-/// would let the Rust say something the contract does not.
+/// The rungs, end to end, and all of them read out of the *vocabulary*
+/// rather than restated here. An imported shape holding passthrough JSON
+/// drags its container down to `PartialEq`; one holding nothing but small
+/// exact scalars lets the container be copied. Before the directory was the
+/// unit, the call site had to say which — a fact sitting in a file two
+/// directories away, where being wrong was silently over-conservative.
 #[test]
-fn supports_may_not_speak_about_a_local_shape() {
-    let err = rejection(
-        IMPORTING,
-        &[("demo.vocab/1", quote!(::demo_vocab))],
-        &[("Args", Support::None)],
-    );
-    assert!(err.contains("not an imported type"), "{err}");
-}
-
-/// The rungs, end to end: an imported shape with no equality drags its
-/// container down to no derives at all, and one that is `copy` lets the
-/// container be copied.
-#[test]
-fn an_imported_shapes_rung_decides_its_containers_derives() {
-    let with = |level| {
-        tokens(
+fn an_imported_shapes_rung_is_read_from_the_manifest_that_declares_it() {
+    let with = |shape: &str| {
+        alongside(
             IMPORTING,
+            &[&vocab(shape)],
             &[("demo.vocab/1", quote!(::demo_vocab))],
-            &[("Shared", level)],
             &[],
         )
         .expect("expands")
         .to_string()
     };
 
-    let none = with(Support::None);
-    assert!(!none.contains("PartialEq"), "{none}");
-
-    let partial = with(Support::Partial);
+    let partial = with("json");
     assert!(partial.contains("PartialEq"), "{partial}");
     assert!(!partial.contains("cmp :: Eq"), "{partial}");
 
-    let total = with(Support::Total);
+    let total = with("string");
     assert!(total.contains("cmp :: Eq"), "{total}");
     assert!(!total.contains("marker :: Copy"), "{total}");
 
-    let copy = with(Support::Copy);
+    let copy = with("i53");
     assert!(copy.contains("marker :: Copy"), "{copy}");
-}
-
-/// And the default, which is the assumption that fails loudly: an imported
-/// shape nobody spoke about is assumed comparable, so a Rust type that is not
-/// fails to compile naming the trait rather than comparing wrongly.
-#[test]
-fn an_imported_shape_nobody_spoke_about_is_assumed_totally_comparable() {
-    let tokens = tokens(
-        IMPORTING,
-        &[("demo.vocab/1", quote!(::demo_vocab))],
-        &[],
-        &[],
-    )
-    .expect("expands")
-    .to_string();
-    assert!(tokens.contains("cmp :: Eq"), "{tokens}");
-    assert!(!tokens.contains("marker :: Copy"), "{tokens}");
 }
 
 /// A vocabulary has no producer, so the two lists a producer registers from
@@ -394,7 +442,7 @@ fn a_flattened_field_writes_its_types_keys_beside_its_siblings() {
         r#"{ "name": "shared", "type": "Shared","#,
         r#"{ "name": "shared", "type": "Shared", "flatten": true,"#,
     );
-    let tokens = tokens(&json, &[("demo.vocab/1", quote!(::demo_vocab))], &[], &[])
+    let tokens = importing(&json, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
         .expect("expands")
         .to_string();
     assert!(tokens.contains("# [serde (flatten)]"), "{tokens}");
@@ -497,9 +545,7 @@ const BROWSER: &str = r#"{
 }"#;
 
 fn browser_tokens(names: &[&str]) -> String {
-    tokens(BROWSER, &[], &[], names)
-        .expect("expands")
-        .to_string()
+    tokens(BROWSER, &[], names).expect("expands").to_string()
 }
 
 /// The whole point of the keyword: in Rust it is the same integer it always
@@ -583,7 +629,7 @@ fn a_variants_wire_spelling_does_not_depend_on_a_cargo_feature() {
 /// macro says it instead, naming what to add.
 #[test]
 fn a_member_left_out_of_the_clause_is_named_rather_than_left_to_ts_rs() {
-    let err = tokens(BROWSER, &[], &[], &["Row"])
+    let err = tokens(BROWSER, &[], &["Row"])
         .expect_err("Row holds a Kind")
         .to_string();
     assert!(err.contains("add `Kind` to the clause"), "{err}");
@@ -591,12 +637,12 @@ fn a_member_left_out_of_the_clause_is_named_rather_than_left_to_ts_rs() {
 
 #[test]
 fn the_clause_may_only_name_shapes_the_manifest_declares() {
-    let err = tokens(BROWSER, &[], &[], &["Nonesuch"])
+    let err = tokens(BROWSER, &[], &["Nonesuch"])
         .expect_err("there is no such shape")
         .to_string();
     assert!(err.contains("not a shape this manifest declares"), "{err}");
 
-    let err = tokens(BROWSER, &[], &[], &["Kind", "Kind"])
+    let err = tokens(BROWSER, &[], &["Kind", "Kind"])
         .expect_err("named twice")
         .to_string();
     assert!(err.contains("named twice"), "{err}");
@@ -611,7 +657,7 @@ fn the_clause_may_not_name_an_imported_shape() {
         LitStr::new("demo.vocab/1", Span::call_site()),
         quote!(::demo_vocab),
     )];
-    let err = match Bindings::resolve(&manifest, &imports, &[], &[format_ident!("Shared")]) {
+    let err = match Bindings::resolve(&manifest, &imports, &[format_ident!("Shared")]) {
         Ok(_) => panic!("`Shared` is imported, so the clause may not name it"),
         Err(err) => err.to_string(),
     };

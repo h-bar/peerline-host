@@ -13,8 +13,10 @@ the same file. Generating a spec *out of* Rust would keep Rust as the
 authority, and that has a known failure — Rust can express things a target
 cannot represent, and the divergence is only found when somebody tries.
 
-This crate parses and validates. It generates nothing: the Rust generator
-is `peerline-contract-macros`, and both are re-exported by
+This crate parses and validates — one manifest, and a whole directory of
+them against each other, since an import, a file name and the error-code
+space are only checkable with the directory in hand. It generates nothing:
+the Rust generator is `peerline-contract-macros`, and both are re-exported by
 [peerline-contract](https://crates.io/crates/peerline-contract), which is
 the only one a consumer needs to name.
 

@@ -73,8 +73,16 @@
 //! by [`spec`], from which [`contract!`] generates the Rust at compile time.
 //!
 //! ```ignore
-//! peerline_contract::contract!("contracts/codex.server.v1.json");
+//! peerline_contract::contract!("codex.server/1" in "contracts");
 //! ```
+//!
+//! A call site names the **directory** and which contract it wants out of
+//! it, because the directory is the unit a contract is written in: the
+//! manifests in one reference each other's shapes and share one error-code
+//! space. All of them are read and checked together, so a file that does not
+//! parse, an import naming a type that does not exist, or two contracts
+//! picking the same error code are compile errors at every crate that
+//! expands any of them.
 //!
 //! The generated types *are* the manifest, so they cannot drift from it; a
 //! service in another language reads the same file and is checked against the
@@ -92,10 +100,14 @@
 //!
 //! ```ignore
 //! peerline_contract::contract!(
-//!     "contracts/coagent.runtime.v1.json",
+//!     "coagent.runtime/1" in "contracts",
 //!     imports { "coagent.rpc/1" => ::coagent_rpc },
 //! );
 //! ```
+//!
+//! That clause carries no correctness — whether the vocabulary exists and
+//! what its shapes look like is answered by the directory — only the Rust
+//! fact of which module holds its expansion.
 //!
 //! **Two things here are called a manifest, and they are different.**
 //! [`manifest`] is what a *binary* reports when probed: which contracts each
@@ -131,12 +143,13 @@ pub use peerline_contract_spec as spec;
 /// result and item types, the error codes, and the manifest's own prose as
 /// doc comments.
 ///
-/// Takes the manifest's path, relative to the invoking crate's `Cargo.toml`,
-/// and two optional clauses — `imports`, binding each imported contract to
-/// the Rust module that supplies it, and `supports`, answering for what an
-/// imported Rust type can do. Both are at the call site rather than in the
-/// file because both are facts about this target and not about the contract.
-/// See the crate docs.
+/// Takes the contract wanted and the directory holding it —
+/// `"codex.server/1" in "contracts"`, the path relative to the invoking
+/// crate's `Cargo.toml` — and two optional clauses: `imports`, binding each
+/// imported contract to the Rust module that supplies it, and `typescript`,
+/// naming the shapes a browser reads. Both are at the call site rather than
+/// in the file because both are facts about this target and not about the
+/// contract. See the crate docs.
 pub use peerline_contract_macros::contract;
 
 use std::fmt;

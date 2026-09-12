@@ -6,10 +6,14 @@
 //! left is one mapping — manifest spelling to Rust spelling — and it is the
 //! same mapping a checker in another language would make into its own.
 //!
-//! The two exceptions are the two things a manifest deliberately does not
-//! say, both supplied at the call site and both about *this* target rather
-//! than about the contract: which Rust module supplies an imported shape, and
-//! what that Rust type supports. See [`Bindings`].
+//! The one exception is the thing a manifest deliberately does not say,
+//! supplied at the call site and about *this* target rather than about the
+//! contract: which Rust module supplies an imported shape. See [`Bindings`].
+//!
+//! Everything else an imported shape needs is read out of the manifest that
+//! declares it, which the [`Directory`] has open. That is the whole of what
+//! loading a directory rather than a file buys: an imported shape is no
+//! longer a name the expansion has to be told about.
 //!
 //! # A generated set is closed
 //!
@@ -28,18 +32,16 @@
 //! Where openness would have to be said, if it were ever wanted, is the
 //! manifest — not a Rust attribute name in a language-neutral file, and not
 //! a call-site clause, because openness is a property of the contract and not
-//! of this build. (`supports` may only speak about *imported* shapes for
-//! exactly that reason.) The format has one answer for closedness today and
+//! of this build. The format has one answer for closedness today and
 //! the wire agrees with it. If it ever gains a way to say the other, the
 //! generator emits the catch-all variant **and** the attribute together, so
 //! that both halves of the generated code say the same thing.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use peerline_contract_spec::{
-    ErrorDef, Field, Manifest, OpDef, OpKind, Prose, Role, Scalar, Schema, Tagging, TypeDef,
-    UnionVariant, Value, pascal_case,
+    Directory, ErrorDef, Field, Manifest, OpDef, OpKind, Prose, Role, Scalar, Schema, Tagging,
+    TypeDef, UnionVariant, Value, pascal_case,
 };
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::{format_ident, quote};
@@ -52,15 +54,11 @@ use syn::{Ident, LitStr};
 /// one that can be compared totally can be compared partially. A struct's
 /// rung is the lowest of its fields', which is the whole computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Support {
-    /// Not comparable at all — a hand-written Rust type that deliberately
-    /// has no `PartialEq`.
-    None,
+enum Support {
     /// `PartialEq`. What a shape holding an `f64` or passthrough JSON
     /// reaches.
     Partial,
-    /// `PartialEq + Eq`. What most wire shapes are, and the assumption for an
-    /// imported type nobody spoke about.
+    /// `PartialEq + Eq`. What most wire shapes are.
     Total,
     /// `PartialEq + Eq + Copy`. Fixed-size scalars only, and never through a
     /// list.
@@ -71,9 +69,6 @@ pub(crate) enum Support {
 pub(crate) struct Bindings {
     /// Imported type name to the Rust module path supplying it.
     paths: BTreeMap<String, TokenStream>,
-    /// Imported type name to what the Rust type supports, where the call
-    /// site said. Absent means [`Support::Total`].
-    supports: BTreeMap<String, Support>,
     /// The shapes the call site asked to be exported to TypeScript. Empty
     /// when the clause is absent, which is the case for every crate that
     /// has no business linking `ts_rs`.
@@ -91,7 +86,6 @@ impl Bindings {
     pub(crate) fn resolve(
         manifest: &Manifest,
         imports: &[(LitStr, TokenStream)],
-        supports: &[(Ident, Support)],
         typescript: &[Ident],
     ) -> syn::Result<Self> {
         let span = Span::call_site();
@@ -138,32 +132,10 @@ impl Bindings {
             }
         }
 
-        let mut levels = BTreeMap::new();
-        for (name, support) in supports {
-            let key = name.to_string();
-            if !paths.contains_key(&key) {
-                return Err(syn::Error::new(
-                    name.span(),
-                    format!(
-                        "`{key}` is not an imported type; a shape declared in the manifest has \
-                         its support read off its fields, and saying otherwise here would let \
-                         the Rust contradict the contract"
-                    ),
-                ));
-            }
-            if levels.insert(key.clone(), *support).is_some() {
-                return Err(syn::Error::new(
-                    name.span(),
-                    format!("`{key}` is given a support level twice"),
-                ));
-            }
-        }
-
         let exported = resolve_typescript(manifest, &paths, typescript)?;
 
         Ok(Self {
             paths,
-            supports: levels,
             typescript: exported,
         })
     }
@@ -171,10 +143,6 @@ impl Bindings {
     /// Whether this shape carries a `ts_rs::TS` derive.
     fn is_exported(&self, name: &str) -> bool {
         self.typescript.contains(name)
-    }
-
-    fn is_imported(&self, name: &str) -> bool {
-        self.paths.contains_key(name)
     }
 
     /// The Rust path for a named shape: a local ident, or the call site's
@@ -185,10 +153,6 @@ impl Bindings {
             Some(prefix) => quote! { #prefix::#ident },
             None => quote! { #ident },
         }
-    }
-
-    fn imported_support(&self, name: &str) -> Support {
-        self.supports.get(name).copied().unwrap_or(Support::Total)
     }
 }
 
@@ -343,8 +307,8 @@ fn ts_field_attrs(field: &Field) -> TokenStream {
 /// what its ops are, what can go wrong, and what shapes travel.
 pub(crate) fn contract(
     manifest: &Manifest,
+    dir: &Directory,
     bindings: &Bindings,
-    path: &Path,
     span: Span,
 ) -> syn::Result<TokenStream> {
     let types = manifest.type_map();
@@ -360,9 +324,9 @@ pub(crate) fn contract(
     let shapes = manifest
         .types
         .iter()
-        .map(|def| shape(def, &types, bindings, span))
+        .map(|def| shape(def, manifest, dir, &types, bindings, span))
         .collect::<syn::Result<Vec<_>>>()?;
-    let tracker = rebuild_tracker(path, span);
+    let tracker = rebuild_tracker(dir, span);
 
     Ok(quote! {
         #header
@@ -511,6 +475,8 @@ fn errors(manifest: &Manifest, span: Span) -> TokenStream {
 
 fn shape(
     def: &TypeDef,
+    owner: &Manifest,
+    dir: &Directory,
     types: &BTreeMap<&str, &TypeDef>,
     bindings: &Bindings,
     span: Span,
@@ -528,7 +494,7 @@ fn shape(
                 .iter()
                 .map(|f| field_decl(&ty, "", f, bindings, span, Visibility::Public, exported))
                 .collect::<syn::Result<Vec<_>>>()?;
-            let derives = comparison_derives(support_of(def, types, bindings));
+            let derives = comparison_derives(support_of(def, owner, dir));
             let ts = ts_derive(exported);
             let ctor = constructor(&ty, name, fields, types, bindings, span)?;
             let defaults = default_fns(&ty, "", fields, types, bindings, span)?;
@@ -650,7 +616,7 @@ fn shape(
                 }
                 ctors.extend(variant_members(&ty, &arm, v, types, bindings, span)?);
             }
-            let derives = comparison_derives(support_of(def, types, bindings));
+            let derives = comparison_derives(support_of(def, owner, dir));
             let impl_block = if ctors.is_empty() {
                 TokenStream::new()
             } else {
@@ -1196,25 +1162,27 @@ fn ctor_parts(
 /// with `assert_eq!` on both halves of a seam is more useful than one that
 /// cannot, and what rules it out is an `f64` or a passthrough `json`
 /// somewhere in the shape. The manifest already says which, so the derives
-/// follow from it rather than from somebody remembering — the one exception
-/// being an imported shape, whose fields are in another file. See
-/// [`Bindings`].
-fn support_of(def: &TypeDef, types: &BTreeMap<&str, &TypeDef>, bindings: &Bindings) -> Support {
+/// follow from it rather than from somebody remembering.
+///
+/// An imported shape is no exception, which is what loading a directory
+/// bought: `owner` says whose scope a name is being read in, and a name that
+/// resolves into another manifest carries on being read there.
+fn support_of(def: &TypeDef, owner: &Manifest, dir: &Directory) -> Support {
     let mut seen = BTreeSet::new();
-    type_support(def, types, bindings, &mut seen)
+    type_support(def, owner, dir, &mut seen)
 }
 
 fn type_support(
     def: &TypeDef,
-    types: &BTreeMap<&str, &TypeDef>,
-    bindings: &Bindings,
-    seen: &mut BTreeSet<String>,
+    owner: &Manifest,
+    dir: &Directory,
+    seen: &mut BTreeSet<(String, String)>,
 ) -> Support {
     match def {
         TypeDef::Enum { .. } => Support::Copy,
         TypeDef::Struct { fields, .. } => fields
             .iter()
-            .map(|f| schema_support(&f.ty, types, bindings, seen))
+            .map(|f| schema_support(&f.ty, owner, dir, seen))
             .min()
             .unwrap_or(Support::Copy),
         TypeDef::Union { variants, .. } => {
@@ -1229,7 +1197,7 @@ fn type_support(
                         .iter()
                         .map(|f| &f.ty)
                         .chain(v.payload.iter())
-                        .map(|s| schema_support(s, types, bindings, seen))
+                        .map(|s| schema_support(s, owner, dir, seen))
                         .collect::<Vec<_>>()
                 })
                 .min()
@@ -1241,15 +1209,15 @@ fn type_support(
 
 fn schema_support(
     schema: &Schema,
-    types: &BTreeMap<&str, &TypeDef>,
-    bindings: &Bindings,
-    seen: &mut BTreeSet<String>,
+    owner: &Manifest,
+    dir: &Directory,
+    seen: &mut BTreeSet<(String, String)>,
 ) -> Support {
     match schema {
         // A list is never `Copy`, whatever it holds.
-        Schema::Array { array } => schema_support(array, types, bindings, seen).min(Support::Total),
+        Schema::Array { array } => schema_support(array, owner, dir, seen).min(Support::Total),
         // An absent-or-null value supports exactly what the value does.
-        Schema::Nullable { nullable } => schema_support(nullable, types, bindings, seen),
+        Schema::Nullable { nullable } => schema_support(nullable, owner, dir, seen),
         Schema::Named(name) => {
             if let Some(scalar) = Scalar::from_keyword(name) {
                 return match (scalar.is_exact(), scalar.is_small()) {
@@ -1258,18 +1226,17 @@ fn schema_support(
                     (false, _) => Support::Partial,
                 };
             }
-            if bindings.is_imported(name) {
-                return bindings.imported_support(name);
-            }
+            // Validation has already insisted that every name resolves, in
+            // this manifest or in one it imports from.
+            let Some((declaring, def)) = dir.resolve(owner, name) else {
+                return Support::Total;
+            };
             // A cycle can only be through a list, which the validator
             // insisted on, and a list has already capped the rung.
-            if !seen.insert(name.clone()) {
+            if !seen.insert((declaring.id(), name.clone())) {
                 return Support::Copy;
             }
-            match types.get(name.as_str()).copied() {
-                Some(def) => type_support(def, types, bindings, seen),
-                None => Support::Total,
-            }
+            type_support(def, declaring, dir, seen)
         }
     }
 }
@@ -1348,15 +1315,17 @@ fn doc_lines(lines: &[String]) -> TokenStream {
     quote! { #(#attrs)* }
 }
 
-/// The dependency edge that makes a manifest edit a rebuild.
+/// The dependency edges that make a manifest edit a rebuild.
 ///
-/// See the crate docs: without it the compiled types outlive the file they
-/// came from, which is the one failure this design cannot tolerate.
-fn rebuild_tracker(path: &Path, span: Span) -> TokenStream {
-    let literal = LitStr::new(&path.to_string_lossy(), span);
-    quote! {
-        const _: &[u8] = include_bytes!(#literal);
-    }
+/// One per file in the directory, not one for the manifest asked for: every
+/// file was read, so an edit to any of them can change or invalidate this
+/// expansion. See the crate docs, including the one case this cannot cover.
+fn rebuild_tracker(dir: &Directory, span: Span) -> TokenStream {
+    let edges = dir.files().iter().map(|path| {
+        let literal = LitStr::new(&path.to_string_lossy(), span);
+        quote! { const _: &[u8] = include_bytes!(#literal); }
+    });
+    quote! { #(#edges)* }
 }
 
 /// A manifest name as a Rust identifier.

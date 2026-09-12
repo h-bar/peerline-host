@@ -15,7 +15,7 @@ use peerline_contract::spec::{Manifest, Schema};
 
 mod vocab {
     //! A vocabulary, expanded. No ops, because nobody produces one.
-    peerline_contract::contract!("tests/contracts/demo.vocab.v1.json");
+    peerline_contract::contract!("demo.vocab/1" in "tests/contracts");
 }
 
 mod wire {
@@ -25,16 +25,13 @@ mod wire {
     //! learns that the module holding it is `crate::vocab`, because which
     //! module that is a fact about this build and not about the contract.
     //!
-    //! `supports` answers the one question the manifest cannot: `Meta` is
-    //! declared in a file this expansion never opens, so how far up the
-    //! comparison ladder the Rust type goes is not readable from here.
+    //! Nothing says what `Meta` supports. It is declared in a file the
+    //! directory holds, so the expansion reads its fields and works the
+    //! derives out for itself, exactly as it does for a local shape.
     peerline_contract::contract!(
-        "tests/contracts/demo.wire.v1.json",
+        "demo.wire/1" in "tests/contracts",
         imports {
             "demo.vocab/1" => crate::vocab,
-        },
-        supports {
-            Meta: copy,
         },
     );
 }
@@ -231,13 +228,13 @@ fn an_imported_shape_is_the_same_shape_on_both_sides() {
         .expect("`Meta` is declared over there");
 }
 
-/// B9. The derives follow from the shape, so nobody has to remember — except
-/// for an imported shape, where the call site's `supports` is the only
-/// available answer. `Cursor` holds nothing but an imported `Meta` the call
-/// site called `copy`, so it is copyable; `Event` holds a string and so is
-/// not, whatever anybody said.
+/// B9. The derives follow from the shape, so nobody has to remember — and
+/// an imported shape is no exception, because the directory holds the file
+/// that declares it. `Cursor` holds nothing but an imported `Meta`, whose
+/// own fields are a safe integer and a closed set, so it is copyable;
+/// `Event` holds a string and so is not.
 #[test]
-fn the_derives_follow_the_shape_and_the_call_site() {
+fn the_derives_follow_the_shape_wherever_it_is_declared() {
     fn needs_copy<T: Copy>(_: &T) {}
     fn needs_eq<T: Eq>(_: &T) {}
 

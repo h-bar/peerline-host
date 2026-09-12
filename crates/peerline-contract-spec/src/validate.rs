@@ -23,7 +23,7 @@ pub struct Error {
 }
 
 impl Error {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -88,13 +88,11 @@ impl Manifest {
 
     /// Check each [`Manifest::imports`] against the manifest it names.
     ///
-    /// Separate from [`Manifest::validate`] because it needs files this crate
-    /// has no way to find: a manifest names a contract and a version, and
-    /// where that file lives is whoever-is-checking's business. A tool that
-    /// has loaded a directory of manifests calls this; the Rust macro does
-    /// not, because Rust performs the same check for it — an imported name
-    /// that does not exist in the module the call site mapped is a name that
-    /// does not resolve, and the compiler says so.
+    /// Separate from [`Manifest::validate`] because it needs a file that one
+    /// is not: a manifest names a contract and a version, never a path, so
+    /// the other file is only in hand once a whole directory is.
+    /// [`Directory::new`](crate::Directory::new) is what has it, and calls
+    /// this for every manifest it holds.
     pub fn check_imports(&self, available: &[Manifest]) -> Result<(), Error> {
         for import in &self.imports {
             let Some(source) = available

@@ -4,8 +4,25 @@
 //! implementing a contract names one dependency rather than three.
 //!
 //! ```ignore
-//! peerline_contract::contract!("contracts/codex.server.v1.json");
+//! peerline_contract::contract!("codex.server/1" in "contracts");
 //! ```
+//!
+//! # The unit is the directory, not the file
+//!
+//! A call site names the **contracts directory** and which contract it wants
+//! out of it, because the directory is what a contract is written in: the
+//! manifests in one reference each other's shapes and share one error-code
+//! space, so a file on its own can be valid and the set of them still wrong.
+//!
+//! Every manifest in the directory is therefore read and checked together,
+//! and all of it lands on the call site as a compile error: a file that does
+//! not parse, a file whose name disagrees with the contract it declares, an
+//! import naming a type the other manifest does not declare, two contracts
+//! picking the same error code. Before, those were a test in whichever crate
+//! remembered to write one.
+//!
+//! It is also what lets an imported shape be read rather than described. See
+//! the derives section below.
 //!
 //! # What it expands to
 //!
@@ -47,7 +64,7 @@
 //!
 //! ```ignore
 //! peerline_contract::contract!(
-//!     "contracts/coagent.runtime.v1.json",
+//!     "coagent.runtime/1" in "contracts",
 //!     imports {
 //!         "coagent.rpc/1" => ::coagent_rpc,
 //!     },
@@ -63,7 +80,23 @@
 //! clause is an instance of: a key that only makes sense to one language does
 //! not go in the shared file.
 //!
-//! # `supports`, and why derives are not in the manifest
+//! ## What this clause is not
+//!
+//! It carries no correctness. Whether `coagent.rpc/1` exists, whether it
+//! declares the types the importing manifest lists, and what those types are
+//! shaped like are all answered by the directory, which the macro has read.
+//! What is left is one Rust fact — *which module holds that vocabulary's
+//! expansion* — and that is the same category as `typescript { … }`: a thing
+//! about this build that no other implementor of the same contract would
+//! write down.
+//!
+//! An earlier revision also asked the call site for `supports { … }`, a rung
+//! per imported type saying how far up the comparison ladder its Rust
+//! supplier went. That existed only because the macro could not read the
+//! manifest it was importing from; now that it can, the rung is computed —
+//! see the next section.
+//!
+//! # Derives, and why they are not in the manifest
 //!
 //! The comparison and copy derives on a generated type are read off the
 //! *shape*: a record of exact scalars can carry `Eq`, one holding an `f64`
@@ -71,35 +104,21 @@
 //! from what it already says, which is why they are not keys. A manifest that
 //! listed Rust derives would be a manifest with a Rust-shaped hole in it.
 //!
-//! An **imported** shape is the one case where the manifest does not say.
-//! Its fields are in a file this expansion never opens, and the Rust type
-//! supplying it may be hand-written and deliberately without `PartialEq`. So
-//! the call site answers for it, in the language-neutral currency of how far
-//! up the ladder the type goes:
+//! An **imported** shape is read the same way, out of the manifest that
+//! declares it. That is the direct consequence of the unit being the
+//! directory: the fields are in another file, and the other file is open.
 //!
-//! ```ignore
-//! peerline_contract::contract!(
-//!     "contracts/coagent.runtime.v1.json",
-//!     imports { "coagent.rpc/1" => ::coagent_rpc },
-//!     supports {
-//!         SessionInfo: none,  // not even PartialEq
-//!         EventMeta: copy,    // PartialEq + Eq + Copy
-//!     },
-//! );
-//! ```
+//! ## When the Rust supplier is hand-written
 //!
-//! Four rungs, each strictly stronger than the last: `none`, `partial`
-//! (`PartialEq`), `total` (`PartialEq + Eq`), `copy` (`PartialEq + Eq +
-//! Copy`). A type nobody mentions is assumed `total`, which is what the
-//! overwhelming majority of wire shapes are — and when the assumption is
-//! wrong the generated derive fails to compile, naming the trait, rather than
-//! silently producing a type that compares unequal values as equal.
-//!
-//! `copy` is not assumed, because assuming it wrongly also fails to compile
-//! but assuming it *absently* costs only ergonomics. And `supports` may only
-//! speak about imported types: a local shape's rung is computed from the
-//! manifest, and letting the call site overrule it would let the Rust
-//! contradict the contract.
+//! `imports` may point at a module whose types were written by hand rather
+//! than generated, and a hand-written type is free to lack `PartialEq` that
+//! the manifest's shape implies. Nothing here detects that, and nothing
+//! tries: the generated derive fails to compile, naming the trait, at the
+//! type that tried to compare it. That is the same "wrong and loud beats
+//! wrong and silent" position the rungs were justified by, and it is the
+//! half of it that was doing the work — a rung stated at the call site could
+//! be *wrong in the safe direction* and then nothing said anything, which is
+//! wrong and quiet.
 //!
 //! # `typescript`, and why the derive is not in the manifest
 //!
@@ -108,12 +127,11 @@
 //! derive on the shapes it publishes. Which shapes those are is a fact about
 //! *this* target — a Python generator has no opinion on it, and a service
 //! that speaks the same contract over a socket does not want `ts_rs` linked
-//! at all — so it is said at the call site, exactly like `imports` and
-//! `supports`:
+//! at all — so it is said at the call site, exactly like `imports`:
 //!
 //! ```ignore
 //! peerline_contract::contract!(
-//!     "contracts/coagent.rpc.v1.json",
+//!     "coagent.rpc/1" in "contracts",
 //!     typescript { BackendKind, CoagentEventKind, SessionInfo },
 //! );
 //! ```
@@ -196,10 +214,10 @@
 //! Rust-shaped hole in a language-neutral file — but as something the format
 //! can *say* about a set, in its own terms, the way it already says `optional`
 //! and `nullable`. And not as a call-site clause either: openness is a
-//! property of the contract, not of this build, which is the same rule that
-//! confines `supports` to imported shapes. When the format can say it, the
-//! generator emits the catch-all variant **and** the attribute together, so
-//! the wire and the Rust go on agreeing.
+//! property of the contract, not of this build, and a call site is only ever
+//! asked about this build. When the format can say it, the generator emits
+//! the catch-all variant **and** the attribute together, so the wire and the
+//! Rust go on agreeing.
 //!
 //! # Why a manifest edit forces a rebuild
 //!
@@ -209,11 +227,27 @@
 //! longer exists. That is the worst failure available to a design whose whole
 //! claim is that the two cannot drift.
 //!
-//! So the expansion ends with an `include_bytes!` of the manifest's resolved
-//! path, bound to `const _`. The compiler records it as a source input in the
-//! crate's dependency info, cargo reads that, and touching the manifest
-//! rebuilds the crate. The constant itself is never read — it exists to be a
-//! dependency edge.
+//! So the expansion ends with an `include_bytes!` bound to `const _` for
+//! **every file in the directory**, not just the one asked for. The compiler
+//! records each as a source input in the crate's dependency info, cargo reads
+//! that, and touching any manifest rebuilds the crate. The constants are
+//! never read — they exist to be dependency edges.
+//!
+//! Every file, because every file was read: a vocabulary supplies an imported
+//! shape's derives, and any manifest at all can collide on an error code, so
+//! an edit anywhere in the directory can change or invalidate this expansion.
+//! Over-rebuilding is the safe direction and the only one available — the
+//! alternative is a crate that goes on trusting a check made against a file
+//! that has since changed.
+//!
+//! What this does **not** catch is a manifest being *added*. A dependency
+//! edge is a file, and a file that did not exist when the crate was built has
+//! no edge to record; there is no stable way to make cargo watch a directory
+//! for new entries. So a manifest added with nothing else touched is first
+//! checked on the next build that happens for another reason. A new manifest
+//! arrives with the call site that expands it, which is a source edit, so
+//! this has no reach in practice — but it is the one gap, and it is here
+//! rather than left to be discovered.
 
 #![forbid(unsafe_code)]
 
@@ -230,14 +264,15 @@ use syn::{Ident, LitStr, Token, braced};
 
 /// Expand a contract manifest into Rust.
 ///
-/// Takes the path to the manifest, relative to the directory holding the
-/// invoking crate's `Cargo.toml` (an absolute path is taken as-is).
-/// Crate-relative rather than file-relative because a manifest is a property
-/// of the crate, not of whichever module happened to invoke the macro.
+/// Takes the contract wanted and the directory holding it —
+/// `"coagent.runtime/1" in "contracts"` — with the path relative to the
+/// directory holding the invoking crate's `Cargo.toml` (an absolute path is
+/// taken as-is). Crate-relative rather than file-relative because a
+/// contracts directory is a property of the crate, not of whichever module
+/// happened to invoke the macro.
 ///
-/// Three optional clauses follow it — `imports`, `supports` and
-/// `typescript`; see the crate docs for what each is for and why none of
-/// them is in the manifest.
+/// Two optional clauses follow it — `imports` and `typescript`; see the
+/// crate docs for what each is for and why neither is in the manifest.
 #[proc_macro]
 pub fn contract(input: TokenStream) -> TokenStream {
     let invocation = syn::parse_macro_input!(input as Invocation);
@@ -247,23 +282,24 @@ pub fn contract(input: TokenStream) -> TokenStream {
     }
 }
 
-/// One `contract!` call: the manifest, plus the two things about *this*
-/// target that the manifest deliberately does not say.
+/// One `contract!` call: which contract, out of which directory, plus the
+/// two things about *this* target that the manifest deliberately does not
+/// say.
 struct Invocation {
-    manifest: LitStr,
+    wanted: LitStr,
+    directory: LitStr,
     imports: Vec<(LitStr, TokenStream2)>,
-    supports: Vec<(Ident, generate::Support)>,
     typescript: Vec<Ident>,
 }
 
 impl Parse for Invocation {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let manifest: LitStr = input.parse()?;
+        let wanted: LitStr = input.parse()?;
+        input.parse::<Token![in]>()?;
+        let directory: LitStr = input.parse()?;
         let mut imports = Vec::new();
-        let mut supports = Vec::new();
         let mut typescript = Vec::new();
         let mut seen_imports = false;
-        let mut seen_supports = false;
         let mut seen_typescript = false;
         while !input.is_empty() {
             input.parse::<Token![,]>()?;
@@ -282,16 +318,6 @@ impl Parse for Invocation {
                     seen_imports = true;
                     imports = parse_imports(input)?;
                 }
-                "supports" => {
-                    if seen_supports {
-                        return Err(syn::Error::new(
-                            keyword.span(),
-                            "`supports` is given twice; one clause carries every type",
-                        ));
-                    }
-                    seen_supports = true;
-                    supports = parse_supports(input)?;
-                }
                 "typescript" => {
                     if seen_typescript {
                         return Err(syn::Error::new(
@@ -306,17 +332,17 @@ impl Parse for Invocation {
                     return Err(syn::Error::new(
                         keyword.span(),
                         format!(
-                            "`{other}` is not a clause of `contract!`; the three are `imports`, \
-                             `supports` and `typescript`"
+                            "`{other}` is not a clause of `contract!`; the two are `imports` \
+                             and `typescript`"
                         ),
                     ));
                 }
             }
         }
         Ok(Self {
-            manifest,
+            wanted,
+            directory,
             imports,
-            supports,
             typescript,
         })
     }
@@ -361,39 +387,6 @@ fn parse_rust_path(input: ParseStream) -> syn::Result<TokenStream2> {
     Ok(tokens)
 }
 
-/// `supports { SessionInfo: none, EventMeta: copy, … }`
-fn parse_supports(input: ParseStream) -> syn::Result<Vec<(Ident, generate::Support)>> {
-    let body;
-    braced!(body in input);
-    let mut out = Vec::new();
-    while !body.is_empty() {
-        let name: Ident = body.parse()?;
-        body.parse::<Token![:]>()?;
-        let rung: Ident = body.parse()?;
-        let support = match rung.to_string().as_str() {
-            "none" => generate::Support::None,
-            "partial" => generate::Support::Partial,
-            "total" => generate::Support::Total,
-            "copy" => generate::Support::Copy,
-            other => {
-                return Err(syn::Error::new(
-                    rung.span(),
-                    format!(
-                        "`{other}` is not a support level; the four are `none`, `partial`, \
-                         `total` and `copy`"
-                    ),
-                ));
-            }
-        };
-        out.push((name, support));
-        if body.is_empty() {
-            break;
-        }
-        body.parse::<Token![,]>()?;
-    }
-    Ok(out)
-}
-
 /// `typescript { SessionInfo, BackendKind, … }`
 fn parse_typescript(input: ParseStream) -> syn::Result<Vec<Ident>> {
     let body;
@@ -410,32 +403,57 @@ fn parse_typescript(input: ParseStream) -> syn::Result<Vec<Ident>> {
 }
 
 fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
-    let literal = &invocation.manifest;
-    let span = literal.span();
-    let given = PathBuf::from(literal.value());
+    let span = invocation.directory.span();
+    let given = PathBuf::from(invocation.directory.value());
     let path = if given.is_absolute() {
         given
     } else {
         let root = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
             syn::Error::new(
                 span,
-                "CARGO_MANIFEST_DIR is not set, so a relative manifest path cannot be resolved; \
+                "CARGO_MANIFEST_DIR is not set, so a relative directory cannot be resolved; \
                  pass an absolute path",
             )
         })?;
         PathBuf::from(root).join(given)
     };
 
-    let json = std::fs::read_to_string(&path)
-        .map_err(|err| syn::Error::new(span, format!("cannot read `{}`: {err}", path.display())))?;
-    let manifest = peerline_contract_spec::Manifest::parse(&json)
+    let directory = peerline_contract_spec::Directory::load(&path)
         .map_err(|err| syn::Error::new(span, format!("`{}`: {err}", path.display())))?;
 
-    let bindings = generate::Bindings::resolve(
-        &manifest,
-        &invocation.imports,
-        &invocation.supports,
-        &invocation.typescript,
-    )?;
-    generate::contract(&manifest, &bindings, &path, span)
+    let span = invocation.wanted.span();
+    let wanted = invocation.wanted.value();
+    let (contract, version) = split_id(&wanted, span)?;
+    let manifest = directory.get(contract, version).ok_or_else(|| {
+        let held: Vec<String> = directory.manifests().iter().map(|m| m.id()).collect();
+        syn::Error::new(
+            span,
+            format!(
+                "`{}` holds no `{wanted}`; it holds {}",
+                path.display(),
+                held.join(", ")
+            ),
+        )
+    })?;
+
+    let bindings =
+        generate::Bindings::resolve(manifest, &invocation.imports, &invocation.typescript)?;
+    generate::contract(manifest, &directory, &bindings, span)
+}
+
+/// `"coagent.runtime/1"` — the same spelling a manifest's own `imports` use,
+/// so that a call site and the file it reads name a contract the same way.
+fn split_id(id: &str, span: proc_macro2::Span) -> syn::Result<(&str, u32)> {
+    let bad = || {
+        syn::Error::new(
+            span,
+            format!(
+                "`{id}` does not name a contract; write it as a manifest's own imports do, \
+                 `<contract>/<major version>`, e.g. `coagent.rpc/1`"
+            ),
+        )
+    };
+    let (contract, version) = id.rsplit_once('/').ok_or_else(bad)?;
+    let version: u32 = version.parse().map_err(|_| bad())?;
+    Ok((contract, version))
 }

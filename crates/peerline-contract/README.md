@@ -38,7 +38,7 @@ format is `peerline-contract-spec`, from which the re-exported
 `contract!` macro generates the Rust at compile time.
 
 ```rust,ignore
-peerline_contract::contract!("contracts/codex.server.v1.json");
+peerline_contract::contract!("codex.server/1" in "contracts");
 ```
 
 Op constants, the argument and result types, the error codes and the

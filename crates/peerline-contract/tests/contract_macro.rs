@@ -11,10 +11,10 @@ use peerline_contract::spec::{Manifest, OpKind};
 
 mod demo {
     //! The fixture manifest, expanded.
-    peerline_contract::contract!("tests/contracts/demo.v1.json");
+    peerline_contract::contract!("demo.thing/2" in "tests/contracts");
 }
 
-const SOURCE: &str = include_str!("contracts/demo.v1.json");
+const SOURCE: &str = include_str!("contracts/demo.thing.v2.json");
 
 /// The op constants carry the manifest's full names, and `OPS` lists them in
 /// the manifest's order — the list a producer registers from.
