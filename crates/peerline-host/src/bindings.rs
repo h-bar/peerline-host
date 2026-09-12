@@ -86,9 +86,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Duration;
 
-use peerline::runtime::Peer;
+use peerline::runtime::{ConnectError, Peer};
 use peerline_contract::{Binding, Consumed, ContractId, Endpoints, HostId};
 use tokio::sync::{mpsc, watch};
+
+use crate::DialError;
 
 /// A dependency's connection dropped: the contract it was for.
 pub(crate) type Lost = mpsc::UnboundedSender<ContractId>;
@@ -281,13 +283,22 @@ impl Bindings {
 
     /// The binding for a contract this service consumes.
     ///
-    /// Panics if the contract did not resolve, which for a **required**
-    /// contract cannot happen: the host does not call
-    /// [`Service::bind`](crate::Service::bind) until every one of them has. Use
-    /// [`get`](Self::get) for a contract declared
-    /// [`optional`](peerline_contract::Consumed::optional) — an optional
-    /// contract that never resolved is exactly the `None` case, and the host
-    /// becomes ready anyway.
+    /// # Panics
+    ///
+    /// Panics if the contract did not resolve. For a **required** contract
+    /// that cannot happen — the host does not call
+    /// [`Service::bind`](crate::Service::bind) until every one of them has —
+    /// which is exactly why this is allowed to panic: the condition is a
+    /// programming error (a contract asked for here but not declared in
+    /// `consumes`), not a runtime state, and unwrapping at every call site
+    /// would be noise around something that cannot happen.
+    ///
+    /// It **can** happen for a contract declared
+    /// [`optional`](peerline_contract::Consumed::optional), because an
+    /// optional contract with no producer resolves to nothing and the host
+    /// becomes ready anyway. Never call this for one: use
+    /// [`get`](Self::get) for the `Option`, or
+    /// [`try_require`](Self::try_require) for a `Result` that `?` carries.
     pub fn require(&self, name: &str, version: u32) -> Binding {
         self.get(name, version).unwrap_or_else(|| {
             panic!(
@@ -296,6 +307,33 @@ impl Bindings {
                  (use `Bindings::get`)"
             )
         })
+    }
+
+    /// [`require`](Self::require), without the panic.
+    ///
+    /// The same question with the answer as a value: `Ok` is the resolved
+    /// binding, and [`DialError::NotBound`](crate::DialError::NotBound) is the
+    /// contract having no binding — undeclared, or optional and not resolved.
+    /// It is the error [`connect`](Self::connect) gives for the same
+    /// condition, so a caller that handles one handles the other.
+    ///
+    /// Prefer this wherever the absence is a state rather than a bug: inside
+    /// a handler that should answer an error rather than take the process
+    /// down, and anywhere an optional contract is involved.
+    ///
+    /// ```no_run
+    /// # fn f(deps: &peerline_host::Bindings) -> Result<(), String> {
+    /// let metrics = deps.try_require("metrics", 1)?;  // `?`, not a panic
+    /// # let _ = metrics;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_require(&self, name: &str, version: u32) -> Result<Binding, DialError> {
+        let contract = ContractId::new(name, version);
+        lock(&self.inner.map)
+            .get(&contract)
+            .map(|r| r.binding.clone())
+            .ok_or(DialError::NotBound { contract })
     }
 
     /// The binding for a contract, or `None` if it did not resolve.
@@ -328,6 +366,29 @@ impl Bindings {
         self.inner.optional.contains(contract)
     }
 
+    /// Every optional contract this host declared that resolved to **nothing**.
+    ///
+    /// These are the ones with no producer at the moment the host became
+    /// ready. Nothing else would ever look for them again: `connect` reports no
+    /// loss for a contract with no binding (there is nothing to re-resolve),
+    /// so a contract that starts here and is not sought stays unbound for the
+    /// life of the process. See
+    /// [`watch_dependencies`](crate::coordinator::watch_dependencies).
+    ///
+    /// A **required** contract cannot appear here. The host does not reach
+    /// this point until `coord.await_ready` has produced a binding for every
+    /// one of them; a required contract with no producer fails the run instead.
+    #[cfg(feature = "uds")]
+    pub(crate) fn unbound_optional(&self) -> Vec<ContractId> {
+        let map = lock(&self.inner.map);
+        self.inner
+            .optional
+            .iter()
+            .filter(|c| !map.contains_key(*c))
+            .cloned()
+            .collect()
+    }
+
     /// Dial the producer bound to a contract.
     ///
     /// Tries this host's coordinates in preference order (see the module docs)
@@ -354,24 +415,30 @@ impl Bindings {
     /// connections left a binding that was never dialable frozen for the life
     /// of the process, with the re-resolve budget never started and the exit
     /// in §9 never taken.
-    pub async fn connect(&self, name: &str, version: u32) -> Result<Connection, String> {
+    pub async fn connect(&self, name: &str, version: u32) -> Result<Connection, DialError> {
         let contract = ContractId::new(name, version);
         // A contract with no binding at all is not a dependency that broke:
         // it was never declared, or it is an optional one that never
         // resolved. There is nothing for the host to re-resolve, so this does
         // not report a loss.
-        let binding = lock(&self.inner.map)
-            .get(&contract)
-            .map(|r| r.binding.clone())
-            .ok_or_else(|| format!("peerline-host: no binding for `{contract}`"))?;
+        let binding = self.try_require(name, version)?;
         let (peer, driver) = match dial(&self.inner.host, &binding.endpoints).await {
             Ok(pair) => pair,
             Err(e) => {
+                // Which contract and which producer used to be formatted into
+                // the returned string, which made them impossible to read
+                // without also making the error impossible to match on. They
+                // are structured fields now: every known caller logged this
+                // error and nothing else, and a log line is where the
+                // attribution was always going. `debug` rather than `warn`
+                // because the watchdog warns about the same event once, with
+                // the decision attached.
+                tracing::debug!(
+                    %contract, instance = %binding.instance, error = %e,
+                    "peerline-host: cannot reach a bound producer"
+                );
                 let _ = self.inner.lost.send(contract.clone());
-                return Err(format!(
-                    "peerline-host: cannot reach `{contract}` (instance `{}`): {e}",
-                    binding.instance
-                ));
+                return Err(e);
             }
         };
         Ok(Connection::spawn(
@@ -429,10 +496,8 @@ impl Connection {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn dial(host: &HostId, endpoints: &Endpoints) -> Result<Connection, String> {
-        let (peer, driver) = dial(host, endpoints)
-            .await
-            .map_err(|e| format!("peerline-host: cannot reach that producer: {e}"))?;
+    pub async fn dial(host: &HostId, endpoints: &Endpoints) -> Result<Connection, DialError> {
+        let (peer, driver) = dial(host, endpoints).await?;
         Ok(Connection::spawn(peer, driver, None))
     }
 
@@ -504,6 +569,65 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Every coordinate that was tried and how it failed, plus whether the
+/// failures were *all* the producer saying no.
+///
+/// Kept as one struct so each transport's arm is the same three lines. The
+/// refusal count is what separates [`DialError::Refused`] from
+/// [`DialError::Unreachable`]: see [`attempts_failed`].
+#[derive(Default)]
+struct Attempts {
+    /// One sentence per coordinate tried, in preference order.
+    sentences: Vec<String>,
+    /// The first refusal seen, and which coordinate produced it.
+    refused: Option<(String, ConnectError)>,
+    /// How many attempts failed for a reason that was *not* a refusal.
+    other: usize,
+}
+
+impl Attempts {
+    /// Record one failed coordinate. `at` names it for a human — `"ws
+    /// ws://host/path"` — and is what a refusal is reported against.
+    fn failed(&mut self, at: String, e: ConnectError) {
+        self.sentences.push(format!("{at}: {e}"));
+        match e {
+            ConnectError::Refused if self.refused.is_none() => self.refused = Some((at, e)),
+            ConnectError::Refused => {}
+            _ => self.other += 1,
+        }
+    }
+}
+
+/// Turn a set of exhausted attempts into the error that describes them.
+///
+/// A refusal is reported **only when every attempt was one**. A producer that
+/// refused us on uds but was merely unreachable on ws is not a host that has
+/// been shut out — its ws coordinate may work in a moment, and reporting
+/// `Refused` there would tell a caller (through
+/// [`DialError::is_transient`](crate::DialError::is_transient)) to stop
+/// trying something that was never refused.
+fn attempts_failed(host: &HostId, endpoints: &Endpoints, attempts: Attempts) -> DialError {
+    if attempts.sentences.is_empty() {
+        // Either the producer reported nothing dialable, or every coordinate it
+        // did report is on a transport this binary was built without.
+        return DialError::NoCoordinates {
+            advertised: format!(
+                "no usable coordinates (this host is `{host}`, the producer reported \
+                 {} ws / {} uds / {} iroh)",
+                endpoints.ws.len(),
+                endpoints.uds.len(),
+                endpoints.iroh.len()
+            ),
+        };
+    }
+    match attempts.refused {
+        Some((endpoint, cause)) if attempts.other == 0 => DialError::Refused { endpoint, cause },
+        _ => DialError::Unreachable {
+            attempts: attempts.sentences,
+        },
+    }
+}
+
 /// Dial one producer's coordinates, in preference order.
 #[cfg_attr(
     not(any(feature = "ws", feature = "uds", feature = "iroh")),
@@ -512,8 +636,8 @@ impl Drop for AbortOnDrop {
 pub(crate) async fn dial(
     host: &HostId,
     endpoints: &Endpoints,
-) -> Result<(Peer, futures::future::BoxFuture<'static, ()>), String> {
-    let mut tried: Vec<String> = Vec::new();
+) -> Result<(Peer, futures::future::BoxFuture<'static, ()>), DialError> {
+    let mut tried = Attempts::default();
 
     // uds first, and only where the locality tag says the path means anything
     // here. See the module docs: this comparison is the difference between a
@@ -523,7 +647,7 @@ pub(crate) async fn dial(
         for path in &endpoints.uds {
             match peerline_transport_uds::connect(path).await {
                 Ok(pair) => return Ok(pair),
-                Err(e) => tried.push(format!("uds {path}: {e}")),
+                Err(e) => tried.failed(format!("uds {path}"), e),
             }
         }
     }
@@ -532,7 +656,7 @@ pub(crate) async fn dial(
     for url in &endpoints.ws {
         match peerline_transport_ws::connect(url).await {
             Ok(pair) => return Ok(pair),
-            Err(e) => tried.push(format!("ws {url}: {e}")),
+            Err(e) => tried.failed(format!("ws {url}"), e),
         }
     }
 
@@ -550,22 +674,11 @@ pub(crate) async fn dial(
         .await
         {
             Ok(pair) => return Ok(pair),
-            Err(e) => tried.push(format!("iroh {}: {e}", d.alpn)),
+            Err(e) => tried.failed(format!("iroh {}", d.alpn), e),
         }
     }
 
-    if tried.is_empty() {
-        // Either the producer reported nothing dialable, or every coordinate it
-        // did report is on a transport this binary was built without.
-        return Err(format!(
-            "no usable coordinates (this host is `{host}`, the producer reported \
-             {} ws / {} uds / {} iroh)",
-            endpoints.ws.len(),
-            endpoints.uds.len(),
-            endpoints.iroh.len()
-        ));
-    }
-    Err(tried.join("; "))
+    Err(attempts_failed(host, endpoints, tried))
 }
 
 #[cfg(all(test, feature = "uds"))]

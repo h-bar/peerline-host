@@ -38,6 +38,7 @@
 //! that both halves of the generated code say the same thing.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use peerline_contract_spec::{
     Directory, ErrorDef, Field, Manifest, OpDef, OpKind, Prose, Role, Scalar, Schema, Tagging,
@@ -431,10 +432,16 @@ fn ts_field_attrs(field: &Field) -> TokenStream {
 
 /// The whole expansion, in the order it reads best: what the contract is,
 /// what its ops are, what can go wrong, and what shapes travel.
+///
+/// `crate_dir` is the invoking crate's `CARGO_MANIFEST_DIR`, and the only
+/// thing it is used for is anchoring the dependency edges — see
+/// [`rebuild_tracker`] for why they are emitted relative to it. `None` is a
+/// caller that has none to offer, and gets absolute literals.
 pub(crate) fn contract(
     manifest: &Manifest,
     dir: &Directory,
     bindings: &Bindings,
+    crate_dir: Option<&Path>,
     span: Span,
 ) -> syn::Result<TokenStream> {
     let types = manifest.type_map();
@@ -456,7 +463,7 @@ pub(crate) fn contract(
         .iter()
         .map(|def| shape(def, manifest, dir, &types, bindings, span))
         .collect::<syn::Result<Vec<_>>>()?;
-    let tracker = rebuild_tracker(dir, span);
+    let tracker = rebuild_tracker(dir, crate_dir, span);
 
     Ok(quote! {
         #header
@@ -1842,10 +1849,55 @@ fn doc_lines(lines: &[String]) -> TokenStream {
 /// One per file in the directory, not one for the manifest asked for: every
 /// file was read, so an edit to any of them can change or invalidate this
 /// expansion. See the crate docs, including the one case this cannot cover.
-fn rebuild_tracker(dir: &Directory, span: Span) -> TokenStream {
+///
+/// # Why the emitted path is not the path this macro read
+///
+/// `crate_dir` is the invoking crate's `CARGO_MANIFEST_DIR`, and each edge
+/// under it is emitted as `concat!(env!("CARGO_MANIFEST_DIR"), "/", <rel>)`
+/// rather than as the absolute path this expansion resolved. The two name the
+/// same file on this machine, and only one of them still does on another.
+///
+/// An absolute literal bakes *this* checkout's location into the expansion,
+/// which costs twice. A shared build cache — sccache, a CI cache, a vendored
+/// `cargo package` — keys on the token stream, so two machines with the same
+/// source and different checkout roots produce different expansions and miss
+/// every hit they should have had. And the expansion is no longer a function
+/// of the crate: moving the checkout changes it. `env!` defers the join to the
+/// compiler that expands the call site, which is the only one that knows where
+/// the crate actually is.
+///
+/// A directory the call site gave as an **absolute** path (or one that is
+/// somehow not under the crate) has no relative spelling and keeps the
+/// absolute literal — it was already machine-specific by construction, and
+/// inventing a `..` chain out of the crate to reach it would be less honest
+/// rather than more portable.
+fn rebuild_tracker(dir: &Directory, crate_dir: Option<&Path>, span: Span) -> TokenStream {
     let edges = dir.files().iter().map(|path| {
-        let literal = LitStr::new(&path.to_string_lossy(), span);
-        quote! { const _: &[u8] = include_bytes!(#literal); }
+        // Lexical, deliberately: a contracts directory reached as `../shared`
+        // strips to `../shared/x.json`, which is exactly the spelling that
+        // stays true wherever the crate is. Canonicalising first would resolve
+        // the `..` away and hand back an absolute path again.
+        let relative = crate_dir
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(|rel| {
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            });
+        match relative {
+            Some(rel) => {
+                let literal = LitStr::new(&rel, span);
+                quote! {
+                    const _: &[u8] =
+                        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/", #literal));
+                }
+            }
+            None => {
+                let literal = LitStr::new(&path.to_string_lossy(), span);
+                quote! { const _: &[u8] = include_bytes!(#literal); }
+            }
+        }
     });
     quote! { #(#edges)* }
 }

@@ -100,7 +100,7 @@ async fn shutdown_resolves_ok_stops_accepting_and_leaves_live_connections_alone(
     // The shutdown arm returns `Ok`, not the "no active mounts" / transport
     // error the other arms produce.
     let outcome = host.await.expect("host task");
-    assert_eq!(outcome, Ok(()), "shutdown must be a clean exit");
+    assert!(outcome.is_ok(), "shutdown must be a clean exit");
 
     // `run_until` drops the serve futures before it returns, so the listener
     // is closed by the time we get here — no retry loop, a single refused
@@ -169,7 +169,10 @@ async fn shutdown_tears_down_every_transport() {
     }
 
     tx.send(()).expect("host still running");
-    assert_eq!(host.await.expect("host task"), Ok(()));
+    assert!(
+        host.await.expect("host task").is_ok(),
+        "a clean shutdown is Ok"
+    );
 
     assert!(
         peerline_transport_uds::connect(&sock).await.is_err(),
@@ -196,7 +199,7 @@ async fn an_already_resolved_shutdown_stops_the_host_immediately() {
         .mount(Echo, Mount::new().uds(&sock))
         .run_until(std::future::ready(()))
         .await;
-    assert_eq!(outcome, Ok(()));
+    assert!(outcome.is_ok(), "a resolved shutdown is a clean exit");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -63,7 +63,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// resolves the endpoint identity while it assembles the transports, before
 /// any of them is polled, so this exercises the real path without needing
 /// the endpoint to reach a relay.
-async fn run_iroh_host(key: &Path) -> Result<(), String> {
+async fn run_iroh_host(key: &Path) -> Result<(), peerline_host::HostError> {
     Host::new()
         .mount(Echo, iroh_mount())
         .iroh_endpoint(Some(key.to_path_buf()))
@@ -129,7 +129,13 @@ async fn a_corrupt_iroh_key_fails_the_run() {
     std::fs::write(&key, b"too short").expect("plant a bad key");
 
     let err = run_iroh_host(&key).await.unwrap_err();
-    assert!(err.contains("iroh key"), "{err}");
+    assert!(
+        matches!(
+            &err,
+            peerline_host::HostError::Plan(peerline_host::PlanError::IrohKey(_))
+        ),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read(&key).expect("read key"),
         b"too short",
@@ -153,7 +159,13 @@ async fn a_bad_relay_url_fails_the_run() {
         .run_until(std::future::ready(()))
         .await
         .unwrap_err();
-    assert!(err.contains("iroh relay"), "{err}");
+    assert!(
+        matches!(
+            &err,
+            peerline_host::HostError::Plan(peerline_host::PlanError::IrohRelay(_))
+        ),
+        "{err}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -173,7 +185,16 @@ async fn two_services_cannot_share_one_iroh_alpn() {
         .run_until(std::future::ready(()))
         .await
         .unwrap_err();
-    assert!(err.contains("share iroh alpn"), "{err}");
+    assert!(
+        matches!(
+            &err,
+            peerline_host::HostError::Plan(peerline_host::PlanError::AddressCollision {
+                transport: "iroh alpn",
+                ..
+            })
+        ),
+        "{err}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -187,7 +208,9 @@ async fn an_iroh_mount_without_an_endpoint_is_not_an_active_mount() {
         .run_until(std::future::ready(()))
         .await
         .unwrap_err();
-    assert!(err.contains("no active mounts"), "{err}");
+    // `NoMounts`, not `Bind`: nothing was ever configured to bind. The two
+    // used to share one string and so could not be told apart.
+    assert!(matches!(err, peerline_host::HostError::NoMounts), "{err}");
 }
 
 // --- what a failed iroh bind does to the rest of the host -------------------
@@ -242,7 +265,10 @@ async fn a_failed_iroh_bind_leaves_the_other_transports_serving() {
     assert_eq!(reply, "echo:hi");
 
     let _ = tx.send(());
-    assert_eq!(host.await.expect("host task"), Ok(()));
+    assert!(
+        host.await.expect("host task").is_ok(),
+        "a clean shutdown is Ok"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -260,9 +286,13 @@ async fn an_iroh_only_host_that_cannot_bind_fails_the_run() {
         .run_until(std::future::pending())
         .await
         .unwrap_err();
-    assert!(err.contains("no active mounts"), "{err}");
+    // `Bind`, not `NoMounts`: a transport *was* configured and failed to
+    // claim its address, which is the environmental case worth a retry.
+    let peerline_host::HostError::Bind(bind) = &err else {
+        panic!("a configured transport that failed to bind is a Bind error: {err}")
+    };
     assert!(
-        err.contains("iroh"),
+        bind.failures.iter().any(|f| f.contains("iroh")),
         "the error must name what failed: {err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -419,7 +449,10 @@ async fn ticket_carries_the_persisted_identity_and_dials_back() {
     assert_eq!(reply, "echo:hi");
 
     let _ = stop_tx.send(());
-    assert_eq!(host.await.expect("host task"), Ok(()));
+    assert!(
+        host.await.expect("host task").is_ok(),
+        "a clean shutdown is Ok"
+    );
     coordinator.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }

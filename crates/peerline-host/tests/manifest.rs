@@ -93,7 +93,21 @@ async fn the_probe_reports_every_mounted_service_and_binds_nothing() {
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), host().run())
         .await
         .expect("the probe must exit rather than serve");
-    assert_eq!(outcome, Ok(()), "a probe is a clean exit");
+    assert!(outcome.is_ok(), "a probe is a clean exit");
+
+    // And through the split, where the probe is a *named* outcome rather than
+    // an `Ok(())` indistinguishable from a host that served and stopped. A
+    // caller that splits `bind` from `serve` is about to do something with an
+    // address, so "there is no address, and that is fine" has to be something
+    // it cannot accidentally read as success.
+    let bound = tokio::time::timeout(std::time::Duration::from_secs(5), host().bind())
+        .await
+        .expect("the probe must exit rather than serve")
+        .expect("a probe is not a failure");
+    assert!(
+        matches!(bound, peerline_host::Bound::Probed),
+        "a probe binds nothing and says so"
+    );
 
     let written = Manifest::from_json(&std::fs::read(&out).expect("the probe wrote its manifest"))
         .expect("valid manifest json");

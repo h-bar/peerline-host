@@ -24,6 +24,33 @@
 //! It is also what lets an imported shape be read rather than described. See
 //! the derives section below.
 //!
+//! ## Where the directory may live, and what that costs at publish time
+//!
+//! The path is resolved against the invoking crate's `CARGO_MANIFEST_DIR`, so
+//! `"contracts"` is the crate's own directory and `"../contracts"` is one
+//! shared with its siblings. Both expand identically, and the expansion
+//! carries no path from the machine that produced it — the dependency edges
+//! are emitted relative to `env!("CARGO_MANIFEST_DIR")` and joined by the
+//! compiler that expands the call site (see the rebuild section below).
+//!
+//! **A directory outside the crate nevertheless makes that crate
+//! unpublishable, and this macro cannot fix it.** `cargo package` builds the
+//! `.crate` archive from the files under the crate root and nothing else, so a
+//! `../contracts` is simply not in the tarball; the published crate then fails
+//! to build at the `include_bytes!` its own expansion emitted, or — worse, if
+//! the edge were omitted — at the `Directory::load` that reads the manifests.
+//! That is a rule about which files cargo collects, decided before any macro
+//! runs, and no spelling of the emitted path changes which files exist in the
+//! archive.
+//!
+//! So the choice is a real one. A directory **inside** the crate publishes,
+//! and is the right default for a crate that will ever leave this workspace. A
+//! shared directory **outside** it keeps one copy of a contract for several
+//! crates, which is what a contract is for, at the price of those crates being
+//! workspace-local. A crate that needs both copies the directory in at release
+//! time or is published from a workspace that vendors it — either way the
+//! decision belongs to the crate, not to its call sites.
+//!
 //! # What it expands to
 //!
 //! Everything the manifest describes, in the scope of the invocation:
@@ -340,6 +367,27 @@
 //! that, and touching any manifest rebuilds the crate. The constants are
 //! never read — they exist to be dependency edges.
 //!
+//! ## The edge names the crate, not this machine
+//!
+//! Each edge is emitted as
+//! `include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/", "contracts/x.json"))`
+//! rather than as the absolute path this macro read. The macro *resolves* an
+//! absolute path — it has to, it opens the files — but what it **emits** is
+//! the crate-relative spelling, and the join is done by the compiler expanding
+//! the call site.
+//!
+//! An absolute literal would bake one checkout's location into the token
+//! stream. Two machines with identical source and different checkout roots
+//! would then produce different expansions, so every shared build cache
+//! (sccache, a CI cache, a vendored build) would miss hits it should have had,
+//! and moving a checkout would change the expansion of code that did not
+//! change. `env!` is evaluated where the crate actually is, which is the only
+//! place that knows.
+//!
+//! A directory the call site gave as an absolute path keeps an absolute
+//! literal: it has no crate-relative spelling, and it was machine-specific
+//! before this macro saw it.
+//!
 //! Every file, because every file was read: a vocabulary supplies an imported
 //! shape's derives, and any manifest at all can collide on an error code, so
 //! an edit anywhere in the directory can change or invalidate this expansion.
@@ -533,17 +581,22 @@ fn parse_typescript(input: ParseStream) -> syn::Result<Vec<Ident>> {
 fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
     let span = invocation.directory.span();
     let given = PathBuf::from(invocation.directory.value());
+    // Read whether or not the directory is relative. A relative one *needs* it
+    // to be found at all; an absolute one still wants it, because a directory
+    // spelled absolutely may nevertheless sit inside the crate, and an edge
+    // that can be anchored should be — see `generate::rebuild_tracker`.
+    let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
     let path = if given.is_absolute() {
         given
     } else {
-        let root = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
+        let root = crate_dir.clone().ok_or_else(|| {
             syn::Error::new(
                 span,
                 "CARGO_MANIFEST_DIR is not set, so a relative directory cannot be resolved; \
                  pass an absolute path",
             )
         })?;
-        PathBuf::from(root).join(given)
+        root.join(given)
     };
 
     let directory = peerline_contract_spec::Directory::load(&path)
@@ -570,7 +623,7 @@ fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
         &invocation.typescript,
         invocation.runtime,
     )?;
-    generate::contract(manifest, &directory, &bindings, span)
+    generate::contract(manifest, &directory, &bindings, crate_dir.as_deref(), span)
 }
 
 /// `"coagent.runtime/1"` — the same spelling a manifest's own `imports` use,

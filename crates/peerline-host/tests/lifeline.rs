@@ -101,9 +101,8 @@ async fn a_host_stops_when_its_supervisor_lets_go_of_the_lifeline() {
         .await
         .expect("the host must stop when its lifeline closes")
         .expect("host task");
-    assert_eq!(
-        outcome,
-        Ok(()),
+    assert!(
+        outcome.is_ok(),
         "EOF on the lifeline is a clean stop, like SIGTERM — not a failure, which \
          a supervisor would read as `restart me` (§9)"
     );

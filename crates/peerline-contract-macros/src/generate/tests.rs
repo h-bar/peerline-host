@@ -88,7 +88,9 @@ fn alongside(
         .map(|name| format_ident!("{}", name))
         .collect();
     let bindings = Bindings::resolve(manifest, &imports, &typescript, runtime)?;
-    contract(manifest, &directory, &bindings, Span::call_site())
+    // No crate directory: an in-memory directory has no files, so there are no
+    // dependency edges to anchor and nothing this argument could change.
+    contract(manifest, &directory, &bindings, None, Span::call_site())
 }
 
 fn expansion() -> String {
@@ -145,34 +147,107 @@ fn an_ops_docs_name_its_kind_and_its_shapes() {
 /// every file was read, so an edit to any of them can change what this
 /// expansion says or invalidate a check made while producing it.
 ///
-/// The only test here that goes through [`Directory::load`], because the
-/// paths are the thing being asserted and an in-memory directory has none.
-#[test]
-fn the_expansion_declares_every_manifest_in_the_directory_as_a_source_input() {
-    let dir = std::env::temp_dir().join(format!("peerline-contract-macros-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+/// A crate root with a `contracts` directory under it, as a call site's
+/// `"contracts"` resolves to. Returns the root; the caller removes it.
+///
+/// The tracker tests are the only ones here that go through
+/// [`Directory::load`], because the paths are the thing being asserted and an
+/// in-memory directory has none.
+fn crate_with_contracts(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "peerline-contract-macros-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("contracts");
     std::fs::create_dir_all(&dir).expect("a directory to load");
     std::fs::write(dir.join("demo.thing.v1.json"), IMPORTING).expect("written");
     std::fs::write(dir.join("demo.vocab.v1.json"), vocab("string")).expect("written");
+    root
+}
 
-    let directory = Directory::load(&dir).expect("the two manifests agree");
+/// Expand `demo.thing/1` out of `<root>/contracts`, anchoring the dependency
+/// edges at `crate_dir`.
+fn tracked(root: &std::path::Path, crate_dir: Option<&std::path::Path>) -> String {
+    let directory = Directory::load(&root.join("contracts")).expect("the two manifests agree");
     let manifest = directory.get("demo.thing", 1).expect("just written");
     let imports = vec![(
         LitStr::new("demo.vocab/1", Span::call_site()),
         quote!(::demo_vocab),
     )];
     let bindings = Bindings::resolve(manifest, &imports, &[], false).expect("mapped");
-    let tokens = contract(manifest, &directory, &bindings, Span::call_site())
-        .expect("expands")
-        .to_string();
+    contract(
+        manifest,
+        &directory,
+        &bindings,
+        crate_dir,
+        Span::call_site(),
+    )
+    .expect("expands")
+    .to_string()
+}
+
+#[test]
+fn the_expansion_declares_every_manifest_in_the_directory_as_a_source_input() {
+    let root = crate_with_contracts("edges");
+    let tokens = tracked(&root, Some(&root));
 
     assert_eq!(tokens.matches("include_bytes").count(), 2, "{tokens}");
-    assert!(tokens.contains("demo.thing.v1.json"), "{tokens}");
+    assert!(tokens.contains("contracts/demo.thing.v1.json"), "{tokens}");
     assert!(
-        tokens.contains("demo.vocab.v1.json"),
+        tokens.contains("contracts/demo.vocab.v1.json"),
         "the vocabulary is an input too: {tokens}"
     );
-    std::fs::remove_dir_all(&dir).expect("cleaned up");
+    std::fs::remove_dir_all(&root).expect("cleaned up");
+}
+
+/// The expansion must be a function of the crate, not of where the crate
+/// happens to be checked out.
+///
+/// An absolute literal here would make two machines with identical source
+/// produce different token streams, which costs every shared build cache the
+/// hits it should have had — and would make the expansion change when nothing
+/// but the checkout path did. The macro still *resolves* an absolute path to
+/// read the files; what it emits defers the join to the compiler that expands
+/// the call site.
+#[test]
+fn a_dependency_edge_is_emitted_relative_to_the_invoking_crate() {
+    let root = crate_with_contracts("portable");
+    let tokens = tracked(&root, Some(&root));
+
+    assert_eq!(
+        tokens.matches("CARGO_MANIFEST_DIR").count(),
+        2,
+        "every edge is anchored at the invoking crate: {tokens}"
+    );
+    assert!(
+        !tokens.contains(&root.to_string_lossy().to_string()),
+        "this machine's checkout path must not appear in the expansion: {tokens}"
+    );
+    std::fs::remove_dir_all(&root).expect("cleaned up");
+}
+
+/// A directory with no crate to anchor it to keeps the absolute literal.
+///
+/// That is the call site that passed an absolute path: it has no
+/// crate-relative spelling, and it was specific to this machine before the
+/// macro ever saw it. Emitting a `..` chain out of the crate to reach it would
+/// be a guess rather than a portability win.
+#[test]
+fn an_unanchorable_directory_keeps_its_absolute_path() {
+    let root = crate_with_contracts("absolute");
+    let tokens = tracked(&root, None);
+
+    assert_eq!(tokens.matches("include_bytes").count(), 2, "{tokens}");
+    assert!(
+        !tokens.contains("CARGO_MANIFEST_DIR"),
+        "there is nothing to anchor to: {tokens}"
+    );
+    assert!(
+        tokens.contains(&root.join("contracts").to_string_lossy().to_string()),
+        "{tokens}"
+    );
+    std::fs::remove_dir_all(&root).expect("cleaned up");
 }
 
 /// A file whose name disagrees with what it declares is one an implementor

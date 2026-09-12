@@ -48,6 +48,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::bindings::{Bindings, LostRx};
+use crate::error::HostError;
 
 /// How often the host heartbeats. An order of magnitude under the
 /// coordinator's default TTL, which is what makes an expiry mean something.
@@ -84,9 +85,21 @@ pub(crate) struct CoordCtx {
 /// How a session ended.
 enum End {
     /// The connection (or the coordinator) went away. Reconnect.
+    ///
+    /// Stays a string: it is written to one `debug!` and never leaves this
+    /// module, because a retried failure is not something a caller ever sees.
     Retry(String),
     /// Nothing a retry can fix. The host exits non-zero.
-    Fatal(String),
+    Fatal(HostError),
+}
+
+/// The message a fatal coordinator condition carries out of this module.
+///
+/// Written without the `peerline-host:` prefix every log line here has:
+/// [`HostError`]'s own `Display` adds it once, and doing it twice was the
+/// first thing the typed errors made visible.
+fn fatal(message: impl Into<String>) -> End {
+    End::Fatal(HostError::Coordinator(message.into()))
 }
 
 /// Keep this host registered, heartbeating and ready for as long as it runs.
@@ -97,7 +110,7 @@ pub(crate) async fn client(
     ctx: Arc<CoordCtx>,
     bindings_tx: oneshot::Sender<Vec<Binding>>,
     mut serving: watch::Receiver<bool>,
-) -> String {
+) -> HostError {
     let mut bindings_tx = Some(bindings_tx);
     const INITIAL: Duration = Duration::from_millis(50);
     let mut backoff = INITIAL;
@@ -215,9 +228,9 @@ async fn lifecycle(
             Err(e) => return Err(retry_or_fatal("coord.ready", e)),
         }
     }
-    Err(End::Fatal(format!(
-        "peerline-host: coordinator kept answering UnknownInstance for `{}` \
-         immediately after a successful register",
+    Err(fatal(format!(
+        "the coordinator kept answering UnknownInstance for `{}` immediately after \
+         a successful register",
         ctx.instance
     )))
 }
@@ -234,9 +247,9 @@ async fn register(peer: &Peer, ctx: &CoordCtx) -> Result<(), End> {
                   "peerline-host: registered");
             Ok(())
         }
-        Err(Error::Rpc(e)) if e.code == ERR_INSTANCE_EXISTS => Err(End::Fatal(format!(
-            "peerline-host: instance id `{}` is already registered with different \
-             coordinates — two processes are claiming one identity: {}",
+        Err(Error::Rpc(e)) if e.code == ERR_INSTANCE_EXISTS => Err(fatal(format!(
+            "instance id `{}` is already registered with different coordinates — two \
+             processes are claiming one identity: {}",
             ctx.instance, e.message
         ))),
         Err(e) => Err(retry_or_fatal("coord.register", e)),
@@ -331,10 +344,7 @@ async fn await_ready(peer: &Peer, ctx: &CoordCtx) -> Result<Vec<Binding>, End> {
                     return Err(End::Retry(format!("coord.await_ready: {}", e.message)));
                 }
                 Err(Error::Rpc(e)) if e.code == ERR_UNRESOLVED => {
-                    return Err(End::Fatal(format!(
-                        "peerline-host: dependencies never resolved: {}",
-                        e.message
-                    )));
+                    return Err(fatal(format!("dependencies never resolved: {}", e.message)));
                 }
                 Err(e) => return Err(retry_or_fatal("coord.await_ready", e)),
             }
@@ -343,8 +353,8 @@ async fn await_ready(peer: &Peer, ctx: &CoordCtx) -> Result<Vec<Binding>, End> {
     };
     match tokio::time::timeout(ctx.await_timeout + Duration::from_secs(5), collect).await {
         Ok(r) => r,
-        Err(_) => Err(End::Fatal(format!(
-            "peerline-host: the coordinator at {} never answered coord.await_ready",
+        Err(_) => Err(fatal(format!(
+            "the coordinator at {} never answered coord.await_ready",
             ctx.socket.display()
         ))),
     }
@@ -355,7 +365,7 @@ async fn await_ready(peer: &Peer, ctx: &CoordCtx) -> Result<Vec<Binding>, End> {
 /// answer.
 fn retry_or_fatal(op: &str, e: Error) -> End {
     match e {
-        Error::Rpc(e) => End::Fatal(format!("peerline-host: {op}: {} ({})", e.message, e.code)),
+        Error::Rpc(e) => fatal(format!("{op}: {} ({})", e.message, e.code)),
         other => End::Retry(format!("{op}: {other}")),
     }
 }
@@ -389,6 +399,67 @@ fn retry_or_fatal(op: &str, e: Error) -> End {
 /// minutes is picked up, which is the whole point of degrading rather than
 /// dying.
 ///
+/// # An optional contract that had no producer at startup is still sought
+///
+/// `optional` means the host does not *wait* for it, and `coord.await_ready`
+/// duly returns without a binding for one that has no producer. Nothing then
+/// looked for it again, ever: [`Bindings::connect`] deliberately reports no
+/// loss for a contract with no binding — there is nothing to re-resolve — so
+/// the contract never entered this loop, and a producer that started thirty
+/// seconds after its consumer was never picked up for the life of the process.
+/// A consumer that wanted it had to poll `coord.resolve` by hand, which is the
+/// workaround this exists to remove.
+///
+/// So every contract in [`Bindings::unbound_optional`] gets a **seeker** here:
+/// the same `coord.resolve`, on a backoff that is capped rather than budgeted.
+/// When one answers, the binding enters `Bindings` with a revision bump, and
+/// the documented `revision -> connect -> closed -> refreshed` loop picks it up
+/// with no new vocabulary — a service written against a producer that was there
+/// from the start needs no change to work with one that arrives late.
+///
+/// ## Capped, not budgeted
+///
+/// A lost dependency has a deadline because *something has broken* and the
+/// host has to decide. An optional contract with no producer has not broken:
+/// no-producer is its documented steady state, and a deadline would only mean
+/// giving up on the very case the seeker exists for. So it runs for the life
+/// of the host at [`SEEK_MAX`], which is the honest cost — one targeted
+/// `coord.resolve` per unbound optional contract per thirty seconds, over a
+/// local unix socket.
+///
+/// ## Why this polls rather than riding `coord.watch`
+///
+/// `coord.watch` exists now (`peerline_contract::coord::OP_WATCH`) and is the
+/// right answer for an *observer* — a dashboard pulling the whole registry
+/// every two seconds is what it was added to replace. It is deliberately not
+/// used here, and the reason is not that it would not fit: it is a stream on a
+/// peer, and [`await_ready`] already shows a stream living perfectly well
+/// inside this future-not-a-task client.
+///
+/// The reason is that it could not replace anything. A watch event says an
+/// instance appeared; it does not say that instance is *ours* to bind.
+/// Selection is the coordinator's, and `coord.resolve` is what records the
+/// producer it picked against this consumer — without that call
+/// `coord.bindings` goes on reporting whatever we were given at startup, which
+/// is precisely the answer that stops being true the moment a late producer is
+/// bound. So the resolve stays either way, and watch could only ever be a
+/// wake-up hint in front of it.
+///
+/// For that hint we would pay: a second long-lived connection to the
+/// coordinator, with its own reconnect ladder duplicating [`client`]'s, plus
+/// this poll retained anyway as the fallback for the window where that
+/// connection is down. Two mechanisms, one of them load-bearing, to save one
+/// small query per thirty seconds against a socket on this machine — which is
+/// nothing like the whole-registry-every-two-seconds that `OP_WATCH`'s own
+/// documentation argues against.
+///
+/// **What would change the call**: a host that needs a late producer bound in
+/// under a second, or enough unbound optional contracts that the steady-state
+/// query rate stops being negligible. The place to put it then is the
+/// registration session in [`client`] — it already holds a live peer and a
+/// reconnect ladder — with the event doing nothing but kicking the resolve
+/// that already exists. Not a second connection.
+///
 /// # Concurrent, and deduplicated
 ///
 /// Each contract is re-resolved in its own task. Awaiting one inline would
@@ -397,16 +468,35 @@ fn retry_or_fatal(op: &str, e: Error) -> End {
 /// failures serialised into one, with the second's clock running the whole
 /// time. Conversely a contract already being re-resolved ignores further
 /// reports for it: a service that re-dials in a loop reports a failure every
-/// time round, and each one would otherwise start a duplicate budget.
+/// time round, and each one would otherwise start a duplicate budget. A seeker
+/// takes the same slot, so a contract that has just been bound by one does not
+/// also start a re-resolve.
 pub(crate) async fn watch_dependencies(
     mut lost: LostRx,
     bindings: Bindings,
     socket: PathBuf,
     instance: String,
     budget: Duration,
-) -> String {
+) -> HostError {
     let mut inflight: HashSet<ContractId> = HashSet::new();
-    let mut tasks: JoinSet<(ContractId, Result<String, String>)> = JoinSet::new();
+    let mut tasks: JoinSet<(ContractId, Found)> = JoinSet::new();
+
+    // The contracts that resolved to nothing at startup. Started before the
+    // loop, because nothing will ever report them: they have no binding, so no
+    // dial against them can fail in a way that arrives on `lost`.
+    for contract in bindings.unbound_optional() {
+        inflight.insert(contract.clone());
+        info!(
+            %contract,
+            "peerline-host: optional dependency has no producer yet; watching for one"
+        );
+        let (socket, bindings, instance) = (socket.clone(), bindings.clone(), instance.clone());
+        tasks.spawn(async move {
+            let producer = seek(&socket, &contract, &bindings, &instance).await;
+            (contract, Found::Appeared(producer))
+        });
+    }
+
     loop {
         tokio::select! {
             report = lost.recv() => match report {
@@ -419,7 +509,11 @@ pub(crate) async fn watch_dependencies(
                         (socket.clone(), bindings.clone(), instance.clone());
                     tasks.spawn(async move {
                         let r = re_resolve(&socket, &contract, &bindings, &instance, budget).await;
-                        (contract, r)
+                        let found = match r {
+                            Ok(producer) => Found::Resolved(producer),
+                            Err(why) => Found::Spent(why),
+                        };
+                        (contract, found)
                     });
                 }
                 // Every `Bindings` handle was dropped: no service can dial a
@@ -429,12 +523,18 @@ pub(crate) async fn watch_dependencies(
             },
             Some(done) = tasks.join_next(), if !tasks.is_empty() => {
                 match done {
-                    Ok((contract, Ok(producer))) => {
+                    Ok((contract, Found::Resolved(producer))) => {
                         inflight.remove(&contract);
                         info!(%contract, instance = %producer,
                               "peerline-host: dependency re-resolved");
                     }
-                    Ok((contract, Err(why))) => match spent(&bindings, &contract, &why) {
+                    Ok((contract, Found::Appeared(producer))) => {
+                        inflight.remove(&contract);
+                        info!(%contract, instance = %producer,
+                              "peerline-host: an optional dependency that had no producer \
+                               at startup is now bound");
+                    }
+                    Ok((contract, Found::Spent(why))) => match spent(&bindings, &contract, &why) {
                         Some(fatal) => return fatal,
                         // Optional: degraded, not dead. Forget the attempt so
                         // the next failed dial can start another one.
@@ -442,20 +542,22 @@ pub(crate) async fn watch_dependencies(
                     },
                     // The task cannot panic — `re_resolve` returns its errors —
                     // but a lost JoinError must not be read as success.
-                    Err(e) => return format!("peerline-host: re-resolve task failed: {e}"),
+                    Err(e) => {
+                        return HostError::Other(format!("a re-resolve task failed: {e}"));
+                    }
                 }
             }
         }
     }
     while let Some(done) = tasks.join_next().await {
         match done {
-            Ok((_, Ok(_))) => {}
-            Ok((contract, Err(why))) => {
+            Ok((_, Found::Resolved(_) | Found::Appeared(_))) => {}
+            Ok((contract, Found::Spent(why))) => {
                 if let Some(fatal) = spent(&bindings, &contract, &why) {
                     return fatal;
                 }
             }
-            Err(e) => return format!("peerline-host: re-resolve task failed: {e}"),
+            Err(e) => return HostError::Other(format!("a re-resolve task failed: {e}")),
         }
     }
     std::future::pending().await
@@ -468,7 +570,7 @@ pub(crate) async fn watch_dependencies(
 /// backoff, the `coord.resolve` calls, the `Err` every `connect` returns
 /// meanwhile — is the same for both, because an optional dependency being
 /// missing is not an excuse to stop looking for it.
-fn spent(bindings: &Bindings, contract: &ContractId, why: &str) -> Option<String> {
+fn spent(bindings: &Bindings, contract: &ContractId, why: &str) -> Option<HostError> {
     if bindings.optional(contract) {
         warn!(
             %contract, reason = %why,
@@ -478,7 +580,70 @@ fn spent(bindings: &Bindings, contract: &ContractId, why: &str) -> Option<String
         );
         return None;
     }
-    Some(format!("peerline-host: `{contract}` {why}; exiting"))
+    Some(HostError::DependencyLost {
+        contract: contract.clone(),
+        reason: why.to_string(),
+    })
+}
+
+/// How one contract's search ended.
+///
+/// Three outcomes rather than a `Result`, because "a producer appeared for a
+/// contract that never had one" and "a producer came back after its connection
+/// died" are both successes and read completely differently in a log — and the
+/// distinction is exactly the fix: the first is the case that used to be
+/// impossible.
+enum Found {
+    /// A lost dependency's coordinates were put right, at this instance.
+    Resolved(String),
+    /// An optional contract with no producer at startup now has one.
+    Appeared(String),
+    /// The re-resolve budget ran out. The reason, bare — whether it is fatal
+    /// is [`spent`]'s call.
+    Spent(String),
+}
+
+/// The longest a seeker waits between asking whether an optional contract has
+/// a producer yet.
+///
+/// Larger than [`RECONNECT_MAX`] on purpose. That one caps a backoff inside a
+/// budget of about a minute, so it is spent within a dozen attempts; this one
+/// is the **steady-state** rate of a loop that runs for the life of the
+/// process, and its cost is what an idle host pays forever. Thirty seconds is
+/// a round trip on a local unix socket twice a minute per unbound optional
+/// contract, against a latency nobody is waiting on — the contract was
+/// declared optional precisely because the host works without it.
+const SEEK_MAX: Duration = Duration::from_secs(30);
+
+/// Keep asking the coordinator whether an optional contract has a producer
+/// yet, for as long as the host runs, and bind the first one that appears.
+///
+/// No deadline, deliberately: see [`watch_dependencies`]. Returns the instance
+/// that was bound, which is the only way this ends short of the task being
+/// dropped with the host.
+async fn seek(socket: &Path, contract: &ContractId, bindings: &Bindings, instance: &str) -> String {
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        match resolve_once(socket, contract, instance).await {
+            Ok(Some(binding)) => {
+                let producer = binding.instance.clone();
+                // The revision bump is what makes this visible to a service:
+                // `replace` on a contract that had no entry leaves it at
+                // revision 1, so a `refreshed(name, version, 0)` parked since
+                // startup wakes with a binding in hand.
+                bindings.replace(binding);
+                return producer;
+            }
+            // Both are the ordinary case and neither is worth a warning: a
+            // contract with no producer is what `optional` describes, and a
+            // coordinator that is down is the reconnect ladder's business.
+            Ok(None) => {}
+            Err(e) => debug!(%contract, error = %e,
+                             "peerline-host: still looking for an optional producer"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(SEEK_MAX);
+    }
 }
 
 /// Keep asking the coordinator for a producer until one answers or the budget
@@ -616,6 +781,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A coordinator that answers `coord.resolve` — with nothing until
+    /// `producer` is filled in, and with that binding afterwards.
+    ///
+    /// Small enough to be honest: `coord.resolve` is the only op a seeker
+    /// calls, and standing up the real coordinator would mean a dependency
+    /// pointing the wrong way down the arrow (`peerline-cluster` depends on
+    /// this crate, never the reverse).
+    fn fake_coordinator(
+        socket: PathBuf,
+        producer: Arc<std::sync::Mutex<Option<Binding>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use peerline::wire::RpcError;
+        use peerline_contract::coord::{ResolveArgs, ResolveResult};
+
+        tokio::spawn(async move {
+            let _ = peerline_transport_uds::serve(&socket, move |_| {
+                let producer = producer.clone();
+                Ok(Arc::new(move |peer: &Peer| {
+                    let producer = producer.clone();
+                    peer.on_request(OP_RESOLVE, move |_: ResolveArgs| {
+                        let producer = producer.clone();
+                        async move {
+                            let bindings = producer
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                                .into_iter()
+                                .collect();
+                            Ok::<_, RpcError>(ResolveResult { bindings })
+                        }
+                    });
+                }) as peerline_transport_uds::PeerHandler)
+            })
+            .await;
+        })
+    }
+
+    /// The documented downstream workaround, removed.
+    ///
+    /// An optional contract with no producer at startup resolved to nothing
+    /// and was then **never looked at again**: `connect` reports no loss for a
+    /// contract with no binding, so it never entered the watchdog, so a
+    /// producer that started a moment later was invisible for the life of the
+    /// process. A consumer that wanted one had to hand-roll `coord.resolve`
+    /// polling.
+    ///
+    /// It must now bind on its own, and — the half that makes it usable —
+    /// wake a service parked in `refreshed`, which is the loop the docs have
+    /// told services to write all along.
+    #[tokio::test]
+    async fn an_optional_producer_that_appears_after_startup_is_bound_and_refreshes() {
+        let dir = scratch("late-optional");
+        let sock = dir.join("coord.sock");
+
+        // Nothing to resolve yet: this is the state the host becomes ready in.
+        let producer = Arc::new(std::sync::Mutex::new(None));
+        let coordinator = fake_coordinator(sock.clone(), producer.clone());
+
+        // An optional contract, and `await_ready` produced no binding for it.
+        let (bindings, lost) = Bindings::new(
+            HostId::new("h"),
+            &[Consumed::optional("storage", 1)],
+            Vec::new(),
+        );
+        assert!(
+            bindings.get("storage", 1).is_none(),
+            "the premise: it resolved to nothing"
+        );
+
+        // A service doing exactly what `Bindings::refreshed` documents: take
+        // the revision, fail to connect, and park until the host has put a
+        // binding in place.
+        let parked = {
+            let bindings = bindings.clone();
+            tokio::spawn(async move {
+                let seen = bindings.revision("storage", 1);
+                assert_eq!(seen, 0, "a contract that never resolved starts at zero");
+                assert!(bindings.connect("storage", 1).await.is_err());
+                let rev = bindings.refreshed("storage", 1, seen).await;
+                (rev, bindings.get("storage", 1))
+            })
+        };
+
+        let watchdog = watch_dependencies(
+            lost,
+            bindings.clone(),
+            sock.clone(),
+            "me".into(),
+            Duration::from_millis(200),
+        );
+        tokio::pin!(watchdog);
+
+        // The producer registers late — after the host was already ready and
+        // serving, which is the whole scenario.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!parked.is_finished(), "nothing has appeared yet");
+        *producer.lock().expect("producer slot") = Some(Binding {
+            contract: ContractId::new("storage", 1),
+            instance: "storage-late".into(),
+            endpoints: Endpoints::new(HostId::new("h")),
+        });
+
+        let (rev, bound) = tokio::select! {
+            e = &mut watchdog => panic!("an optional contract must not end the host: {e}"),
+            r = parked => r.expect("the parked task"),
+        };
+        assert!(rev > 0, "the late bind bumps the revision");
+        assert_eq!(
+            bound.expect("bound at last").instance,
+            "storage-late",
+            "the producer that appeared is the one now bound"
+        );
+
+        coordinator.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ...and the required case is untouched, which is what makes the change
     /// above a narrowing rather than a removal. Without this, "optional does
     /// not exit" would be indistinguishable from "nothing exits".
@@ -645,9 +927,15 @@ mod tests {
                 panic!("a required dependency that never came back must exit the host")
             }
         };
-        assert!(err.contains("storage/1"), "{err}");
-        assert!(err.contains("did not come back"), "{err}");
-        assert!(err.contains("exiting"), "{err}");
+        // The variant *is* the assertion now: a spent budget on a required
+        // contract is `DependencyLost` and nothing else can be mistaken for
+        // it. The reason is still checked, because which failure exhausted
+        // the budget is the part an operator reads.
+        let HostError::DependencyLost { contract, reason } = &err else {
+            panic!("a required dependency that never came back exits the host: {err}")
+        };
+        assert_eq!(contract, &ContractId::new("storage", 1));
+        assert!(reason.contains("did not come back"), "{reason}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

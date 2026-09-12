@@ -58,7 +58,7 @@ async fn dial_until_up(endpoints: &Endpoints) -> Connection {
         match Connection::dial(host_id(), endpoints).await {
             Ok(conn) => return conn,
             Err(e) => {
-                last = e;
+                last = e.to_string();
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -167,7 +167,7 @@ async fn dial_refuses_a_uds_path_across_a_hostid_mismatch() {
         .err()
         .expect("a uds path from another namespace must never be dialled");
     assert!(
-        refused.contains("no usable coordinates"),
+        matches!(refused, peerline_host::DialError::NoCoordinates { .. }),
         "the path must be skipped outright rather than attempted and reported \
          as a failure — got: {refused}"
     );

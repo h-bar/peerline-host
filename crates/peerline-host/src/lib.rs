@@ -35,6 +35,34 @@
 //! each transport, requiring at least one active mount, iroh key
 //! persistence + ticket emission, and graceful shutdown.
 //!
+//! # Learning your own address: [`Host::bind`]
+//!
+//! [`run`](Host::run) binds and serves in one step, which is what almost every
+//! service wants. A service that has to *know* what it bound — because it
+//! asked for port `0` and has to report the port the kernel picked, or because
+//! it hands its iroh ticket to somebody — splits the two:
+//!
+//! ```ignore
+//! let Bound::Listening(bound) = host.bind().await? else { return Ok(()) };
+//! if let Some(addr) = bound.ws_addr() {
+//!     hello.publish(format!("ws://{addr}/"));     // the resolved port
+//! }
+//! bound.serve_until(shutdown).await?;
+//! ```
+//!
+//! The listeners are open across that gap, so a client that dials while the
+//! caller is still deciding queues in the kernel backlog rather than being
+//! refused. `run` and `run_until` are thin wrappers over exactly this pair.
+//!
+//! # Failures are types, not sentences
+//!
+//! Every fallible entry point answers with [`HostError`], [`PlanError`],
+//! [`BindError`] or [`DialError`] rather than a `String`, so a supervisor can
+//! tell a misconfiguration (which will fail identically forever) from a busy
+//! port (which may not), and a service can tell a producer that **refused**
+//! it from one that is merely down. Each converts into a `String`, so code
+//! written against the old signature keeps compiling.
+//!
 //! # Joining a cluster
 //!
 //! A service that needs *another* service declares a **contract** rather than
@@ -123,11 +151,13 @@ use tracing::{info, warn};
 mod bindings;
 #[cfg(feature = "uds")]
 mod coordinator;
+mod error;
 mod hostid;
 #[cfg(unix)]
 mod lifeline;
 
 pub use bindings::{Bindings, Connection};
+pub use error::{BindError, DialError, HostError, PlanError};
 pub use hostid::host_id;
 // The two types `Connection::dial` cannot be called without. Re-exported
 // because that entry point exists precisely for a caller who has *not* taken
@@ -142,7 +172,7 @@ pub use peerline_contract::{Endpoints, HostId};
 pub use peerline_contract::env::{COORD_SOCK_ENV, SERVICE_UDS_ENV};
 
 /// A transport's forever-running accept loop.
-type Serve = BoxFuture<'static, Result<(), String>>;
+type Serve = BoxFuture<'static, Result<(), HostError>>;
 
 // One mount entry per transport. Only defined when that transport is
 // compiled in: `Mount` has no setter for a disabled one, so nothing can be
@@ -651,7 +681,7 @@ impl Host {
     /// A **lifeline**, if this process was given one, is a third way to reach
     /// that same path — and unlike the signals it does not depend on anybody
     /// remembering to send anything. See [`Host::run_until`].
-    pub async fn run(self) -> Result<(), String> {
+    pub async fn run(self) -> Result<(), HostError> {
         self.run_until(terminate()).await
     }
 
@@ -683,9 +713,118 @@ impl Host {
     /// With no `PEERLINE_LIFELINE_FD` in the environment there is no lifeline
     /// and this is `shutdown` alone, which is how every host not started by a
     /// supervisor runs.
-    pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> Result<(), String> {
+    pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> Result<(), HostError> {
+        // The configuration checks and the manifest probe run *before* the
+        // shutdown race, exactly as they always have. They are synchronous and
+        // they touch nothing, so there is nothing for a shutdown to save by
+        // pre-empting them — and a host that is misconfigured has to say so
+        // even when it is asked to stop in the same breath, or a caller that
+        // passes an already-resolved shutdown (which every test of these
+        // errors does) gets a clean `Ok` out of a broken configuration.
+        let Some((prepared, plan)) = self.prepare()? else {
+            return Ok(());
+        };
+
+        // From here the shutdown wins over everything, including a bind that
+        // has not finished: an iroh endpoint takes seconds to bind and may
+        // fail, and a host asked to stop must not first wait that out.
+        tokio::pin!(shutdown);
+        let bound = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                info!("peerline-host: shutdown signal received, stopping");
+                return Ok(());
+            }
+            r = self.bind_planned(prepared, plan) => r?,
+        };
+
+        match bound {
+            // Neither claimed anything and neither will serve, and both are a
+            // clean exit — a probe did its job, and an orphan has nobody left
+            // to serve. (`Probed` cannot arrive here: `prepare` answered it
+            // above. Spelling it out beats a wildcard that would silently
+            // absorb a future variant.)
+            Bound::Probed | Bound::Orphaned => Ok(()),
+            Bound::Listening(host) => host.serve_until(shutdown).await,
+        }
+    }
+
+    /// Bind every configured transport and stop there, so the caller can read
+    /// the addresses that were **actually** bound before anything is served.
+    ///
+    /// # Why this is a separate step
+    ///
+    /// `bind(2)` and `accept(2)` are separate syscalls, and the window between
+    /// them is where a host learns what it is. A host that asked for
+    /// `127.0.0.1:0` does not know its port until the kernel has picked one;
+    /// an iroh endpoint has no ticket until it is bound and has found a relay.
+    /// [`run`](Self::run) resolves both and then hands them only to the
+    /// coordinator — so a caller that needs its own address for anything else
+    /// (reporting it in a handshake, writing it to a file, passing it to a
+    /// child) had no way to get it, and the only way out was to stop using
+    /// `Host` and re-implement the acceptor, the policy wiring and the mount
+    /// table against the transport crate directly.
+    ///
+    /// ```ignore
+    /// let Bound::Listening(bound) = host.bind().await? else { return Ok(()) };
+    /// if let Some(addr) = bound.ws_addr() {
+    ///     service.publish(format!("ws://{addr}/"));   // the real port
+    /// }
+    /// bound.serve_until(terminate()).await
+    /// ```
+    ///
+    /// # Where the split sits, and why exactly there
+    ///
+    /// `Bind -> Register -> AwaitReady -> Service::bind(deps) -> Serve -> Ready`
+    ///
+    /// The cut is immediately after `Bind` and the endpoint report built from
+    /// it, and before **everything** to its right. That position is forced
+    /// from both sides. It cannot be earlier: the endpoints are computed from
+    /// what bound, which is the whole reason `Bind` comes first, and there is
+    /// nothing to report before that. It cannot be later: the very next step
+    /// registers those coordinates with the coordinator, and a caller that
+    /// wanted to *add* to them — a ws URL of its own, a port it passes to a
+    /// child — has to do so before they are published, or it publishes one
+    /// thing and tells the cluster another.
+    ///
+    /// So everything that can fail without touching the network still happens
+    /// here (the manifest probe, the missing-coordinator check, the plan), and
+    /// everything that involves another process still happens in
+    /// [`BoundHost::serve_until`]. The listeners are open across the gap, which
+    /// is the same property the coordinator handshake already relied on: a
+    /// client that dials while the caller is still deciding queues in the
+    /// kernel backlog rather than being refused.
+    ///
+    /// # The three outcomes
+    ///
+    /// Two of them are not a host to serve, and they are variants rather than
+    /// a silent `Ok` because a caller holding a [`BoundHost`] is about to do
+    /// something with an address, and "there is no address" must not be
+    /// spelled the same way as "here it is". See [`Bound`].
+    pub async fn bind(self) -> Result<Bound, HostError> {
+        let Some((prepared, plan)) = self.prepare()? else {
+            return Ok(Bound::Probed);
+        };
+        self.bind_planned(prepared, plan).await
+    }
+
+    /// Everything that can be decided without touching the network: the
+    /// configuration errors, and the manifest probe.
+    ///
+    /// `Ok(None)` is the probe — it has already written its manifest, and
+    /// there is nothing left to bind. Otherwise the mount tables, ready to
+    /// bind.
+    ///
+    /// Separate from [`bind_planned`](Self::bind_planned) because these checks
+    /// must not be skippable. [`run_until`](Self::run_until) races the bind
+    /// against the caller's shutdown, and a host handed a shutdown that has
+    /// already resolved would otherwise never discover that it was
+    /// misconfigured — it would answer `Ok(())` to a duplicate mount address
+    /// or an unreadable iroh key. Nothing here blocks, so there is nothing for
+    /// a shutdown to gain by pre-empting it.
+    fn prepare(&self) -> Result<Option<(Vec<Prepared>, Plan)>, HostError> {
         if self.services.is_empty() {
-            return Err("peerline-host: no services registered".into());
+            return Err(HostError::NoServices);
         }
 
         // The probe (§10.3): report and exit, before anything is bound and
@@ -697,7 +836,8 @@ impl Host {
         // fails before anything binds: one stray `export` and every host in
         // the cluster refuses to start.
         if let Some(out) = peerline_contract::env::var(MANIFEST_OUT_ENV) {
-            return write_manifest(&self.manifest(), Path::new(&out));
+            write_manifest(&self.manifest(), Path::new(&out))?;
+            return Ok(None);
         }
 
         // The service itself, not a pre-boxed initializer: each transport
@@ -719,11 +859,7 @@ impl Host {
         if self.coordinator.is_none()
             && let Some(p) = prepared.iter().find(|p| !p.svc.consumes().is_empty())
         {
-            return Err(format!(
-                "peerline-host: `{}` consumes contracts but no coordinator is \
-                 configured — call Host::coordinator(socket)",
-                p.name
-            ));
+            return Err(HostError::NoCoordinator { service: p.name });
         }
 
         // Everything that can be decided without touching the network is
@@ -731,68 +867,49 @@ impl Host {
         // an address fails the run rather than racing the shutdown signal.
         let plan = self.plan(&prepared)?;
         if plan.is_empty() {
-            return Err(
-                "peerline-host: no active mounts (configure ws_bind / iroh_endpoint \
-                        and give each service a Mount)"
-                    .into(),
-            );
+            return Err(HostError::NoMounts);
         }
 
         info!(services = self.services.len(), "peerline-host starting");
+        Ok(Some((prepared, plan)))
+    }
 
+    /// The half of [`bind`](Self::bind) that touches the network: take the
+    /// lifeline, claim the addresses, and build the endpoint report from what
+    /// actually bound.
+    async fn bind_planned(self, prepared: Vec<Prepared>, plan: Plan) -> Result<Bound, HostError> {
         // Taken *after* the probe and the plan, so that a manifest probe and a
         // misconfiguration both still behave exactly as they did — and before
         // anything binds, so a supervisor that is already gone is discovered
         // before this process claims an address.
-        let lifeline = lifeline_closed();
+        //
+        // Boxed and carried into the `BoundHost` rather than taken again
+        // later, because `lifeline::take` yields the descriptor **once per
+        // process**: a second call answers `Absent`, so a lifeline that was
+        // taken here and dropped would leave the served host watching nothing.
+        // That is the one piece of state the split cannot simply re-derive.
+        let mut lifeline: BoxFuture<'static, ()> = Box::pin(lifeline_closed());
 
-        // Shutdown wins over everything to its right, including a bind that has
-        // not finished: an iroh endpoint takes seconds to bind and may fail,
-        // and a host asked to stop must not first wait that out.
-        tokio::pin!(shutdown);
-        tokio::pin!(lifeline);
-        tokio::select! {
+        let host_id = hostid::host_id().clone();
+        let listening = tokio::select! {
             biased;
-            () = &mut shutdown => {
-                info!("peerline-host: shutdown signal received, stopping");
-                Ok(())
-            }
             () = &mut lifeline => {
-                info!("peerline-host: the supervisor is gone, stopping");
-                Ok(())
+                info!("peerline-host: the supervisor is gone before this host bound, \
+                       stopping");
+                return Ok(Bound::Orphaned);
             }
-            r = self.lifecycle(&prepared, plan) => r,
-        }
-    }
+            r = bind_all(plan) => r?,
+        };
+        let endpoints = self.endpoints(&prepared, &listening, &host_id);
 
-    /// Everything from `Bind` rightwards. Returns only on failure, or when
-    /// every transport's accept loop has ended.
-    async fn lifecycle(&self, prepared: &[Prepared], plan: Plan) -> Result<(), String> {
-        let host = hostid::host_id().clone();
-        let listening = bind_all(plan).await?;
-        let endpoints = self.endpoints(prepared, &listening, &host);
-        let serves = listening.into_serves();
-
-        match &self.coordinator {
-            None => {
-                // No coordinator: `Bind -> Serve`, and nothing else. `bind` is
-                // still called, with an empty set, so a service can rely on it
-                // having run exactly once before any handler does.
-                //
-                // No declarations either, and that is exact rather than lazy:
-                // `run` has already refused any service that consumes anything
-                // when there is no coordinator to resolve it with.
-                let (bindings, _lost) = Bindings::new(host, &[], Vec::new());
-                for p in prepared {
-                    p.svc.bind(&bindings);
-                }
-                futures::future::try_join_all(serves).await.map(|_| ())
-            }
-            Some(socket) => {
-                self.with_coordinator(prepared, endpoints, serves, host, socket.clone())
-                    .await
-            }
-        }
+        Ok(Bound::Listening(Box::new(BoundHost {
+            host: self,
+            prepared,
+            listening,
+            endpoints,
+            host_id,
+            lifeline,
+        })))
     }
 
     #[cfg(feature = "uds")]
@@ -803,7 +920,7 @@ impl Host {
         serves: Vec<Serve>,
         host: HostId,
         socket: PathBuf,
-    ) -> Result<(), String> {
+    ) -> Result<(), HostError> {
         use coordinator::CoordCtx;
 
         let entries: Vec<ServiceEntry> = prepared
@@ -841,7 +958,9 @@ impl Host {
         let resolved = tokio::select! {
             e = &mut client => return Err(e),
             b = bindings_rx => b.map_err(|_| {
-                "peerline-host: coordinator client stopped before resolving".to_string()
+                HostError::Coordinator(
+                    "the coordinator client stopped before resolving".into(),
+                )
             })?,
         };
 
@@ -882,12 +1001,10 @@ impl Host {
         _serves: Vec<Serve>,
         _host: HostId,
         _socket: PathBuf,
-    ) -> Result<(), String> {
-        Err(
-            "peerline-host: Host::coordinator needs the `uds` feature (a coordinator \
-             is uds-only)"
-                .into(),
-        )
+    ) -> Result<(), HostError> {
+        Err(HostError::Coordinator(
+            "Host::coordinator needs the `uds` feature (a coordinator is uds-only)".into(),
+        ))
     }
 
     /// Assemble every transport's mount table. Sync: nothing here touches the
@@ -896,7 +1013,7 @@ impl Host {
         not(any(feature = "ws", feature = "uds", feature = "iroh")),
         allow(unused_variables, unused_mut)
     )]
-    fn plan(&self, prepared: &[Prepared]) -> Result<Plan, String> {
+    fn plan(&self, prepared: &[Prepared]) -> Result<Plan, PlanError> {
         let mut plan = Plan::default();
 
         #[cfg(feature = "ws")]
@@ -919,8 +1036,9 @@ impl Host {
             for p in prepared {
                 if let Some((path, policy)) = &p.mount.uds {
                     if let Some(dir) = path.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| {
-                            format!("peerline-host: uds dir {}: {e}", dir.display())
+                        std::fs::create_dir_all(dir).map_err(|e| PlanError::UdsDirectory {
+                            path: dir.to_path_buf(),
+                            cause: e.to_string(),
                         })?;
                     }
                     mounts.push((path.clone(), uds_acceptor(p.svc.clone(), policy.clone())));
@@ -947,10 +1065,10 @@ impl Host {
                 // silently different key would invalidate every ticket ever
                 // handed out, so a broken key file must fail the run.
                 let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
-                    .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
+                    .map_err(|e| PlanError::IrohKey(e.to_string()))?;
                 let mut config =
                     peerline_transport_iroh::IrohConfig::from_relay_urls(self.iroh_relays.clone())
-                        .map_err(|e| format!("peerline-host: iroh relay: {e}"))?;
+                        .map_err(|e| PlanError::IrohRelay(e.to_string()))?;
                 config.bind_port = self.iroh_port;
                 config.reachability = self.iroh_reachability;
                 plan.iroh = Some(IrohPlan {
@@ -1077,6 +1195,195 @@ impl Host {
 }
 
 // ---------------------------------------------------------------------------
+// The bind / serve split
+// ---------------------------------------------------------------------------
+
+/// What [`Host::bind`] found when it stopped between `bind` and `accept`.
+///
+/// Three outcomes, because a host has three honest answers to "are you
+/// listening": yes, and here is where; no, because I was only being asked what
+/// I am; and no, because the process that started me is already gone. The two
+/// `no`s are **not** errors — each is a clean exit, and a caller that treats
+/// them as failures would turn a routine probe into a restart loop.
+///
+/// A caller that only wants the listening case gets all three right in one
+/// line, which is why they are one enum rather than an `Option` and a flag:
+///
+/// ```ignore
+/// let Bound::Listening(bound) = host.bind().await? else { return Ok(()) };
+/// ```
+#[non_exhaustive]
+pub enum Bound {
+    /// Bound, published, and not yet accepting. The addresses are readable and
+    /// [`BoundHost::serve_until`] takes it from here.
+    ///
+    /// Boxed because this variant is two orders of magnitude larger than the
+    /// other two, and a `Result<Bound, _>` is returned by value.
+    Listening(Box<BoundHost>),
+    /// `PEERLINE_MANIFEST_OUT` was set, so this run was a **probe**: the
+    /// manifest has been written to that path and nothing was bound. Exit 0.
+    ///
+    /// This is how a supervisor learns the contract graph from the binary
+    /// itself — see [`peerline_contract::manifest`].
+    Probed,
+    /// The **lifeline** closed before the bind finished: the supervisor that
+    /// spawned this process is gone. Nothing was claimed, and serving would
+    /// mean outliving it. Exit 0 — this is a stop that was asked for, not a
+    /// failure. See [`peerline_contract::lifeline`].
+    Orphaned,
+}
+
+/// A host whose transports are bound and published, but not yet accepting.
+///
+/// The addresses here are the ones the kernel actually gave out, which is the
+/// whole point: a `ws_bind` of `127.0.0.1:0` has a real port by now, and an
+/// iroh endpoint has a real ticket. Read them, do whatever has to happen
+/// before anybody connects, then call [`serve`](Self::serve) or
+/// [`serve_until`](Self::serve_until).
+///
+/// Nothing is being accepted while this is held, but the listeners are open:
+/// a client that dials meanwhile queues in the kernel backlog instead of being
+/// refused. That is the same property the coordinator handshake has always
+/// depended on, now available to a caller as well.
+pub struct BoundHost {
+    /// The builder, kept whole: everything to the right of `Bind` — the
+    /// coordinator socket, the instance id, the two timeouts — is still read
+    /// off it, and copying those fields out would be the same struct twice.
+    host: Host,
+    prepared: Vec<Prepared>,
+    listening: Listening,
+    endpoints: Vec<Endpoints>,
+    host_id: HostId,
+    /// Taken during [`Host::bind`] and carried, not re-taken: the descriptor
+    /// is claimed once per process.
+    lifeline: BoxFuture<'static, ()>,
+}
+
+impl BoundHost {
+    /// Every mounted service's dial coordinates, in the order the services
+    /// were [`mounted`](Host::mount).
+    ///
+    /// This is exactly what would be registered with a coordinator, built from
+    /// what bound rather than from what was configured — a transport that
+    /// failed to bind contributes nothing here, so nothing in it is a
+    /// coordinate that does not work.
+    pub fn endpoints(&self) -> &[Endpoints] {
+        &self.endpoints
+    }
+
+    /// One service's coordinates by name, for a caller that would otherwise
+    /// have to count mounts to find them.
+    ///
+    /// `None` if no service of that name is mounted. Two services cannot share
+    /// a name usefully — the name is what a log line and a manifest identify
+    /// them by — so the first match is the answer.
+    pub fn endpoints_for(&self, service: &str) -> Option<&Endpoints> {
+        let i = self.prepared.iter().position(|p| p.name == service)?;
+        self.endpoints.get(i)
+    }
+
+    /// The address the shared WebSocket port is really bound to.
+    ///
+    /// `None` when no ws port was configured, or when it failed to bind and
+    /// the host is serving on its other transports. This is the one thing
+    /// [`endpoints`](Self::endpoints) cannot give back as a `SocketAddr`: a
+    /// coordinate is a URL, and a caller that wants the port wants the number.
+    #[cfg(feature = "ws")]
+    pub fn ws_addr(&self) -> Option<SocketAddr> {
+        self.listening.ws.as_ref().map(|b| b.addr())
+    }
+
+    /// The shared iroh endpoint's ticket, or `None` if iroh was not configured
+    /// or did not bind.
+    ///
+    /// One ticket for the whole host; which service a dialer reaches is picked
+    /// by the ALPN, which is in each service's [`endpoints`](Self::endpoints).
+    #[cfg(feature = "iroh")]
+    pub fn iroh_ticket(&self) -> Option<&str> {
+        self.listening.iroh.as_ref().map(|b| b.ticket())
+    }
+
+    /// Every unix socket path this host is listening on, across all services.
+    ///
+    /// The paths were configured rather than discovered, so this says nothing
+    /// new about *where* — what it says is that they bound, which the caller
+    /// could not otherwise know.
+    #[cfg(feature = "uds")]
+    pub fn uds_paths(&self) -> Vec<&str> {
+        self.endpoints
+            .iter()
+            .flat_map(|e| e.uds.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Accept connections until a **termination signal** — `SIGINT` or, on
+    /// unix, `SIGTERM` — exactly as [`Host::run`] would have.
+    pub async fn serve(self) -> Result<(), HostError> {
+        self.serve_until(terminate()).await
+    }
+
+    /// Accept connections until `shutdown` resolves, the lifeline closes, or
+    /// the run fails.
+    ///
+    /// This is everything to the right of `Bind`: register with a coordinator
+    /// if one was configured, wait for required contracts,
+    /// [`Service::bind`] the resolved dependencies in, start accepting, and
+    /// announce readiness. The lifeline taken during [`Host::bind`] is watched
+    /// here for the same reason [`Host::run_until`] watches it — it is not one
+    /// of the caller's choices.
+    pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<(), HostError> {
+        let Self {
+            host,
+            prepared,
+            listening,
+            endpoints,
+            host_id,
+            mut lifeline,
+        } = self;
+        let serves = listening.into_serves();
+
+        let work = async move {
+            match &host.coordinator {
+                None => {
+                    // No coordinator: `Bind -> Serve`, and nothing else. `bind`
+                    // is still called, with an empty set, so a service can rely
+                    // on it having run exactly once before any handler does.
+                    //
+                    // No declarations either, and that is exact rather than
+                    // lazy: `bind` has already refused any service that
+                    // consumes anything when there is no coordinator to resolve
+                    // it with.
+                    let (bindings, _lost) = Bindings::new(host_id, &[], Vec::new());
+                    for p in &prepared {
+                        p.svc.bind(&bindings);
+                    }
+                    futures::future::try_join_all(serves).await.map(|_| ())
+                }
+                Some(socket) => {
+                    host.with_coordinator(&prepared, endpoints, serves, host_id, socket.clone())
+                        .await
+                }
+            }
+        };
+        tokio::pin!(shutdown);
+        tokio::pin!(work);
+
+        tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                info!("peerline-host: shutdown signal received, stopping");
+                Ok(())
+            }
+            () = &mut lifeline => {
+                info!("peerline-host: the supervisor is gone, stopping");
+                Ok(())
+            }
+            r = &mut work => r,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bind
 // ---------------------------------------------------------------------------
 
@@ -1162,11 +1469,15 @@ impl Listening {
         let mut serves: Vec<Serve> = Vec::new();
         #[cfg(feature = "ws")]
         if let Some(bound) = self.ws {
-            serves.push(Box::pin(bound.serve()));
+            serves.push(Box::pin(async move {
+                bound.serve().await.map_err(HostError::Serve)
+            }));
         }
         #[cfg(feature = "uds")]
         if let Some(bound) = self.uds {
-            serves.push(Box::pin(bound.serve()));
+            serves.push(Box::pin(async move {
+                bound.serve().await.map_err(HostError::Serve)
+            }));
         }
         #[cfg(feature = "iroh")]
         if let Some(bound) = self.iroh {
@@ -1199,7 +1510,7 @@ impl Listening {
     not(any(feature = "ws", feature = "uds", feature = "iroh")),
     allow(unused_variables, unused_mut)
 )]
-async fn bind_all(plan: Plan) -> Result<Listening, String> {
+async fn bind_all(plan: Plan) -> Result<Listening, BindError> {
     let mut listening = Listening::default();
     let mut failures: Vec<String> = Vec::new();
 
@@ -1234,11 +1545,7 @@ async fn bind_all(plan: Plan) -> Result<Listening, String> {
     }
 
     if listening.is_empty() {
-        return Err(format!(
-            "peerline-host: no active mounts — every configured transport failed to \
-             bind ({})",
-            failures.join("; ")
-        ));
+        return Err(BindError { failures });
     }
     for failure in failures {
         warn!(
@@ -1253,12 +1560,15 @@ async fn bind_all(plan: Plan) -> Result<Listening, String> {
 /// Write the probe's answer and exit — no binds, no coordinator, no
 /// coordinates. A file rather than stdout, which the service's own logging is
 /// already using by the time it reaches here.
-fn write_manifest(manifest: &Manifest, path: &Path) -> Result<(), String> {
-    let json = manifest
-        .to_json()
-        .map_err(|e| format!("peerline-host: cannot serialise manifest: {e}"))?;
-    std::fs::write(path, json)
-        .map_err(|e| format!("peerline-host: cannot write {}: {e}", path.display()))?;
+fn write_manifest(manifest: &Manifest, path: &Path) -> Result<(), HostError> {
+    let json = manifest.to_json().map_err(|e| HostError::Manifest {
+        path: path.to_path_buf(),
+        cause: format!("cannot serialise the manifest: {e}"),
+    })?;
+    std::fs::write(path, json).map_err(|e| HostError::Manifest {
+        path: path.to_path_buf(),
+        cause: e.to_string(),
+    })?;
     info!(path = %path.display(), "peerline-host: wrote manifest and exiting");
     Ok(())
 }
@@ -1328,13 +1638,16 @@ async fn terminate() {
 /// one silently shadow the other (and axum panics on a duplicate path).
 #[cfg(any(feature = "ws", feature = "uds", feature = "iroh"))]
 fn reject_dupes<T: std::hash::Hash + Eq + std::fmt::Debug>(
-    kind: &str,
+    kind: &'static str,
     keys: impl Iterator<Item = T>,
-) -> Result<(), String> {
+) -> Result<(), PlanError> {
     let mut seen = HashSet::new();
     for key in keys {
         if !seen.insert(format!("{key:?}")) {
-            return Err(format!("peerline-host: two services share {kind} {key:?}"));
+            return Err(PlanError::AddressCollision {
+                transport: kind,
+                address: format!("{key:?}"),
+            });
         }
     }
     Ok(())

@@ -87,13 +87,18 @@ async fn host_mounts_two_services_by_path() {
     assert_eq!(b, "beta:hi");
 }
 
+/// Each of these used to be asserted with `err.contains("...")`, which tied
+/// the test to wording that was never a promise. They are variants now, which
+/// is what a downstream deciding whether to restart has to match on too.
 #[tokio::test]
 async fn run_rejects_empty_dupe_and_no_mount() {
+    use peerline_host::{HostError, PlanError};
+
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     // No services.
     let err = Host::new().ws_bind(addr).run().await.unwrap_err();
-    assert!(err.contains("no services"), "{err}");
+    assert!(matches!(err, HostError::NoServices), "{err}");
 
     // Two services colliding on one WS path.
     let err = Host::new()
@@ -109,7 +114,16 @@ async fn run_rejects_empty_dupe_and_no_mount() {
         .run()
         .await
         .unwrap_err();
-    assert!(err.contains("share ws path"), "{err}");
+    assert!(
+        matches!(
+            &err,
+            HostError::Plan(PlanError::AddressCollision {
+                transport: "ws path",
+                ..
+            })
+        ),
+        "{err}"
+    );
 
     // A service exists but no transport is active (mount requests WS, host
     // never binds a WS port).
@@ -121,7 +135,60 @@ async fn run_rejects_empty_dupe_and_no_mount() {
         .run()
         .await
         .unwrap_err();
-    assert!(err.contains("no active mounts"), "{err}");
+    assert!(matches!(err, HostError::NoMounts), "{err}");
+}
+
+/// The whole reason the bind/serve split exists: a host asked for port `0`
+/// does not know its own address until the kernel has picked one, and
+/// `ws_bind` took an address and handed nothing back.
+///
+/// The assertion is deliberately not "the port is non-zero" — that would pass
+/// for any number at all. The port is *dialled*, and the service behind it
+/// answers, which is the only evidence that the reported address is the one
+/// the listener is really on.
+#[tokio::test]
+async fn bind_reports_the_port_the_kernel_actually_picked() {
+    use peerline_host::Bound;
+
+    let host = Host::new()
+        .mount(
+            Echo { name: "ephemeral" },
+            Mount::new().ws("/e", WsPolicy::allow_any()),
+        )
+        // Port 0: the kernel chooses, and nothing above this line can know it.
+        .ws_bind("127.0.0.1:0".parse().expect("a bind address"));
+
+    let Bound::Listening(bound) = host.bind().await.expect("binds") else {
+        panic!("no manifest probe and no supervisor: this host is listening")
+    };
+
+    let addr = bound.ws_addr().expect("a ws port was configured and bound");
+    assert_ne!(addr.port(), 0, "the kernel has picked by now");
+
+    // The same address, through the per-service endpoint report — which is
+    // what would be registered with a coordinator, so the two must agree.
+    let reported = bound
+        .endpoints_for("ephemeral")
+        .expect("the service is mounted");
+    assert_eq!(
+        reported.ws,
+        vec![format!("ws://{addr}/e")],
+        "the coordinate a consumer would be handed names the resolved port"
+    );
+
+    // Hold the bound host past the dial: the listener is open across the gap,
+    // so a client that arrives before `serve` queues rather than being refused.
+    let serving = tokio::spawn(async move { bound.serve_until(std::future::pending()).await });
+
+    let (peer, driver) = dial(&format!("ws://{addr}/e")).await;
+    tokio::spawn(driver);
+    let reply: String = peer
+        .call("echo", &EchoArgs { s: "hi".into() })
+        .await
+        .expect("the reported port is the one being served");
+    assert_eq!(reply, "ephemeral:hi");
+
+    serving.abort();
 }
 
 /// The uid `register_remote` saw, so the test can prove credentials
