@@ -23,6 +23,21 @@
 //! | [`OP_WATCH`] | stream | the whole registry, then every change to it |
 //! | [`OP_BINDINGS`] | unary | the selections the coordinator actually made |
 //!
+//! # This module is mirrored by a manifest
+//!
+//! Every op, type and error code below is also declared in
+//! `contracts/coord.v1.json`, which is what an implementor who is not writing
+//! Rust reads. The manifest does not generate this file and this file is not
+//! generated from it — see the crate docs for why that exception exists here
+//! and nowhere else — so the two are kept in step by
+//! `tests/coord_manifest_drift.rs`, which fails naming the type and the field
+//! when they diverge. **Edit one and edit both.**
+//!
+//! The five types this module takes from the crate root travel in
+//! `contracts/peerline.contract.v1.json`, a vocabulary, because the same
+//! shapes appear on the probe path and in a dashboard with no coordinator
+//! involved.
+//!
 //! **Registered and ready are distinct.** Registered means the coordinator
 //! knows your coordinates; ready means you are serving *and* your own consumed
 //! contracts resolved. Only ready producers are ever handed out, so readiness

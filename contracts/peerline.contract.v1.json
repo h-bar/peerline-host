@@ -1,0 +1,290 @@
+{
+  "contract": "peerline.contract",
+  "version": 1,
+  "role": "vocabulary",
+  "description": [
+    "What a service declares about itself, and what a coordinator hands back.",
+    "",
+    "These shapes are not owned by any one control protocol. A service declares them at registration over `coord/1`; a binary writes the same `Produced` and `Consumed` values into the probe file a supervisor reads; a dashboard and a CLI render `Endpoints` and `Binding` without ever calling a coordinator op. Three restatements of one shape would be three things that can drift with nothing saying they were ever the same, which is what a vocabulary exists to prevent.",
+    "",
+    "What a contract is here",
+    "",
+    "A service declares the contracts it produces and consumes, never the instance names of its dependencies. A coordinator matches each consumed contract to a live producer and hands back a `Binding`: which producer it chose, and how to dial it. Once a consumer holds a binding it dials that producer directly and calls that producer's own ops. No shape in this vocabulary ever appears on the data connection.",
+    "",
+    "The interchangeability invariant",
+    "",
+    "Producers of one contract at one version are interchangeable, and any consumer must be correct when bound to any of them. This is a precondition on whoever implements a contract, not something a coordinator can check: it may hand out any ready producer, and a consumer that restarts may be bound to a different one than it held before.",
+    "",
+    "The concrete consequence is a constraint on service design rather than on deployment. Two `storage/1` producers backed by independent databases is a contract violation, not a redundancy strategy. Producers of one contract must either share backing state or be genuinely stateless, and services that are not substitutable get distinct contract names.",
+    "",
+    "Additive within a version",
+    "",
+    "Unknown keys are ignored rather than rejected, everywhere in this vocabulary. A major version is additive: a field that appears in a later revision must be safe to omit, which is why almost every non-identifying field here declares a `default`. A breaking change is a new major version and a new file, never an edit in place."
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "ContractId",
+      "description": [
+        "Which contract, at which version.",
+        "",
+        "The registry key, the match predicate, a vertex in the cycle graph, and the correlation tag on the readiness stream. Always in the control path, never on the data connection.",
+        "",
+        "The version is one integer major, not a semver range. peerline's own wire does exactly this (`ver: \"1\"`): additive within a version, a new major as a new variant. One versioning discipline in the stack rather than two. Range matching stays speculative until a contract actually has two live majors, and the interchangeability invariant already forbids widening a match across versions.",
+        "",
+        "Splitting the name from the version is justified by error quality rather than by matching. With a flat `fs/2` string, \"no producer for `fs/2`\" is indistinguishable from a typo'd name; split, a coordinator can say \"`fs` is produced at version 1; you consume version 2\". Given that the failure mode of a cluster is that things silently never become ready, that is worth one object.",
+        "",
+        "A contract id is a promise, not a proof: nothing verifies that a producer implements what it claims. A mismatch surfaces as a method-not-found at the consumer, not as a refusal at registration.",
+        "",
+        "It renders as `name/version` in log lines and coordinator messages. That is a display form only; the wire form is this two-key object."
+      ],
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "description": [
+            "The contract name, for example `storage`. Names a capability, not an instance: several processes may produce the same name."
+          ]
+        },
+        {
+          "name": "version",
+          "type": "u32",
+          "description": [
+            "The major version. Incremented only for a breaking change; additive changes keep the number."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "enum",
+      "name": "Cardinality",
+      "description": [
+        "How many producers of one contract may be live at once.",
+        "",
+        "The interchangeability invariant is a precondition a coordinator cannot check: it has no way to know that two `storage/1` producers are backed by two independent database files rather than one shared one. Some contracts, though, can say up front that they admit no second producer — a gateway owning a listening port, a manager owning a process table, a store owning a local database file. For those, two producers is never redundancy and always a misconfiguration, and it is one that is otherwise silent: a selection policy of \"lowest instance id\" simply picks one, and the second sits there serving a different database until somebody notices data going missing from one of them.",
+        "",
+        "Cardinality is logically a property of the contract, but a contract has no central definition anywhere in this system — a contract id is just a name and a major version, minted by whoever says it. So the only place the claim can be made is on a `Produced` declaration, by a producer, which means two producers of one contract can disagree about it.",
+        "",
+        "A `single` declaration by either of them binds for that contract: the strict reading wins, on the same principle that makes a contract consumed as required by one service and optional by another required. Refusing a second producer that should have been allowed is a loud, immediate, one-line config fix; admitting one that should have been refused is the silent data-loss failure this set exists to prevent. A coordinator that sees a disagreement should say so — it is a misconfiguration in its own right — but it must still refuse.",
+        "",
+        "A named set rather than a boolean, so that the declaration reads as a claim rather than as a knob."
+      ],
+      "variants": [
+        {
+          "name": "any",
+          "description": [
+            "Any number of interchangeable producers. The default, and what every declaration that predates this field means: an absent `cardinality` reads as `any`, which is additive within a contract version."
+          ]
+        },
+        {
+          "name": "single",
+          "description": [
+            "Exactly one producer may be registered at a time. A second live producer is refused at registration rather than ranked second.",
+            "",
+            "The claim is about live producers, not about history: once the incumbent's registration expires on its time-to-live, or it re-registers as itself after a restart, a producer may hold the contract again."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Produced",
+      "description": [
+        "A contract this service implements.",
+        "",
+        "Spelled as a participle deliberately. peerline already uses the bare nouns producer and consumer for the two ends of a stream, and readiness is delivered as a stream, so both senses show up in one file. The participle names a declaration; producer and consumer stay reserved for stream ends."
+      ],
+      "fields": [
+        {
+          "name": "contract",
+          "type": "ContractId",
+          "description": ["What is produced."]
+        },
+        {
+          "name": "ops",
+          "type": { "array": "string" },
+          "default": [],
+          "description": [
+            "The op names this producer answers for the contract.",
+            "",
+            "Carried but unused: it is the hook for checking a producer against its contract later, and no coordinator reads it today. Reserving the field makes that check additive rather than a wire change, which is the same reason the host identity on `Endpoints` exists on day one.",
+            "",
+            "An implementor in any language may send it, and none may rely on it being acted upon."
+          ]
+        },
+        {
+          "name": "cardinality",
+          "type": "Cardinality",
+          "default": "any",
+          "description": [
+            "How many producers of this contract may be live at once, as this producer understands it.",
+            "",
+            "An absent key reads as `any`, so a registration written before this field existed — or by an implementation in another language that does not know about it — keeps decoding and keeps meaning what it meant."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Consumed",
+      "description": [
+        "A contract this service depends on."
+      ],
+      "fields": [
+        {
+          "name": "contract",
+          "type": "ContractId",
+          "description": ["What is consumed."]
+        },
+        {
+          "name": "optional",
+          "type": "bool",
+          "default": false,
+          "description": [
+            "Whether the service can run without it. Two moments, and the word means the same thing at both.",
+            "",
+            "At startup, a required contract gates readiness: the consumer waits, and the coordinator's timeout names it. An optional one that never resolves yields no binding and the consumer becomes ready anyway.",
+            "",
+            "After it has resolved, losing a required contract exits the host once its re-resolve budget is spent; losing an optional one does not. The re-resolve is identical either way — the coordinates still have to be put right, and connecting still fails while they are wrong — but an optional dependency that never comes back leaves a degraded process rather than a dead one.",
+            "",
+            "The second half used to be missing, and its absence was the more dangerous kind of bug: a consumer that declared a dependency optional because it could carry on without it was killed sixty seconds after losing it, exactly like one that had declared it required.",
+            "",
+            "An absent key reads as `false`: omitting the field asks for the strict, safe reading rather than the permissive one."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "IrohDial",
+      "description": [
+        "One iroh dial coordinate: the shared endpoint ticket plus this service's ALPN. The ticket identifies the process's endpoint; the ALPN selects which mounted service on it is being dialled."
+      ],
+      "fields": [
+        {
+          "name": "ticket",
+          "type": "string",
+          "description": ["The node ticket, as produced when the iroh endpoint binds."]
+        },
+        {
+          "name": "alpn",
+          "type": "string",
+          "description": ["The ALPN this service is mounted under."]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Endpoints",
+      "description": [
+        "How one producer can be reached, across every transport it is mounted on, plus the identity of the host reporting them.",
+        "",
+        "Where several coordinates are listed for one transport, the first is the preferred one and the rest are fallbacks, tried in order.",
+        "",
+        "Endpoints are per mounted service, not per contract. A service's coordinates are a property of where it is mounted, not of what it promises, so a process producing two contracts from one mount reports one entry with both.",
+        "",
+        "A set naming no coordinate on any transport is a legal value and is not a producer anyone can be sent to. A service whose every transport failed to bind is still registered, because dropping the entry would silently drop its consumed contracts from its host's readiness — but it can never be selected, and a coordinator reports it as unreachable instead.",
+        "",
+        "There is deliberately no empty default for this shape as a whole. A set of endpoints with no locality is not a meaningful value, and a defaulted blank `host` would compare equal to another one, turning \"locality unknown\" into \"same host\" — the exact mis-dial `host` exists to prevent."
+      ],
+      "fields": [
+        {
+          "name": "host",
+          "type": "string",
+          "description": [
+            "Who reported these coordinates: an opaque identity token for the namespace in which this set's `uds` paths mean anything.",
+            "",
+            "Why it is here",
+            "",
+            "A consumer prefers uds, then ws, then iroh — cheapest first. But a `uds` entry is a bare path with no machine identity, so that preference is only sound for a producer known to be local. A consumer on host B resolving a producer on host A would either fail on a path that does not exist or, far worse, connect to an unrelated socket that happens to sit at the same path on B, and succeed. The bug is silent, and it is a mis-dial rather than an error. So a consumer considers the `uds` list only when its own host token is exactly equal to this one.",
+            "",
+            "What equality asserts",
+            "",
+            "Equality is the only defined operation. The value is opaque: nothing dials it, parses it, or resolves it. Two reports carrying equal host tokens assert exactly one thing — a path in one's `uds` list, dialled from the other, reaches the process that published it. Unequal is always the safe answer: the consumer falls back to ws or iroh.",
+            "",
+            "It is deliberately not a DNS hostname. A hostname is neither unique (two containers can both be `localhost`) nor a statement about the filesystem (two containers on one machine share a hostname but not a socket namespace), so hostnames compare equal in precisely the case that must compare unequal. A machine id has the same flaw. What is wanted is an identity of the filesystem namespace.",
+            "",
+            "How to mint one, which is a cross-implementation contract",
+            "",
+            "Whoever mints the value owes the assertion above, and a joiner that mints it differently from its neighbours does not fail — it silently never gets uds to a peer on the same machine. Every peerline implementation must therefore derive it the same way, in this order:",
+            "",
+            "1. If the environment variable `PEERLINE_HOST_ID` is set to a non-empty value (after trimming surrounding whitespace), that value is the host token and nothing else is consulted. This is the override for a deployment that knows better, such as containers deliberately sharing a socket directory.",
+            "",
+            "2. Otherwise read the file `peerline-host-id` in the system temporary directory — the directory `TMPDIR` names on Unix, `/tmp` when it does not. Its trimmed contents are the host token if their length is at least 8 and at most 128 characters. A shorter, longer, empty or whitespace-only file is treated as absent rather than adopted: a truncated or scribbled-on file must not become a shared identity, because every process that read the same damage would compare equal.",
+            "",
+            "3. If the file does not exist or was treated as absent, create it with a fresh random token of the form `pl-` followed by 32 lowercase hexadecimal characters (128 bits). The creation must be exclusive — `O_CREAT | O_EXCL`, or whatever the language spells that as — so that exactly one process wins the race and every other process re-reads what the winner wrote. Losing the race is not an error: re-read the file and use its contents.",
+            "",
+            "4. If the file can be neither read nor created, because the temporary directory is read-only or otherwise unusable, fall back to a token that is unique to this process and share it with nobody. The Rust implementation spells it `pl-proc-` followed by the process id, a hyphen, and 32 hexadecimal characters; the exact spelling does not matter, only that it cannot collide with another process's.",
+            "",
+            "Why a file, and what the fallback costs",
+            "",
+            "Two processes sharing that file share a temporary directory, so they share the mount namespace their uds paths are resolved in, and the claim holds. Two containers each have their own temporary directory and so their own token, even on one kernel and under one hostname, so they compare unequal — which is the conservative answer. The token survives a reboot, which is correct: the claim is about a namespace, not about an epoch, and nothing is invalidated by living longer.",
+            "",
+            "The step 4 fallback can only ever under-claim locality. uds is skipped and the consumer dials ws or iroh instead; a consumer whose producer is uds-only will fail to connect and say so, which is a failure that can be diagnosed rather than one that cannot. An implementation should warn when it takes that branch, because it disables uds for every dependency of the process for its whole life and nothing later in the resulting failure says why.",
+            "",
+            "Do not invent a fifth source. A joiner that hashes its hostname, reads a machine id, or mints a fresh token per process without trying the file will be told its uds-only neighbours are unreachable, or — if it over-claims — will mis-dial them."
+          ]
+        },
+        {
+          "name": "ws",
+          "type": { "array": "string" },
+          "default": [],
+          "description": [
+            "WebSocket URLs, spelled `ws://host:port/path`. Dialable from anywhere that can route to the host and port."
+          ]
+        },
+        {
+          "name": "uds",
+          "type": { "array": "path" },
+          "default": [],
+          "description": [
+            "Unix domain socket paths.",
+            "",
+            "Resolved on the machine that reported them, in the filesystem namespace named by `host`, and meaningful only to a dialler whose own host token is equal to it. A dialler whose token differs must skip this list entirely rather than try the paths and see what happens."
+          ]
+        },
+        {
+          "name": "iroh",
+          "type": { "array": "IrohDial" },
+          "default": [],
+          "description": [
+            "iroh ticket and ALPN pairs. Always dialable, wherever the consumer runs, which is what makes them the last fallback rather than an alternative worth preferring."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Binding",
+      "description": [
+        "A resolved dependency: the contract asked for, the producer chosen for it, and where to dial that producer.",
+        "",
+        "One is emitted per consumed contract as it resolves. The instance id is informational — for logs, dashboards and a future pinning policy — and not a promise of stability: the interchangeability invariant means a consumer that restarts may legitimately be handed a different instance for the same contract, and must be correct either way."
+      ],
+      "fields": [
+        {
+          "name": "contract",
+          "type": "ContractId",
+          "description": [
+            "The consumed contract this binding satisfies. Present because bindings arrive one at a time on a stream and must be correlated with what was asked for."
+          ]
+        },
+        {
+          "name": "instance",
+          "type": "string",
+          "description": [
+            "The instance id of the producer that was chosen. Supplied by that service and stable across restarts of either side, so one service shows one identity in logs over time."
+          ]
+        },
+        {
+          "name": "endpoints",
+          "type": "Endpoints",
+          "description": [
+            "How to reach that producer: the producing service's own coordinates, copied in whole."
+          ]
+        }
+      ]
+    }
+  ]
+}

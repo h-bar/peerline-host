@@ -1,0 +1,771 @@
+{
+  "contract": "coord",
+  "version": 1,
+  "description": [
+    "The control protocol between a service and a cluster coordinator: how a service registers, waits for its dependencies, becomes ready, and stays known.",
+    "",
+    "A producer of this contract is a coordinator. Every other process in a cluster is a consumer of it, whatever else it also produces. The coordinator owns the registry, the selection policy and the handlers; this file owns the wire.",
+    "",
+    "Registered and ready are distinct",
+    "",
+    "Registered means the coordinator knows your coordinates. Ready means you are serving and your own consumed contracts have resolved. Only ready producers are ever handed out, so readiness is transitive and a cluster converges leaf-first, with no separate notion of whether the cluster as a whole is up.",
+    "",
+    "The joining sequence",
+    "",
+    "The ops below are listed in lifecycle order, and the order is part of the contract. A joiner calls `coord.register` with its instance id, its process id and every service it mounts; opens `coord.await_ready` and reads it to completion, receiving one binding per required consumed contract; calls `coord.ready`; and then calls `coord.heartbeat` on a repeating interval well under the coordinator's time-to-live for the rest of its life.",
+    "",
+    "On a `unknown_instance` answer from either `coord.ready` or `coord.heartbeat`, the joiner re-registers and re-sends `coord.ready`. It must not re-run `coord.await_ready`: that is a one-shot startup step, its bindings are already in hand, and re-running it parks the process on dependencies it has already resolved.",
+    "",
+    "Joining is a lifecycle, not a vocabulary",
+    "",
+    "This file describes the ops, their shapes and their error codes exhaustively, and that is less than everything a joiner must do. It does not and cannot express: that the sequence above has that order; that a supervised child must write its probe file to the path in `PEERLINE_MANIFEST_OUT` and hold its lifeline descriptor open until end-of-file; that the coordinator's socket arrives in `PEERLINE_COORD_SOCK`; or that the host token in `Endpoints` must be derived exactly as `peerline.contract/1` says. An implementor needs the README beside this file as well as this file.",
+    "",
+    "Why some failures are values and others are errors",
+    "",
+    "Both appear, and the split is deliberate. A recoverable protocol state with one defined next step is a value: `unknown_instance` on ready or heartbeat means go and re-register, and a caller should not have to match an error code to drive its own state machine. A condition the caller cannot make progress against by retrying is an error: two processes claiming one identity, a second producer of a singleton contract, and a resolve deadline are all things a human has to undo or a process has to die of. Errors carry a stable numeric code plus structured data, so a caller matches on the code rather than on a message.",
+    "",
+    "Why ready and heartbeat are requests rather than notifications",
+    "",
+    "A notification cannot report failure, and both of these have a failure to report. For `coord.ready` it is an instance whose entry expired while it was resolving: dropping that silently would leave a service serving, believing it is ready, and invisible to the coordinator forever, with everything consuming it hanging.",
+    "",
+    "`coord.heartbeat` is a request for the same reason one step later. It was a notification at first, on the argument that nothing is lost if one goes missing since the next is a second away. That argument is about a dropped heartbeat and it holds. The failure it misses is a heartbeat that arrives and finds no entry to refresh — a coordinator that expired an instance which had already readied, through a stalled process, a paused virtual machine, or a time-to-live set too tight. It cannot say so, and the host goes on heartbeating into a registry that has forgotten it. `coord.ready` is sent once, at startup, so it cannot catch a loss that happens later; the heartbeat is the only call still being made. The cost is one response per host per second, which is nothing.",
+    "",
+    "Op naming",
+    "",
+    "These are application-level op names. The `$peerline/` prefix is reserved for protocol ops and is deliberately not used here, so a coordinator is an ordinary peerline service that happens to answer these."
+  ],
+
+  "imports": [
+    {
+      "contract": "peerline.contract",
+      "version": 1,
+      "types": ["ContractId", "Produced", "Consumed", "Endpoints", "Binding"],
+      "description": [
+        "What a service declares about itself, and the coordinates it is given back.",
+        "",
+        "Shared rather than restated because the same values travel on three paths that this contract is only one of: a binary writes `Produced` and `Consumed` into the probe file a supervisor reads without any coordinator involved, and a dashboard renders `Endpoints` and `Binding` without calling an op at all. A second definition here would be a second thing to keep in step, with nothing asserting the two were ever the same shape."
+      ]
+    }
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "ServiceEntry",
+      "description": [
+        "One mounted service: its name, where it is reachable, and the contracts it declares.",
+        "",
+        "Endpoints are per mounted service, not per contract. A service's coordinates are a property of where it is mounted, not of what it promises, so a process producing two contracts from one mount reports one entry carrying both — and a binding copies the producing service's endpoints into the reply.",
+        "",
+        "Consumed contracts are carried per service because that is where they are declared, but a coordinator only ever uses the union across an instance's services. Readiness is per host: one process, one registration, one lifecycle, and the process is what a supervisor restarts."
+      ],
+      "fields": [
+        {
+          "name": "service",
+          "type": "string",
+          "description": [
+            "The service's stable name, as it appears in logs. Not an identity — use the instance id for that. One binary may legitimately be run twice under two different names."
+          ]
+        },
+        {
+          "name": "endpoints",
+          "type": "Endpoints",
+          "description": [
+            "How to reach this service, on every transport that actually bound. A service whose every transport failed to bind reports an empty set rather than being left out."
+          ]
+        },
+        {
+          "name": "produces",
+          "type": { "array": "Produced" },
+          "default": [],
+          "description": ["The contracts this service implements."]
+        },
+        {
+          "name": "consumes",
+          "type": { "array": "Consumed" },
+          "default": [],
+          "description": ["The contracts this service depends on."]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "RegisterArgs",
+      "description": [
+        "Everything one process declares about itself in a single call.",
+        "",
+        "The instance id is supplied by the service, not minted by the coordinator. It is stable — derived from the service name plus its mount coordinates — and identical across restarts of either side, so one service shows one identity in logs, in a dashboard and in a CLI over time; a future pinning policy has a name to pin to; and a collision means two processes are claiming one identity, which is a misconfiguration worth rejecting here rather than discovering later.",
+        "",
+        "It is a plain string rather than a distinct type, matching the instance id on a binding, which is the same value seen from the other side."
+      ],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["This instance's stable, service-chosen identity."]
+        },
+        {
+          "name": "pid",
+          "type": "u32",
+          "default": 0,
+          "description": [
+            "The process id, for operators reading a dashboard. Send `0` when unknown, which is also what an absent key means. Nothing dispatches on it, and a platform whose process ids do not fit an unsigned 32-bit integer should send `0` rather than truncate."
+          ]
+        },
+        {
+          "name": "services",
+          "type": { "array": "ServiceEntry" },
+          "default": [],
+          "description": [
+            "Every service this process mounts. An empty list registers a process that declares nothing, which is legal and is how a pure consumer with no mounts announces itself."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "RegisterAck",
+      "description": [
+        "The accepted id, echoed back.",
+        "",
+        "It echoes rather than assigns: a caller that sees its own id come back has confirmation that the coordinator holds the identity it thinks it does."
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": [
+            "The registered instance id. Always equal to the `instance` that was sent."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "AwaitReadyArgs",
+      "description": [
+        "Who is waiting, and for how long.",
+        "",
+        "What is waited for is deliberately not re-declared here. Registration already established this instance's consumed contracts, and repeating them would put two sources of truth for one fact on adjacent calls. The args carry only what identifies the wait."
+      ],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["The waiting instance, as registered."]
+        },
+        {
+          "name": "timeout_ms",
+          "type": "u53",
+          "description": [
+            "How long to wait before failing with the `unresolved` error, in milliseconds.",
+            "",
+            "There is no \"wait forever\". A cluster's characteristic failure is silence, and a deadline is what converts silence into a diagnosis."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Unresolved",
+      "description": [
+        "The data carried on an `unresolved` error: what did not resolve, and — if the contract graph suggests one — the cycle that may be why."
+      ],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["The instance that gave up waiting."]
+        },
+        {
+          "name": "waited_ms",
+          "type": "u53",
+          "description": [
+            "How long it waited, in milliseconds, echoing the timeout it was given."
+          ]
+        },
+        {
+          "name": "unresolved",
+          "type": { "array": "ContractId" },
+          "description": [
+            "The required contracts that had no ready producer at the deadline. Optional contracts never appear here: they do not gate readiness."
+          ]
+        },
+        {
+          "name": "cycle",
+          "type": { "array": "ContractId" },
+          "default": [],
+          "description": [
+            "A cycle in the registered contract graph that passes through one of the unresolved contracts, as a path with the head repeated at the end, so that it renders directly: `storage/1 -> index/1 -> storage/1`. Empty when no cycle touches the outstanding contracts.",
+            "",
+            "Advisory, and an over-approximation. Collapsing instances into contracts invents cycles that no actual deployment has: with two interchangeable producers of one contract, one of which consumes a second contract produced by a consumer of the first, the contract graph has a cycle while every instance still resolves. So this is a hint printed in an error, never a reason to reject anything."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "ReadyArgs",
+      "description": ["Which instance is now serving."],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["The instance, as registered."]
+        }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "ReadyResult",
+      "tagging": "internal",
+      "tag": "status",
+      "description": [
+        "The answer to a ready call.",
+        "",
+        "The unknown-instance arm is a value rather than an error because it names a recoverable state with one defined next step — re-register, then send ready again — and a caller should not have to match an error code to drive its own state machine.",
+        "",
+        "Neither arm carries any key beyond the discriminator, so both are the single-key objects `{\"status\": \"ok\"}` and `{\"status\": \"unknown_instance\"}`."
+      ],
+      "variants": [
+        {
+          "name": "ok",
+          "description": ["The instance is registered and is now marked ready."]
+        },
+        {
+          "name": "unknown_instance",
+          "description": [
+            "No such instance: it never registered, or its entry expired while it was resolving.",
+            "",
+            "Re-register and send ready again. Do not re-run the await-ready stream, which is a one-shot startup step whose bindings the caller already holds."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Heartbeat",
+      "description": ["Which instance is still alive."],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["The instance, as registered."]
+        }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "HeartbeatResult",
+      "tagging": "internal",
+      "tag": "status",
+      "description": [
+        "The answer to a heartbeat.",
+        "",
+        "Its own shape rather than a reuse of the ready result, because the two answer different questions — \"you are now marked serving\" and \"you are still known here\" — and a shared type would make a future arm on one an unannounced arm on the other. The wire form is identical today, which is what lets a caller handle both with the same branch."
+      ],
+      "variants": [
+        {
+          "name": "ok",
+          "description": [
+            "The instance is registered; its last-seen time has been refreshed."
+          ]
+        },
+        {
+          "name": "unknown_instance",
+          "description": [
+            "No such instance: its entry expired, or the coordinator restarted since it registered.",
+            "",
+            "Re-register, and send ready again if already serving. Do not re-run the await-ready stream."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "ResolveArgs",
+      "description": ["Which contract to resolve, and who is asking."],
+      "fields": [
+        {
+          "name": "contract",
+          "type": "ContractId",
+          "description": ["The contract to resolve."]
+        },
+        {
+          "name": "instance",
+          "type": "string",
+          "optional": true,
+          "description": [
+            "Who is asking, if the caller is a registered instance.",
+            "",
+            "Absent because resolve is also how an operator's CLI asks who could serve a contract, and that caller has no identity to give. When it is present, the coordinator records the producer it handed back as this instance's current selection, which is what makes the bindings op track a consumer that re-resolved after a dropped connection rather than reporting the producer it was first given.",
+            "",
+            "Omit the key entirely rather than sending `null`."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "ResolveResult",
+      "description": [
+        "Every ready producer of the contract, best first.",
+        "",
+        "Ordered by the coordinator's selection policy: the first entry is the coordinator's choice and the rest are alternates, in preference order. A consumer re-resolving after a dropped connection normally takes the first and only looks further if it cannot dial it.",
+        "",
+        "An empty list means no ready producer, which is not an error: a producer may simply not have finished starting."
+      ],
+      "fields": [
+        {
+          "name": "bindings",
+          "type": { "array": "Binding" },
+          "default": [],
+          "description": ["Ready producers, best first."]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "SingletonOccupied",
+      "description": [
+        "The data carried on a `singleton_occupied` error.",
+        "",
+        "It names both ends, because neither is in the caller's hand: the refused process knows what it declared but not who already holds the contract, and the operator reading the message needs the incumbent's instance id to go and stop it."
+      ],
+      "fields": [
+        {
+          "name": "contract",
+          "type": "ContractId",
+          "description": ["The contract that admits only one live producer."]
+        },
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["The instance that was refused — the one that just registered."]
+        },
+        {
+          "name": "holder",
+          "type": "string",
+          "description": [
+            "The instance already producing the contract. Still live: it heartbeated within the time-to-live, or it would have been swept before the check ran."
+          ]
+        },
+        {
+          "name": "disagreed",
+          "type": "bool",
+          "default": false,
+          "description": [
+            "Whether the two producers disagreed about the cardinality — one of them declared `single` and the other `any`.",
+            "",
+            "The refusal is the same either way, since the strict reading wins, but the diagnosis is not. With both declaring `single`, somebody started two of a service that admits one. With a disagreement, the two binaries hold different beliefs about the contract and one of them needs fixing whatever else is done about the duplicate."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "InstanceInfo",
+      "description": ["One registered instance, as a listing or a watch reports it."],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["Its stable, service-chosen id."]
+        },
+        {
+          "name": "pid",
+          "type": "u32",
+          "description": [
+            "Its process id, or `0` if it did not report one. Always written, unlike on registration, where an absent key is read as `0`."
+          ]
+        },
+        {
+          "name": "ready",
+          "type": "bool",
+          "description": [
+            "Whether it has sent ready. Only ready instances are ever handed out."
+          ]
+        },
+        {
+          "name": "last_seen_ms",
+          "type": "u53",
+          "description": [
+            "Milliseconds since its last heartbeat, or since registration if it has not heartbeated yet.",
+            "",
+            "Meaningless without the time-to-live to compare it against, which is why a listing carries that too."
+          ]
+        },
+        {
+          "name": "services",
+          "type": { "array": "ServiceEntry" },
+          "description": ["Everything it mounts."]
+        },
+        {
+          "name": "waiting_on",
+          "type": { "array": "ContractId" },
+          "default": [],
+          "description": [
+            "The required contracts it is parked on right now, if it is inside an await-ready call. Empty for an instance that is not waiting.",
+            "",
+            "This is the field that answers the question a stuck cluster actually poses — who is waiting for what — without correlating log files."
+          ]
+        },
+        {
+          "name": "unreachable",
+          "type": { "array": "string" },
+          "default": [],
+          "description": [
+            "The names of this instance's services that reported no coordinates on any transport, and so cannot be dialled by anybody.",
+            "",
+            "A service whose every transport failed to bind is still registered: dropping it would silently drop its consumed contracts from the host's readiness union, which is worse than an unreachable service. But it is then a service that is running, may be ready, and can never be selected — and until this field existed that fact appeared only in the producer's own log, so an operator watching a consumer fail to resolve had nothing in the registry to point at."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Listing",
+      "description": [
+        "The whole registry as the coordinator currently holds it, with expired instances already swept, and the coordinator itself.",
+        "",
+        "Why the coordinator describes itself here",
+        "",
+        "Two facts about the coordinator are needed to read its own answer, and nothing else in the reply carries them.",
+        "",
+        "The last-seen figure on each instance is meaningless without the time-to-live to compare it against: 9.4 seconds since the last heartbeat is perfectly healthy at a two-minute time-to-live and within a rounding error of fatal at ten seconds. A reader that does not know which cannot colour a row, and an operator that does not know cannot decide whether to worry.",
+        "",
+        "And the address is the only thing that says which coordinator answered. A coordinator deliberately does not register with itself, so an operator with two of them running — a stale one on the default socket, the real one somewhere else — otherwise has no way to tell from the output which they are looking at."
+      ],
+      "fields": [
+        {
+          "name": "ttl_ms",
+          "type": "u53",
+          "default": 0,
+          "description": [
+            "How long an instance survives without a heartbeat, in milliseconds. `0` from a coordinator too old to report it, which is also what an absent key means."
+          ]
+        },
+        {
+          "name": "address",
+          "type": "string",
+          "default": "",
+          "description": [
+            "Where this coordinator is listening, as an operator would type it — normally a Unix socket path, though nothing here requires it to be one.",
+            "",
+            "Empty when it was not told its own address, which is a coordinator embedded in another process rather than a misconfiguration."
+          ]
+        },
+        {
+          "name": "instances",
+          "type": { "array": "InstanceInfo" },
+          "default": [],
+          "description": [
+            "Every live instance, ordered by instance id — the same order selection uses, so a reader sees the registry the way the coordinator does."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "WatchEvent",
+      "tagging": "internal",
+      "tag": "kind",
+      "description": [
+        "One frame of the watch stream.",
+        "",
+        "Why there are only three arms",
+        "",
+        "A watch is a snapshot followed by deltas, and the registry is a map keyed by instance id — so structurally there are exactly three things a frame can say: here is everything, here is one entry's current state, this entry is gone. A consumer that applies them to a map by id ends up with the same listing the coordinator holds, which is precisely what the two-second poll this op replaces used to fetch whole.",
+        "",
+        "The causes an observer might care about — registered, became ready, endpoints changed, started or stopped waiting — are deliberately not arms. They are all \"this instance's state changed\", they all carry the same payload, and a consumer that wants to distinguish them can: it is holding the previous state for that id, so not-was-ready and is-ready is \"became ready\" and needs no help from the wire. Spending an arm per cause would fix today's list of interesting transitions into the protocol, and every later one would be a breaking change to an internally tagged union. Three structural arms close the set instead.",
+        "",
+        "Removal carries no reason for the same reason it needs none today: the registry has exactly one way to lose an instance, the time-to-live sweep. If a deliberate deregistration is ever added it arrives as an additional defaulted field on the remove arm, not as a fourth arm.",
+        "",
+        "Ordering guarantees",
+        "",
+        "The snapshot is always the first frame and arrives exactly once. No change can slip between the snapshot and the first delta: the coordinator takes the snapshot and installs the watcher under a single lock acquisition. Deltas then arrive in the order the registry applied them.",
+        "",
+        "A consumer may receive an upsert for an instance already in its map — that is the normal case, and it means the entry changed — and must treat it as a replace rather than an insert. It may not receive a remove for an id it has never seen."
+      ],
+      "variants": [
+        {
+          "name": "snapshot",
+          "description": [
+            "The registry as it stood the moment this watch was installed. Always the first frame of the stream, and sent exactly once."
+          ],
+          "fields": [
+            {
+              "name": "registry",
+              "type": "Listing",
+              "default": { "ttl_ms": 0, "address": "", "instances": [] },
+              "description": [
+                "The whole registry: the identical value the list op would have returned at that instant, carrying the coordinator's own time-to-live and address as well as its instances.",
+                "",
+                "Reusing the listing shape rather than restating its fields is the point. The snapshot and the poll it replaces cannot drift into describing the registry differently, and a consumer switching from one to the other reuses its rendering unchanged."
+              ]
+            }
+          ]
+        },
+        {
+          "name": "upsert",
+          "description": [
+            "One instance's current state, in full. Sent when it registers, when it becomes ready, when it heartbeats, when its endpoints or services change, and when what it is waiting on changes.",
+            "",
+            "Always the complete instance record, never a patch: a partial update would need the consumer to hold a merge rule that the coordinator also holds, and the two would eventually disagree."
+          ],
+          "fields": [
+            {
+              "name": "instance",
+              "type": "InstanceInfo",
+              "description": ["The instance, exactly as the list op would report it now."]
+            }
+          ]
+        },
+        {
+          "name": "remove",
+          "description": [
+            "An instance has left the registry: its time-to-live elapsed with no heartbeat.",
+            "",
+            "This is the event polling could not deliver promptly, and the reason a coordinator runs a sweep timer while anyone is watching. Expiry is generated by the sweep, the sweep is lazy, and on a fleet that has gone entirely silent there are no ops left to trigger one."
+          ],
+          "fields": [
+            {
+              "name": "instance",
+              "type": "string",
+              "description": ["The instance id that is gone. Drop it from your view."]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Edge",
+      "description": [
+        "One recorded selection: this consumer was given that producer for a contract."
+      ],
+      "fields": [
+        {
+          "name": "consumer",
+          "type": "string",
+          "description": ["The instance that asked, as registered."]
+        },
+        {
+          "name": "contract",
+          "type": "ContractId",
+          "description": ["What it asked for."]
+        },
+        {
+          "name": "producer",
+          "type": "string",
+          "description": ["The instance it was given."]
+        },
+        {
+          "name": "age_ms",
+          "type": "u53",
+          "description": [
+            "How long ago the selection was made, in milliseconds.",
+            "",
+            "A large age is not staleness by itself — a binding that has worked for a week is the normal case — but it does bound how recently the coordinator was in a position to know."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "BindingGraph",
+      "description": [
+        "Every selection the coordinator has made and still believes in.",
+        "",
+        "What a recorded selection is, and is not",
+        "",
+        "It is the coordinator's best knowledge, not a guarantee. The coordinator records the producer it handed to a consumer at the moment it handed it over, through the await-ready stream at startup or through a resolve on a re-resolve. What the consumer did with it is not observable from here: the data path never touches the coordinator, so a consumer that failed to dial the producer and fell back to an alternate in the same resolve result, or that is mid-reconnect right now, has an edge here that is one step out of date. The age on each edge is how stale it might be.",
+        "",
+        "It is still strictly better than the declared contracts a listing returns. With two ready producers of `storage/1`, declarations say only that `fs` consumes it and order `fs` before both; a recorded selection names the one `fs` was given. A superset ordering is safe but coarse, and under redundancy — the thing the selection policy exists to support — it gets coarser exactly as the cluster gets more interesting.",
+        "",
+        "An edge is dropped when either end leaves the registry: a selection pointing at an expired producer describes nothing."
+      ],
+      "fields": [
+        {
+          "name": "edges",
+          "type": { "array": "Edge" },
+          "default": [],
+          "description": [
+            "Every recorded selection, ordered by consumer and then contract — the same stable ordering a listing uses, and for the same reason."
+          ]
+        }
+      ]
+    }
+  ],
+
+  "errors": [
+    {
+      "name": "instance_exists",
+      "code": 1001,
+      "description": [
+        "Registration was given an instance id that is already registered to a different set of services.",
+        "",
+        "Two live processes claiming one identity is a misconfiguration, and retrying cannot fix it, so it is an error rather than a value. It carries no data: the id is already in the caller's hand.",
+        "",
+        "What is not a collision",
+        "",
+        "Re-registering the same id with the same services, declaring the same contracts, is the reconnect path and it succeeds. A service that reconnects, or one restarted while its previous entry is still inside the time-to-live, has to be able to say who it is again without being crash-looped until the entry expires.",
+        "",
+        "Endpoints are not part of the comparison, and neither is the process id. Both change on an ordinary restart — an ephemeral WebSocket port resolves differently every boot and an iroh ticket is minted at bind — while the instance id, derived from the configured coordinates, does not. Comparing them made every restart of such a host a fatal collision for one whole time-to-live. What remains is what the id is a name for: which services this process mounts and what they declare.",
+        "",
+        "A re-registration clears readiness, because it asserts where the service can be reached rather than that it is serving, so a service that is already serving follows it with a ready call. That is also what makes accepting changed endpoints safe: the new coordinates are handed to nobody until the process that reported them says it is serving."
+      ]
+    },
+    {
+      "name": "unknown_instance",
+      "code": 1002,
+      "description": [
+        "The named instance is not registered. Answered by the await-ready stream when the caller never registered, or when its entry has already expired.",
+        "",
+        "The ready and heartbeat ops deliberately do not use this code. They answer a value instead, because at those two points the caller has a defined next step and driving a state machine off an error code is worse than driving it off a value."
+      ]
+    },
+    {
+      "name": "unresolved",
+      "code": 1003,
+      "description": [
+        "The await-ready stream hit its deadline with required contracts still outstanding.",
+        "",
+        "Fatal for the waiting process: it has dependencies it cannot reach and no way to make progress by waiting longer. The data names what was outstanding and, when the contract graph suggests one, a cycle that may be why."
+      ],
+      "data": "Unresolved"
+    },
+    {
+      "name": "singleton_occupied",
+      "code": 1004,
+      "description": [
+        "Registration declared a producer of a contract that already has a live producer, and one of the two declared that contract to admit a single producer.",
+        "",
+        "Why this is not the instance-exists error",
+        "",
+        "They are different mistakes with different fixes, and the operator needs to be told which one they made. Instance-exists says two processes are claiming one identity: the ids collide and the deployments differ. This says the ids are perfectly distinct and the contract is the thing that admits only one holder — a second `storage/1` over its own database file is a config with one entry too many, or a stray process started by hand, and the answer is to stop one of them rather than to rename it. Sharing a code would put both under one message that is wrong for one of them.",
+        "",
+        "Why an error rather than a value",
+        "",
+        "A recoverable state with a defined next step is a value, and anything not fixable by retrying is an error. A second producer of a singleton contract is not fixable by retrying. It is fixed by a human removing one of the two, and until then the process that was refused must not go on believing it is part of the fleet — so a host treats this as fatal and exits, which is the loud failure the distinction exists to convert a silent one into.",
+        "",
+        "What is not occupied",
+        "",
+        "The same instance re-registering. A service that reconnects, or that is restarted while its previous entry is still inside the time-to-live, re-registers its own id and must refresh rather than be refused as its own rival. And an incumbent whose registration has expired no longer holds anything: a coordinator sweeps before it checks, so a dead singleton never blocks its own replacement."
+      ],
+      "data": "SingletonOccupied"
+    }
+  ],
+
+  "ops": [
+    {
+      "name": "coord.register",
+      "kind": "unary",
+      "description": [
+        "Declare an instance's produced and consumed contracts and its dial coordinates. The first call a joiner makes, and the call it repeats whenever it is told its instance is unknown.",
+        "",
+        "Registering does not make an instance ready, and re-registering clears readiness. A service that is already serving follows a re-registration with a ready call."
+      ],
+      "args": "RegisterArgs",
+      "result": "RegisterAck",
+      "errors": ["instance_exists", "singleton_occupied"]
+    },
+    {
+      "name": "coord.await_ready",
+      "kind": "stream",
+      "description": [
+        "Wait for this instance's consumed contracts to resolve, receiving one binding per contract as it does.",
+        "",
+        "A one-shot startup step. The stream ends cleanly once every required contract has been bound; optional contracts that never resolve simply yield no binding and do not hold it open. On the deadline it ends with the `unresolved` error instead.",
+        "",
+        "The stream is seeded from current state, so a contract that was already resolvable when the call was made yields its binding immediately rather than waiting for the next change. A joiner must not re-run this op after a later `unknown_instance`: its bindings are already in hand, and re-running it parks the process on dependencies it has already resolved."
+      ],
+      "args": "AwaitReadyArgs",
+      "item": "Binding",
+      "errors": ["unknown_instance", "unresolved"]
+    },
+    {
+      "name": "coord.ready",
+      "kind": "unary",
+      "description": [
+        "Mark a registered instance as serving.",
+        "",
+        "Sent once, after the await-ready stream has ended cleanly and the process is actually able to answer ops. Only ready producers are ever handed out to a consumer."
+      ],
+      "args": "ReadyArgs",
+      "result": "ReadyResult",
+      "errors": []
+    },
+    {
+      "name": "coord.heartbeat",
+      "kind": "unary",
+      "description": [
+        "Refresh an instance's last-seen time.",
+        "",
+        "Send it on a repeating interval well under the coordinator's time-to-live, which a listing reports. It is the only call a healthy joiner keeps making, and therefore the only one that can discover that the registry has forgotten it."
+      ],
+      "args": "Heartbeat",
+      "result": "HeartbeatResult",
+      "errors": []
+    },
+    {
+      "name": "coord.resolve",
+      "kind": "unary",
+      "description": [
+        "The ready producers of one contract, best first.",
+        "",
+        "Two callers use it. A registered consumer re-resolving after a dropped connection sends its own instance id, and the coordinator records the answer as that consumer's current selection. An operator's CLI asking who could serve a contract omits the id and no selection is recorded.",
+        "",
+        "An empty answer is not an error."
+      ],
+      "args": "ResolveArgs",
+      "result": "ResolveResult",
+      "errors": []
+    },
+    {
+      "name": "coord.list",
+      "kind": "unary",
+      "description": [
+        "Every registered instance and its state, plus the coordinator's own time-to-live and address. What a dashboard or a CLI reads.",
+        "",
+        "Takes no arguments. Any params object sent is ignored, so a caller may send none at all.",
+        "",
+        "An observer that wants to keep a view current should use the watch op rather than calling this on a timer."
+      ],
+      "result": "Listing",
+      "errors": []
+    },
+    {
+      "name": "coord.bindings",
+      "kind": "unary",
+      "description": [
+        "The producer this coordinator handed to each consumer, per contract.",
+        "",
+        "Takes no arguments. The list op answers what every instance declares; this answers what was actually chosen. The two are different questions, and only the second can order a shutdown under redundancy."
+      ],
+      "result": "BindingGraph",
+      "errors": []
+    },
+    {
+      "name": "coord.watch",
+      "kind": "stream",
+      "description": [
+        "Watch the registry: one snapshot frame carrying the whole registry, then one frame per change, until the caller cancels.",
+        "",
+        "Takes no arguments. This is what an observer should use instead of polling the list op on a timer, which is simultaneously too slow — a registration is visible up to one poll interval after it happened — and too fast, since every observer pulls the entire registry on every tick whether or not anything changed.",
+        "",
+        "Why a stream and not a publish-subscribe topic",
+        "",
+        "A watch is per consumer and correlated to the request that opened it: it begins with a snapshot taken for that caller and ends when that caller goes away, which is a stream's shape and not a topic's. The await-ready op is the same shape and is the precedent. A topic's shape is one producer fanning identical events out to subscribers who each missed whatever preceded them, and a snapshot would have to be bolted on beside it.",
+        "",
+        "There is a second, decisive reason in this system: the dashboard reaches this op through a TypeScript client that has streaming but no publish-subscribe runtime, so a topic-based watch would work from Rust and have to be hand-rolled in the browser — exactly the demultiplexing a runtime exists to stop applications writing.",
+        "",
+        "Cancellation",
+        "",
+        "Dropping the receiving end cancels the stream and the coordinator forgets the watcher, which is the same cancel-on-drop every other stream op has."
+      ],
+      "item": "WatchEvent",
+      "errors": []
+    }
+  ]
+}

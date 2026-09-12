@@ -117,6 +117,40 @@
 //! of its mounted services produces and consumes. [`spec`] is what a
 //! *contract* is, independent of any process that implements it.
 //!
+//! # This crate is the one exception to that rule, deliberately
+//!
+//! Everything in this file, and all of [`coord`], is hand-written Rust **and**
+//! is described by a manifest — `contracts/coord.v1.json` and
+//! `contracts/peerline.contract.v1.json` at the root of this repository. The
+//! manifests do not generate anything. They are documentation of record, for
+//! an implementor who is not writing Rust and has no library to fall back on.
+//!
+//! The rule everywhere else is that the manifest is the source and the Rust is
+//! generated, so the two cannot drift. It does not hold here because these
+//! types are not only wire shapes: they are the **public API of a library**.
+//! `Host` takes a `Vec<Produced>`, `Bindings::connect` returns a [`Binding`],
+//! `Connection::dial` takes a [`HostId`] and an [`Endpoints`], and a
+//! supervisor consumes [`coord::Listing`] and [`coord::BindingGraph`]. Two
+//! crates each expanding their own `coord/1` would hold two distinct Rust
+//! types and could not pass those values to one another.
+//!
+//! What makes the exception safe rather than merely cheap is the **drift
+//! test**, `tests/coord_manifest_drift.rs`. It serialises real values of these
+//! types and checks field names, the three field states, default values, union
+//! tags, arm spellings, op names, op kinds and error codes against what the
+//! manifests declare. A field added, renamed, retagged or re-optioned on
+//! either side fails it, naming the type and the field. Its module docs state
+//! what classes of drift it does *not* catch, which is the part worth reading
+//! before relying on it.
+//!
+//! So: **edit either side and edit both.** The reasoning behind choosing this
+//! over a full migration, and what would reopen that choice, is recorded in
+//! `peerline-cluster`'s `PROPOSALS.md` item 1.
+//!
+//! `contracts/README.md` carries the things the format has no key for and a
+//! joiner still needs: the order the ops must be called in, the environment
+//! variables a supervisor injects, and the [`HostId`] derivation.
+//!
 //! # The lifeline
 //!
 //! [`lifeline`] carries the one variable that travels the other way round the
@@ -428,6 +462,21 @@ impl Consumed {
 /// platform machine id combined with a container/namespace discriminator, both
 /// satisfy it; the bare output of `gethostname` does not. This crate does not
 /// mint one — that needs a runtime, and this crate has none.
+///
+/// # There is one derivation, and every implementation owes it
+///
+/// Satisfying the assertion is not enough: a process that mints a *valid* token
+/// nobody else shares silently never gets uds to a neighbour on the same
+/// machine, and one that over-claims mis-dials. So the derivation is a
+/// cross-implementation contract, not a local choice —
+/// `PEERLINE_HOST_ID`, else the token file at `{temp_dir}/peerline-host-id`
+/// created exclusively by whichever process gets there first, else a
+/// per-process fallback that can only ever under-claim.
+///
+/// It is written out in full in two places a non-Rust implementor can find:
+/// the prose of `Endpoints.host` in `contracts/peerline.contract.v1.json`, and
+/// the `HostId` derivation section of `contracts/README.md`. `peerline-host`'s
+/// `hostid` module is the Rust implementation of it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HostId(pub String);

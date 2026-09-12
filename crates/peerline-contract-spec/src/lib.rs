@@ -233,6 +233,18 @@ impl Manifest {
         self.errors.iter().map(|e| (e.name.as_str(), e)).collect()
     }
 
+    /// The ops, keyed by the full name they travel under.
+    ///
+    /// The companion to [`Manifest::type_map`] and [`Manifest::error_map`],
+    /// and there for the same reason: a checker comparing this file against an
+    /// implementation walks the implementation's op table and asks what the
+    /// manifest says about each name. Doing that against [`Manifest::ops`]
+    /// directly is a linear scan per op written slightly differently by every
+    /// caller.
+    pub fn op_map(&self) -> BTreeMap<&str, &OpDef> {
+        self.ops.iter().map(|op| (op.name.as_str(), op)).collect()
+    }
+
     /// The id a manifest is imported by: `"coagent.rpc/1"`.
     pub fn id(&self) -> String {
         format!("{}/{}", self.contract, self.version)
@@ -675,6 +687,47 @@ impl Field {
     pub fn is_required(&self) -> bool {
         !self.optional && !self.nullable && self.default.is_none()
     }
+
+    /// Which of the states this field is in, as one value.
+    ///
+    /// The three states are spelled on [`Field`] as three independent keys
+    /// because that is what reads well in the file, and the validator has
+    /// already rejected the combinations that are not a state — optional and
+    /// nullable together, or either of them with a default. A reader that has
+    /// a validated manifest in hand is therefore looking at exactly one of
+    /// [`FieldState`]'s arms, and matching on it is how a checker gets told by
+    /// its own compiler when a fourth state is added to the format. Four
+    /// booleans tested in the wrong order would just quietly pick one.
+    pub fn state(&self) -> FieldState<'_> {
+        if let Some(default) = &self.default {
+            FieldState::Default(default)
+        } else if self.nullable {
+            FieldState::Nullable
+        } else if self.optional {
+            FieldState::Optional
+        } else {
+            FieldState::Required
+        }
+    }
+}
+
+/// What a field's absence from an object means.
+///
+/// See [`Field::state`], and the crate docs on the three field states for why
+/// absent and null are not one answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FieldState<'a> {
+    /// The key is always written, and an object without it is malformed.
+    Required,
+    /// The key may be absent, and absence means nothing was said. A writer
+    /// omits it rather than writing `null`. See [`Field::optional`].
+    Optional,
+    /// The key is always written, and its value is `null` when there is
+    /// nothing to say. See [`Field::nullable`].
+    Nullable,
+    /// Absence has a **value**, carried here: a reader that does not apply it
+    /// gets a different answer than one that does. See [`Field::default`].
+    Default(&'a Value),
 }
 
 /// One value of a string enum.
