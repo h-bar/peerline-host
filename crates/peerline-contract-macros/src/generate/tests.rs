@@ -866,6 +866,113 @@ fn a_shape_named_like_a_generated_name_is_rejected_at_the_call_site() {
     assert!(err.contains("already declares a shape"), "{err}");
 }
 
+/// One registration per op, beside the one for all of them. Without these a
+/// producer that wants a different surface per transport — the whole contract
+/// on a socket the kernel attests, reads only on a port — cannot use the
+/// generated wiring at all, and goes back to hand-writing the very
+/// `on_request` calls the clause exists to remove.
+#[test]
+fn every_op_gets_a_registration_of_its_own() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(tokens.contains("pub fn register_go"), "{tokens}");
+    assert!(tokens.contains("pub fn register_watch"), "{tokens}");
+}
+
+/// A per-op registration is the *same* wiring, not a second one: the
+/// whole-contract function calls it. Two copies of the wiring would be two
+/// places for a kind to be wrong, which is the failure this whole clause was
+/// written to make unwritable.
+#[test]
+fn the_whole_contract_registration_is_written_in_terms_of_the_per_op_ones() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(
+        tokens.contains("register_go (peer , :: std :: sync :: Arc :: clone (& imp))"),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains("register_watch (peer , :: std :: sync :: Arc :: clone (& imp))"),
+        "{tokens}",
+    );
+    // And it is only the delegation: a wiring left behind beside the calls
+    // would be a second registration of the same op on the same peer.
+    assert_eq!(
+        tokens.matches("on_request (OP_GO").count(),
+        1,
+        "`go` is wired exactly once: {tokens}",
+    );
+    assert_eq!(
+        tokens.matches("on_stream_request (OP_WATCH").count(),
+        1,
+        "`watch` is wired exactly once: {tokens}",
+    );
+}
+
+/// Each per-op function carries its own op's kind, because it *is* the
+/// generated wiring rather than a wrapper around a name. A subset registered
+/// one op at a time is as kind-correct as the whole contract registered at
+/// once — otherwise the subset path would buy back the mistake.
+#[test]
+fn a_per_op_registration_keeps_the_kind_the_manifest_declares() {
+    let tokens = expand_with_runtime(FIXTURE);
+    let go = body_of(&tokens, "pub fn register_go");
+    assert!(go.contains("on_request (OP_GO"), "{go}");
+    assert!(!go.contains("on_stream_request"), "{go}");
+    let watch = body_of(&tokens, "pub fn register_watch");
+    assert!(watch.contains("on_stream_request (OP_WATCH"), "{watch}");
+    assert!(!watch.contains(". on_request (OP_WATCH"), "{watch}");
+}
+
+/// Everything the two entry points promise is in the prose, because the
+/// reason to register one op rather than all of them is a security argument
+/// and not a preference. An adopter who reads only the signature would take
+/// the per-op functions for a convenience.
+#[test]
+fn the_subset_use_case_is_documented_on_both_registrations() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(
+        tokens
+            .matches("registering none of an op leaves it `MethodNotFound`, which is the point")
+            .count()
+            >= 3,
+        "the point of a subset belongs on every registration: {tokens}",
+    );
+}
+
+/// A generated function name is as collidable as a generated type name, and
+/// the one reachable collision is an op that spells the whole-contract
+/// registration. Left alone it is a duplicate definition on a generated line
+/// that mentions neither the manifest nor the clause.
+#[test]
+fn an_op_that_spells_the_whole_contract_registration_is_rejected() {
+    let json = FIXTURE.replace(
+        r#""name": "demo.thing.go""#,
+        r#""name": "demo.thing.demo_thing_handlers""#,
+    );
+    let err = alongside(&json, &[], &[], &[], true)
+        .expect_err("the name is taken")
+        .to_string();
+    assert!(err.contains("register_demo_thing_handlers"), "{err}");
+    assert!(err.contains("the whole-contract registration"), "{err}");
+}
+
+/// The token text between `marker` and the next item, which is how a test
+/// reads one generated function rather than the whole expansion. Functions
+/// are emitted one after another, so the next `pub fn` or `pub trait` is the
+/// end of this one.
+fn body_of(tokens: &str, marker: &str) -> String {
+    let start = tokens
+        .find(marker)
+        .unwrap_or_else(|| panic!("`{marker}` is not in the expansion: {tokens}"))
+        + marker.len();
+    let rest = &tokens[start..];
+    let end = ["pub fn ", "pub trait ", "pub struct "]
+        .iter()
+        .filter_map(|next| rest.find(next))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
 /// A vocabulary has no ops, so there is no producer to implement and no
 /// client to call. Asking for the stubs there is a mistake about which
 /// manifest is being expanded, and generating nothing would leave it to be

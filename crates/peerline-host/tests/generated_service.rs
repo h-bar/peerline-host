@@ -23,7 +23,13 @@
 //! attribute; what cannot be read there is whether the registration actually
 //! answers, whether a stream op registered by the generator is answered as a
 //! stream, and whether an op with no arguments or no result survives a round
-//! trip. Those are the four things below.
+//! trip.
+//!
+//! The per-op registrations are here for the same reason and one more: what a
+//! *subset* is for cannot be read off tokens at all. That an op nobody
+//! registered answers `MethodNotFound` — rather than answering, or failing in
+//! some way that confirms it exists — is a property of the peer's dispatch,
+//! and the only place to observe it is over a real connection.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -186,6 +192,89 @@ async fn a_contract_error_arrives_with_its_code_and_its_data() {
         }
         other => panic!("expected an rpc error, got {other:?}"),
     }
+}
+
+/// The same two peers, with **part** of the contract on the producer: the two
+/// ops a reader needs and neither of the two that change anything.
+///
+/// This is the shape a producer whose surface varies by transport builds — the
+/// whole contract on a unix socket the kernel attests, a chosen few on a port
+/// any local user can reach — written here with no host in the way, because
+/// what is under test is the registration and not the admission.
+fn wired_subset() -> (DemoHostClient, Arc<Thing>, Peer) {
+    let (consumer, producer, driver) = loopback();
+    tokio::spawn(driver);
+    let thing = Arc::new(Thing::default());
+    demo::register_greet(&producer, Arc::clone(&thing));
+    demo::register_count(&producer, Arc::clone(&thing));
+    (DemoHostClient::new(consumer), thing, producer)
+}
+
+/// **The property a subset is for.** What was registered answers; what was not
+/// is `MethodNotFound`, which does not even confirm the op exists — no check
+/// inside a handler, nothing to forget, and nothing on the wire that tells a
+/// caller it found the right producer and was merely refused.
+#[tokio::test]
+async fn an_op_left_out_of_a_subset_is_not_there_at_all() {
+    let (client, thing, _producer) = wired_subset();
+
+    let greeting = client
+        .greet(&GreetArgs::new("world"))
+        .await
+        .expect("`greet` was registered");
+    assert_eq!(greeting.text, "hello, world");
+
+    let err = client
+        .forget(&GreetArgs::new("world"))
+        .await
+        .expect_err("`forget` was not registered");
+    match err {
+        peerline::runtime::Error::Rpc(rpc) => {
+            assert_eq!(rpc.code, -32601, "{rpc:?}");
+            assert_eq!(
+                rpc.error_type(),
+                peerline::wire::ErrorType::MethodNotFound,
+                "{rpc:?}",
+            );
+        }
+        other => panic!("expected MethodNotFound, got {other:?}"),
+    }
+    // And the op really did not run: `forget` would have reset this.
+    assert_eq!(thing.greeted.load(Ordering::Relaxed), 1);
+}
+
+/// A per-op registration *is* the generated wiring, so a stream op registered
+/// one at a time is still registered as a stream. A subset path that reached
+/// for `on_request` would answer this with a kind mismatch — the failure the
+/// whole clause exists to make unwritable, which a subset must not buy back.
+#[tokio::test]
+async fn a_subset_registers_a_stream_op_as_a_stream() {
+    let (client, _thing, _producer) = wired_subset();
+    let mut items = client.count(&CountArgs::new(3)).expect("the stream opened");
+
+    let mut seen = Vec::new();
+    while let Some(item) = items.next().await {
+        seen.push(item.expect("an item, not a fault").data.n);
+    }
+    assert_eq!(seen, vec![0, 1, 2]);
+}
+
+/// The whole-contract registration is these same functions, called once each.
+/// The assertion is that nothing is lost by the delegation: every op the
+/// subset withheld answers when the whole contract is registered.
+#[tokio::test]
+async fn registering_every_op_is_what_the_whole_contract_registration_does() {
+    let (client, _thing, _producer) = wired();
+    client
+        .greet(&GreetArgs::new("world"))
+        .await
+        .expect("greeted");
+    assert_eq!(client.tally().await.expect("tallied").greeted, 1);
+    client
+        .forget(&GreetArgs::new("world"))
+        .await
+        .expect("`forget` is registered by the whole-contract path");
+    assert_eq!(client.tally().await.expect("tallied").greeted, 0);
 }
 
 /// `produced()` is the declaration every producer used to write out by hand,

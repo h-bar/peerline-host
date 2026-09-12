@@ -155,6 +155,7 @@ mod error;
 mod hostid;
 #[cfg(unix)]
 mod lifeline;
+mod serving;
 
 pub use bindings::{Bindings, Connection};
 pub use error::{BindError, DialError, HostError, PlanError};
@@ -171,8 +172,11 @@ pub use peerline_contract::{Endpoints, HostId};
 // mount address is expected to honour the second.
 pub use peerline_contract::env::{COORD_SOCK_ENV, SERVICE_UDS_ENV};
 
-/// A transport's forever-running accept loop.
-type Serve = BoxFuture<'static, Result<(), HostError>>;
+// The accept loops and the rule for combining them. A host keeps serving as
+// long as anything is listening, which is a policy rather than a detail of
+// whichever `futures` combinator the serving stage happened to reach for —
+// see [`serving`].
+use serving::{TransportServe, serve_all};
 
 // One mount entry per transport. Only defined when that transport is
 // compiled in: `Mount` has no setter for a disabled one, so nothing can be
@@ -696,6 +700,13 @@ impl Host {
     /// me" signal: map it to a non-zero exit, which is what distinguishes it
     /// from the clean `Ok(())` of a shutdown signal.
     ///
+    /// One thing that is deliberately **not** in that list: a transport whose
+    /// accept loop dies while serving. A host keeps serving as long as
+    /// anything is listening, and only the last live transport's failure ends
+    /// the run — with the coordinates already published for the dead transport
+    /// left stale. [`BoundHost::serve_until`] documents the rule and what it
+    /// costs; this method is that method with the binding in front of it.
+    ///
     /// With `PEERLINE_MANIFEST_OUT` set it binds nothing, writes the manifest
     /// to that path and returns `Ok(())`.
     ///
@@ -917,7 +928,7 @@ impl Host {
         &self,
         prepared: &[Prepared],
         endpoints: Vec<Endpoints>,
-        serves: Vec<Serve>,
+        serves: Vec<TransportServe>,
         host: HostId,
         socket: PathBuf,
     ) -> Result<(), HostError> {
@@ -987,7 +998,7 @@ impl Host {
         let _ = serving_tx.send(true);
 
         tokio::select! {
-            r = futures::future::try_join_all(serves) => r.map(|_| ()),
+            r = serve_all(serves) => r,
             e = &mut client => Err(e),
             e = watchdog => Err(e),
         }
@@ -998,7 +1009,7 @@ impl Host {
         &self,
         _prepared: &[Prepared],
         _endpoints: Vec<Endpoints>,
-        _serves: Vec<Serve>,
+        _serves: Vec<TransportServe>,
         _host: HostId,
         _socket: PathBuf,
     ) -> Result<(), HostError> {
@@ -1331,6 +1342,33 @@ impl BoundHost {
     /// announce readiness. The lifeline taken during [`Host::bind`] is watched
     /// here for the same reason [`Host::run_until`] watches it — it is not one
     /// of the caller's choices.
+    ///
+    /// # A host serves as long as anything is listening
+    ///
+    /// An accept loop that dies mid-serve does not end this future. The
+    /// transport is dropped with a `warn!` naming it and the error, and the
+    /// rest go on answering; only when the **last** live transport's loop ends
+    /// does this resolve, with that loop's own result. The rule is the same
+    /// for ws, uds and iroh — a ws port lost to whatever took it does not cost
+    /// a caller the unix socket that every local process was reaching it on,
+    /// which is otherwise a whole session lost to a door closing.
+    ///
+    /// This is about the accept loop, not the bind. A transport that never
+    /// bound is already gone by here: [`Host::bind`] drops it, and it
+    /// contributes no coordinate to [`endpoints`](Self::endpoints).
+    ///
+    /// # What that costs: the endpoints for a dead transport go stale
+    ///
+    /// A host registers its coordinates with the coordinator once, at `Ready`,
+    /// and a transport dying afterwards does **not** withdraw them. A consumer
+    /// resolving this service can be handed a ws URL or an iroh ticket that no
+    /// longer answers, and finds out by failing to connect. Withdrawing them
+    /// would mean re-registering a shrunken set mid-serve, which is a question
+    /// about what a re-registration means for consumers already bound to the
+    /// old set — a coordinator-side protocol question, not something this
+    /// method can decide on its own. The staleness is the accepted cost: it
+    /// fails one dial, where ending the host failed every transport at once,
+    /// including the ones that were still working.
     pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<(), HostError> {
         let Self {
             host,
@@ -1357,7 +1395,7 @@ impl BoundHost {
                     for p in &prepared {
                         p.svc.bind(&bindings);
                     }
-                    futures::future::try_join_all(serves).await.map(|_| ())
+                    serve_all(serves).await
                 }
                 Some(socket) => {
                     host.with_coordinator(&prepared, endpoints, serves, host_id, socket.clone())
@@ -1465,34 +1503,37 @@ impl Listening {
         not(any(feature = "ws", feature = "uds", feature = "iroh")),
         allow(unused_mut)
     )]
-    fn into_serves(self) -> Vec<Serve> {
-        let mut serves: Vec<Serve> = Vec::new();
+    /// Every bound transport's accept loop, each labelled with the transport
+    /// it belongs to.
+    ///
+    /// Nothing here decides what a failure means — [`serve_all`] does, for all
+    /// of them at once. That used to be the other way round: iroh's arm caught
+    /// its own error and parked forever while ws's and uds's propagated, so
+    /// the host's failure policy was three different policies depending on
+    /// which future you read. The label is all that is left of the difference,
+    /// and it exists only so the log line can name the transport.
+    fn into_serves(self) -> Vec<TransportServe> {
+        let mut serves: Vec<TransportServe> = Vec::new();
         #[cfg(feature = "ws")]
         if let Some(bound) = self.ws {
-            serves.push(Box::pin(async move {
-                bound.serve().await.map_err(HostError::Serve)
-            }));
+            serves.push(TransportServe::new(
+                "ws",
+                Box::pin(async move { bound.serve().await.map_err(HostError::Serve) }),
+            ));
         }
         #[cfg(feature = "uds")]
         if let Some(bound) = self.uds {
-            serves.push(Box::pin(async move {
-                bound.serve().await.map_err(HostError::Serve)
-            }));
+            serves.push(TransportServe::new(
+                "uds",
+                Box::pin(async move { bound.serve().await.map_err(HostError::Serve) }),
+            ));
         }
         #[cfg(feature = "iroh")]
         if let Some(bound) = self.iroh {
-            // The endpoint is bound and its ticket is already published, so an
-            // accept loop that dies later must not take the other transports
-            // with it. (A *bind* failure is different: it never becomes an
-            // advertised coordinate at all — see `bind_all`.)
-            serves.push(Box::pin(async move {
-                if let Err(e) = bound.serve().await {
-                    tracing::error!(error = %e, "peerline-host: iroh accept loop failed; \
-                                                 continuing without it");
-                }
-                std::future::pending::<()>().await;
-                Ok(())
-            }));
+            serves.push(TransportServe::new(
+                "iroh",
+                Box::pin(async move { bound.serve().await.map_err(HostError::Serve) }),
+            ));
         }
         serves
     }

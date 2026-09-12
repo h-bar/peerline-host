@@ -666,14 +666,34 @@ fn op_summary(op: &OpDef, errors: &BTreeMap<&str, &ErrorDef>) -> Vec<String> {
 /// the two crates that implement contracts without being hosts would
 /// otherwise link a transport stack to get at a type alias.
 ///
-/// # The three generated names
+/// # The generated names
 ///
 /// For `demo.thing`: the trait `DemoThingService`, the function
 /// `register_demo_thing_handlers`, and the client `DemoThingClient`; plus one
-/// `…Items` sink per stream op. A manifest that declares a shape by one of
-/// those names is rejected here rather than left to collide in the expansion,
-/// because the collision otherwise lands as a duplicate-definition error on a
-/// line that mentions neither the manifest nor the clause.
+/// `…Items` sink per stream op, and one `register_<op>` per op —
+/// `register_go`, `register_watch`. A manifest that declares a shape by one of
+/// the first three names is rejected here rather than left to collide in the
+/// expansion, because the collision otherwise lands as a duplicate-definition
+/// error on a line that mentions neither the manifest nor the clause; the
+/// per-op functions are checked the same way against each other and against
+/// the whole-contract registration (see [`claimed_fn`]).
+///
+/// # Why there is a registration per op as well as one for all of them
+///
+/// A registration is not always all-or-nothing. A producer that exposes
+/// different op subsets per transport — the whole contract on a
+/// kernel-attested unix socket, reads only on a port any local user can reach
+/// — registers per op; registering none of an op leaves it `MethodNotFound`,
+/// which is the point, since an op that was never registered does not even
+/// confirm it exists and there is no check inside a handler to forget. Before
+/// this existed such a producer could not use the generated registration at
+/// all, and hand-wired its subsets instead — which is precisely the
+/// kind-mismatch exposure the clause was written to remove, reintroduced by
+/// the one class of producer that most wants its ops restricted.
+///
+/// The whole-contract registration is written in terms of the per-op ones
+/// rather than beside them, so there is exactly one wiring per op and the two
+/// entry points cannot drift.
 fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<TokenStream> {
     let types = manifest.type_map();
     let errors = manifest.error_map();
@@ -692,8 +712,20 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
         span = span
     );
 
+    // The function names this expansion claims, checked as they are claimed.
+    // Seeded with the whole-contract registration because that is the one a
+    // per-op name can really collide with: an op called
+    // `demo.thing.demo_thing_handlers` asks for `register_demo_thing_handlers`,
+    // which is already taken. See [`claimed_fn`].
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    claimed.insert(
+        register_name.to_string(),
+        "the whole-contract registration".to_string(),
+    );
+
     let mut methods = Vec::new();
-    let mut registrations = Vec::new();
+    let mut per_op = Vec::new();
+    let mut delegations = Vec::new();
     let mut sinks = Vec::new();
     let mut calls = Vec::new();
 
@@ -725,6 +757,19 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
             Some(_) => quote! { args },
             None => quote! { &::serde_json::Map::new() },
         };
+        let register_op = claimed_fn(
+            format!("register_{}", snake_case(short)),
+            &format!("the registration of `{}`", op.name),
+            &mut claimed,
+            span,
+        )?;
+
+        // Assigned in both arms and read once below: the *wiring* is what
+        // differs between a unary op and a stream one, and the function it is
+        // wrapped in is not. Writing the wrapper once is what makes "the kind
+        // comes from the manifest" a property of every registration path
+        // rather than of the one that happened to be generated first.
+        let wiring: TokenStream;
 
         match op.kind {
             OpKind::Unary => {
@@ -743,15 +788,12 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
                         Output = ::core::result::Result<#result_ty, ::peerline::wire::RpcError>,
                     > + ::core::marker::Send;
                 });
-                registrations.push(quote! {
-                    {
+                wiring = quote! {
+                    peer.on_request(#konst, move |args: #args_ty| {
                         let imp = ::std::sync::Arc::clone(&imp);
-                        peer.on_request(#konst, move |args: #args_ty| {
-                            let imp = ::std::sync::Arc::clone(&imp);
-                            async move { imp.#method(#passes).await }
-                        });
-                    }
-                });
+                        async move { imp.#method(#passes).await }
+                    });
+                };
                 calls.push(quote! {
                     #prose
                     #summary
@@ -840,18 +882,15 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
                         Output = ::core::result::Result<(), ::peerline::wire::RpcError>,
                     > + ::core::marker::Send;
                 });
-                registrations.push(quote! {
-                    {
-                        let imp = ::std::sync::Arc::clone(&imp);
-                        peer.on_stream_request(
-                            #konst,
-                            move |args: #args_ty, sender: ::peerline::runtime::StreamSender| {
-                                let imp = ::std::sync::Arc::clone(&imp);
-                                async move { imp.#method(#passes, #sink::new(sender)).await }
-                            },
-                        );
-                    }
-                });
+                wiring = quote! {
+                    peer.on_stream_request(
+                        #konst,
+                        move |args: #args_ty, sender: ::peerline::runtime::StreamSender| {
+                            let imp = ::std::sync::Arc::clone(&imp);
+                            async move { imp.#method(#passes, #sink::new(sender)).await }
+                        },
+                    );
+                };
                 calls.push(quote! {
                     #prose
                     #summary
@@ -865,6 +904,53 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
                 });
             }
         }
+
+        let per_op_docs = doc_lines(&[
+            format!("Register `{}` on `peer`, and nothing else.", op.name),
+            String::new(),
+            format!(
+                "The wiring `{register_name}` uses for this op — it calls this function, so there \
+                 is one wiring per op and not two that can drift. The kind comes from the \
+                 manifest here as everywhere else: `{}` is declared `{}`, and that is the \
+                 peerline call this makes.",
+                op.name, op.kind,
+            ),
+            String::new(),
+            "Per op because a registration is not always all-or-nothing. A producer that exposes \
+             different op subsets per transport registers per op; registering none of an op \
+             leaves it `MethodNotFound`, which is the point — an op that was never registered \
+             does not even confirm it exists, and there is no check inside a handler to forget."
+                .into(),
+            String::new(),
+            "Which transport a connection arrived on is what `peerline_host::Service::\
+             register_remote` is handed, and it is the place these calls belong: the whole \
+             contract on a socket the kernel attests, a chosen few on anything weaker."
+                .into(),
+            String::new(),
+            "What a subset does not change: `produced()` declares this contract's whole op list, \
+             because that is what the contract *is* and a producer registering fewer ops on one \
+             transport has not produced a different one. A consumer reading the coordinator's \
+             registry therefore sees every op, and discovers the narrower surface by calling \
+             into it. That is the same answer `MethodNotFound` gives, and the alternative — a \
+             declaration that varies per connection — is not something a registry describing a \
+             service could hold."
+                .into(),
+        ]);
+        per_op.push(quote! {
+            #per_op_docs
+            pub fn #register_op<I: #trait_name>(
+                peer: &::peerline::runtime::Peer,
+                imp: ::std::sync::Arc<I>,
+            ) {
+                #wiring
+            }
+        });
+        // One clone per op, which is one per registered handler either way:
+        // the handler holds the implementation for as long as the connection
+        // does, so there is nothing here to hand out by reference.
+        delegations.push(quote! {
+            #register_op(peer, ::std::sync::Arc::clone(&imp));
+        });
     }
 
     let trait_docs = doc_lines(&[
@@ -895,6 +981,17 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
         "Call it from `Service::register`, which runs once per connection — so the `Arc` is \
          cloned per connection and the implementation is shared, not copied."
             .into(),
+        String::new(),
+        format!(
+            "It is written as one call to each `register_<op>` rather than as the wiring again, \
+             so there is exactly one wiring per op of `{}`. That matters because the other entry \
+             point is not a convenience: a producer that exposes different op subsets per \
+             transport registers per op; registering none of an op leaves it `MethodNotFound`, \
+             which is the point — an op that was never registered does not even confirm it \
+             exists, and there is no check inside a handler to forget. Both paths therefore have \
+             to be the same registration, and here they are literally the same code.",
+            manifest.contract,
+        ),
     ]);
     let client_docs = doc_lines(&[
         format!("A typed caller for `{}`.", manifest.contract),
@@ -914,12 +1011,14 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
             #(#methods)*
         }
 
+        #(#per_op)*
+
         #register_docs
         pub fn #register_name<I: #trait_name>(
             peer: &::peerline::runtime::Peer,
             imp: ::std::sync::Arc<I>,
         ) {
-            #(#registrations)*
+            #(#delegations)*
         }
 
         #client_docs
@@ -973,6 +1072,50 @@ fn reserved(
         ));
     }
     Ok(format_ident!("{}", name, span = span))
+}
+
+/// A *function* name this expansion needs, checked against the ones it has
+/// already taken.
+///
+/// The sibling of [`reserved`], for the other namespace. A shape and a
+/// function cannot collide with each other — one is a type, the other a value
+/// — so this checks a different set: the names the `runtime` clause generates
+/// for itself, which are the whole-contract registration and one registration
+/// per op.
+///
+/// Exactly one collision is reachable here, and it is worth naming precisely
+/// rather than guarding vaguely: an op whose own name spells the
+/// whole-contract registration — `demo.thing.demo_thing_handlers` under
+/// `demo.thing` — which gives `register_demo_thing_handlers` twice. Two *ops*
+/// colliding with each other cannot reach this function, because a manifest
+/// whose ops give the same `OP_…` constant is already refused by the
+/// validator, and a per-op function name is that same constant lowercased.
+/// This check is what keeps that true as names are added: a generated name
+/// that collided silently would land as a duplicate definition on a generated
+/// line mentioning neither the manifest nor the clause.
+///
+/// The map is `name -> what asked for it` so the error can say which two
+/// things wanted the name, which is the whole difference between a diagnosis
+/// and "defined twice".
+fn claimed_fn(
+    name: String,
+    what: &str,
+    taken: &mut BTreeMap<String, String>,
+    span: Span,
+) -> syn::Result<Ident> {
+    if let Some(prior) = taken.get(&name) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "the `runtime` clause generates `{name}` for {what}, and it already generates \
+                 `{name}` for {prior}; a `.` and a `-` in an op name are both `_` in Rust, so \
+                 rename one of them in the manifest"
+            ),
+        ));
+    }
+    let ident = format_ident!("{}", name, span = span);
+    taken.insert(name, what.to_string());
+    Ok(ident)
 }
 
 /// `thread.start` to `thread_start`: the manifest's own spelling as a Rust
