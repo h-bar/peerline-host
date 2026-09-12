@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use peerline_contract_spec::{
     Directory, ErrorDef, Field, Manifest, OpDef, OpKind, Prose, Role, Scalar, Schema, Tagging,
-    TypeDef, UnionVariant, Value, pascal_case,
+    TypeDef, UnionVariant, Value, pascal_case, screaming_case,
 };
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::{format_ident, quote};
@@ -73,6 +73,14 @@ pub(crate) struct Bindings {
     /// when the clause is absent, which is the case for every crate that
     /// has no business linking `ts_rs`.
     typescript: BTreeSet<String>,
+    /// Whether the call site asked for the runtime stubs — the producer
+    /// trait, its registration, and the client.
+    ///
+    /// A call-site clause and not something read off the manifest, for the
+    /// same reason `typescript` is one: the stubs name `::peerline` paths,
+    /// and whether this crate has a peer runtime linked at all is a fact
+    /// about *this* build. See [`runtime`].
+    runtime: bool,
 }
 
 impl Bindings {
@@ -87,6 +95,7 @@ impl Bindings {
         manifest: &Manifest,
         imports: &[(LitStr, TokenStream)],
         typescript: &[Ident],
+        runtime: bool,
     ) -> syn::Result<Self> {
         let span = Span::call_site();
         let mut given: BTreeMap<String, (&LitStr, &TokenStream)> = BTreeMap::new();
@@ -134,9 +143,26 @@ impl Bindings {
 
         let exported = resolve_typescript(manifest, &paths, typescript)?;
 
+        // A vocabulary has no ops, so there is nothing for a producer to
+        // implement and nothing for a client to call. Saying `runtime` at
+        // such a call site is a mistake about which manifest is being
+        // expanded, and silently generating nothing would leave it to be
+        // found as a missing trait somewhere else.
+        if runtime && manifest.role == Role::Vocabulary {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "`{}` is a vocabulary: it declares shapes and no ops, so there is no producer \
+                     to implement and no client to call; drop the `runtime` clause",
+                    manifest.id()
+                ),
+            ));
+        }
+
         Ok(Self {
             paths,
             typescript: exported,
+            runtime,
         })
     }
 
@@ -248,30 +274,130 @@ fn collect_named(schema: &Schema, out: &mut Vec<String>) {
     }
 }
 
+/// Everything this generator knows about one [`Scalar`], in one row.
+///
+/// # Why there is a table, and why it is here rather than in the spec
+///
+/// The manifest's eleven scalar keywords used to be matched on in five
+/// separate places — the Rust type, the Rust name in a doc line, the
+/// TypeScript override, the Rust literal a default becomes, and the
+/// validator's check of a default's JSON. Four of those are the *same
+/// question* asked four times ("what does this keyword become in the targets
+/// this crate emits?"), and four parallel matches is four chances for a
+/// twelfth keyword to be added to three of them. So they are one table, and
+/// a new scalar is one row in it.
+///
+/// It lives in this crate and not in `peerline-contract-spec` on purpose.
+/// The spec crate's own stance is that it "does not generate anything", and
+/// that anything which only makes sense to one language belongs at that
+/// language's generator rather than in the shared file. `::std::path::PathBuf`
+/// and `unknown` are exactly that: they would be a Rust-shaped and a
+/// TypeScript-shaped hole in the crate whose whole claim is that it has
+/// neither. A Python generator reads the same eleven keywords and writes its
+/// own table, which is the arrangement working rather than duplication.
+///
+/// The fifth match — `validate::check_scalar_value` — stays in the spec, and
+/// is not this question at all: "is this JSON a legal value of this keyword"
+/// is a fact about the manifest, answered identically for every target, and
+/// a checker in another language needs it without needing any of these
+/// columns.
+struct ScalarTarget {
+    /// The Rust type the keyword generates, spelled absolutely because the
+    /// expansion lands in a crate whose imports this macro cannot see.
+    rust: &'static str,
+    /// The same type as a doc line names it: what a caller writes, without
+    /// the leading `::` and the module path nobody says out loud.
+    doc: &'static str,
+    /// The TypeScript this maps to when `ts_rs` reading the Rust alone would
+    /// get it wrong, and `None` when it would not.
+    ///
+    /// Two rows carry one. A safe integer generates an `i64`, which `ts_rs`
+    /// maps to `bigint` — correct for a value that may exceed the safe range
+    /// and wrong for one the contract says cannot. Passthrough JSON generates
+    /// a `serde_json::Value`, which `ts_rs` maps to a named `JsonValue`
+    /// import; the contract says the value is uninterpreted, and `unknown` is
+    /// how TypeScript spells that. Everything else is left alone
+    /// deliberately: `i64` really is a `bigint`, and saying so is the warning
+    /// the keyword exists to give.
+    ts: Option<&'static str>,
+    /// How a manifest default of this type becomes a Rust expression. Grouped
+    /// rather than per-scalar because seven of the eleven keywords produce a
+    /// bare numeric literal and differ only in which `serde_json` accessor
+    /// reads them.
+    literal: LiteralForm,
+}
+
+/// The shape of the Rust expression a manifest default turns into.
+///
+/// A small closed set rather than a second match on [`Scalar`]: the question
+/// "how is this value written as Rust" has six answers across eleven
+/// keywords, and naming the six is what stops the seventh being invented by
+/// accident.
+#[derive(Clone, Copy)]
+enum LiteralForm {
+    /// `true` / `false`, written as itself.
+    Bool,
+    /// A `String`, built from a string literal.
+    Text,
+    /// A `PathBuf`, built from a string literal.
+    Path,
+    /// A double, written as an unsuffixed float literal.
+    Float,
+    /// A signed integer, written as an unsuffixed integer literal.
+    Signed,
+    /// An unsigned integer, written as an unsuffixed integer literal.
+    Unsigned,
+    /// Passthrough JSON: the one form with no Rust literal at all, so the
+    /// JSON text is emitted and parsed once at run time.
+    Json,
+}
+
+/// The one place the manifest's spelling of a scalar becomes this target's.
+fn scalar_target(scalar: Scalar) -> ScalarTarget {
+    let row = |rust, doc, ts, literal| ScalarTarget {
+        rust,
+        doc,
+        ts,
+        literal,
+    };
+    match scalar {
+        Scalar::String => row("::std::string::String", "String", None, LiteralForm::Text),
+        Scalar::Bool => row("bool", "bool", None, LiteralForm::Bool),
+        Scalar::I32 => row("i32", "i32", None, LiteralForm::Signed),
+        Scalar::U32 => row("u32", "u32", None, LiteralForm::Unsigned),
+        // A safe integer is the same Rust as the wide one: the bound is a
+        // promise about the value, and Rust's narrowest exact integer that
+        // holds it is still 64 bits. What the keyword buys is that a target
+        // whose numbers are doubles can be told the truth — which is the
+        // `ts` column — and that a generator can annotate on the strength of
+        // the file instead of a remembered per-field attribute.
+        Scalar::I53 => row("i64", "i64", Some("number"), LiteralForm::Signed),
+        Scalar::U53 => row("u64", "u64", Some("number"), LiteralForm::Unsigned),
+        Scalar::I64 => row("i64", "i64", None, LiteralForm::Signed),
+        Scalar::U64 => row("u64", "u64", None, LiteralForm::Unsigned),
+        Scalar::F64 => row("f64", "f64", None, LiteralForm::Float),
+        Scalar::Path => row("::std::path::PathBuf", "PathBuf", None, LiteralForm::Path),
+        Scalar::Json => row(
+            "::serde_json::Value",
+            "serde_json::Value",
+            Some("unknown"),
+            LiteralForm::Json,
+        ),
+    }
+}
+
 /// The TypeScript a schema maps to, in the cases where `ts_rs` reading the
-/// Rust alone would get it wrong.
-///
-/// Two of them, and both are the manifest knowing something the Rust type no
-/// longer carries. A safe integer generates an `i64`, which `ts_rs` maps to
-/// `bigint` — correct for a value that may exceed the safe range and wrong
-/// for one the contract says cannot. Passthrough JSON generates a
-/// `serde_json::Value`, which `ts_rs` maps to a named `JsonValue` import;
-/// the contract says the value is uninterpreted, and `unknown` is how
-/// TypeScript spells that.
-///
-/// Everything else is left alone deliberately: `i64` really is a `bigint` in
-/// TypeScript, and saying so is the warning the keyword exists to give.
+/// Rust alone would get it wrong. The leaf answer is the table's `ts` column;
+/// what is here is the way a list or a nullable wraps it.
 fn ts_override(schema: &Schema) -> Option<String> {
     match schema {
         Schema::Array { array } => ts_override(array).map(|inner| format!("Array<{inner}>")),
         Schema::Nullable { nullable } => {
             ts_override(nullable).map(|inner| format!("{inner} | null"))
         }
-        Schema::Named(name) => match Scalar::from_keyword(name) {
-            Some(Scalar::I53 | Scalar::U53) => Some("number".to_owned()),
-            Some(Scalar::Json) => Some("unknown".to_owned()),
-            _ => None,
-        },
+        Schema::Named(name) => Scalar::from_keyword(name)
+            .and_then(|scalar| scalar_target(scalar).ts)
+            .map(ToOwned::to_owned),
     }
 }
 
@@ -320,6 +446,10 @@ pub(crate) fn contract(
         Role::Vocabulary => TokenStream::new(),
         Role::Contract => ops(manifest, span)?,
     };
+    let stubs = match (manifest.role, bindings.runtime) {
+        (Role::Contract, true) => runtime(manifest, bindings, span)?,
+        _ => TokenStream::new(),
+    };
     let errors = errors(manifest, span);
     let shapes = manifest
         .types
@@ -333,6 +463,7 @@ pub(crate) fn contract(
         #ops
         #errors
         #(#shapes)*
+        #stubs
         #tracker
     })
 }
@@ -404,6 +535,28 @@ fn ops(manifest: &Manifest, span: Span) -> syn::Result<TokenStream> {
             .into(),
     ]);
 
+    // The declaration every producer of this contract wrote out by hand, and
+    // wrote out the same way. `Produced::with_ops(CONTRACT, VERSION,
+    // OPS.iter().copied())` is three facts the expansion already holds, so a
+    // producer restating them is three chances to hand a coordinator a name,
+    // a version or an op list that is not the one it registers handlers for.
+    //
+    // Unconditional, unlike the runtime stubs below it, and for a reason
+    // worth stating: this names `::peerline_contract`, which the expansion
+    // *already* requires — `OP_KINDS` above is typed
+    // `::peerline_contract::spec::OpKind`. Any crate that can compile the op
+    // table can compile this, so it costs no call site a new dependency. The
+    // stubs are different: they name `::peerline`, which nothing else in the
+    // expansion does.
+    let produced_docs = doc_lines(&[
+        "This contract as a producer declares it, with its full op list.".into(),
+        String::new(),
+        "What a `Service::produces` returns. Written here rather than at each producer because \
+         the contract name, the version and the op list are all in this expansion already, and a \
+         producer restating them is a producer that can restate one of them wrongly."
+            .into(),
+    ]);
+
     Ok(quote! {
         #(#consts)*
 
@@ -412,6 +565,12 @@ fn ops(manifest: &Manifest, span: Span) -> syn::Result<TokenStream> {
 
         #kinds_docs
         pub const OP_KINDS: &[(&str, ::peerline_contract::spec::OpKind)] = &[#(#kinds),*];
+
+        #produced_docs
+        #[must_use]
+        pub fn produced() -> ::peerline_contract::Produced {
+            ::peerline_contract::Produced::with_ops(CONTRACT, VERSION, OPS.iter().copied())
+        }
     })
 }
 
@@ -446,6 +605,377 @@ fn op_summary(op: &OpDef, errors: &BTreeMap<&str, &ErrorDef>) -> Vec<String> {
         lines.push(format!("Raises: {}.", raised.join(", ")));
     }
     lines
+}
+
+// ---------------------------------------------------------------------------
+// The runtime stubs
+// ---------------------------------------------------------------------------
+
+/// The producer trait, the registration that wires it, and the consumer's
+/// client — the three things every implementor of a contract wrote by hand.
+///
+/// # What this is for
+///
+/// `OP_KINDS` was added because a producer that registers a stream op with
+/// `on_request` answers a `call_stream` with a kind mismatch at runtime, on
+/// the first call, in a way no argument or result schema catches. But a table
+/// only helps whoever writes the test that reads it, and the hand-wiring it
+/// was meant to guard — eight `peer.on_request(ops::OP_X, …)` lines and one
+/// `on_stream_request` — is exactly the code nobody writes a test for. So the
+/// registration is generated from the same table instead: there is no line at
+/// which a producer *could* name the wrong call, because the producer does
+/// not name a call at all. The failure `OP_KINDS` was created to catch stops
+/// being catchable and starts being unwritable.
+///
+/// The same argument applies at the other end, one step weaker. A consumer
+/// passing `ops::OP_WATCH` to `peer.call` rather than `call_stream` is the
+/// mirror image of the same mistake, and the generated client has one method
+/// per op with the op's own kind baked into it.
+///
+/// # Why it is opt-in, and what a call site must have for it
+///
+/// Everything else this macro emits resolves against `::serde`,
+/// `::serde_json` and `::peerline_contract` — the dependencies any crate
+/// using the macro has by construction. The stubs do not: they name
+/// `::peerline::runtime::Peer`, `::peerline::runtime::StreamSender` and
+/// `::peerline::wire::RpcError`, and a crate that only wants the *types* of a
+/// contract — a dashboard, a CLI, a crate that re-encodes a manifest's shapes
+/// onto some other wire — has no peer runtime and should not grow one.
+///
+/// A proc macro has no `$crate`, so there is no way to emit a path that
+/// resolves wherever this crate happens to be named; the path is whatever the
+/// *invoking* crate calls its dependency. That is a constraint, not a choice,
+/// and the honest response to it is to make the clause explicit rather than
+/// to emit paths that may or may not resolve. So:
+///
+/// ```ignore
+/// peerline_contract::contract!("demo.thing/2" in "contracts", runtime);
+/// ```
+///
+/// and the invoking crate needs `peerline = { version = "…", features =
+/// ["runtime"] }` under exactly that name. `::peerline` rather than
+/// `::peerline_host` because `peerline-host` does not re-export `Peer` and
+/// should not have to: a producer of a contract needs a peer, not a host, and
+/// the two crates that implement contracts without being hosts would
+/// otherwise link a transport stack to get at a type alias.
+///
+/// # The three generated names
+///
+/// For `demo.thing`: the trait `DemoThingService`, the function
+/// `register_demo_thing_handlers`, and the client `DemoThingClient`; plus one
+/// `…Items` sink per stream op. A manifest that declares a shape by one of
+/// those names is rejected here rather than left to collide in the expansion,
+/// because the collision otherwise lands as a duplicate-definition error on a
+/// line that mentions neither the manifest nor the clause.
+fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<TokenStream> {
+    let types = manifest.type_map();
+    let errors = manifest.error_map();
+    let base = pascal_case(&manifest.contract);
+
+    let trait_name = reserved(
+        &format!("{base}Service"),
+        "the producer trait",
+        &types,
+        span,
+    )?;
+    let client_name = reserved(&format!("{base}Client"), "the client", &types, span)?;
+    let register_name = format_ident!(
+        "register_{}_handlers",
+        snake_case(&manifest.contract),
+        span = span
+    );
+
+    let mut methods = Vec::new();
+    let mut registrations = Vec::new();
+    let mut sinks = Vec::new();
+    let mut calls = Vec::new();
+
+    for op in &manifest.ops {
+        let short = op.short_name(&manifest.contract);
+        let konst = ident(&peerline_contract_spec::const_name("OP", short), span)?;
+        let method = ident(&snake_case(short), span)?;
+        let prose = docs(&op.description);
+        let summary = doc_lines(&op_summary(op, &errors));
+
+        // An op with no `args` still travels as one: peerline rejects params
+        // that are not a JSON object, so the empty argument is an empty
+        // object rather than nothing. A map is what both ends of that spell:
+        // it decodes from `{}` on the way in and encodes to `{}` on the way
+        // out, where a `()` would insist on `null` and be refused.
+        let args_ty = match &op.args {
+            Some(args) => rust_type(args, bindings, span),
+            None => quote! { ::serde_json::Map<::std::string::String, ::serde_json::Value> },
+        };
+        let (takes, passes, sends) = match &op.args {
+            Some(_) => (
+                quote! { , args: #args_ty },
+                quote! { args },
+                quote! { , args: &#args_ty },
+            ),
+            None => (TokenStream::new(), TokenStream::new(), TokenStream::new()),
+        };
+        let client_args = match &op.args {
+            Some(_) => quote! { args },
+            None => quote! { &::serde_json::Map::new() },
+        };
+
+        match op.kind {
+            OpKind::Unary => {
+                // Absent `result` means the op answers nothing at all, every
+                // time — which is `()`, encoded as JSON null, and not an
+                // absent value a caller has to test for.
+                let result_ty = match &op.result {
+                    Some(result) => rust_type(result, bindings, span),
+                    None => quote! { () },
+                };
+                methods.push(quote! {
+                    #prose
+                    #summary
+                    fn #method(&self #takes)
+                    -> impl ::core::future::Future<
+                        Output = ::core::result::Result<#result_ty, ::peerline::wire::RpcError>,
+                    > + ::core::marker::Send;
+                });
+                registrations.push(quote! {
+                    {
+                        let imp = ::std::sync::Arc::clone(&imp);
+                        peer.on_request(#konst, move |args: #args_ty| {
+                            let imp = ::std::sync::Arc::clone(&imp);
+                            async move { imp.#method(#passes).await }
+                        });
+                    }
+                });
+                calls.push(quote! {
+                    #prose
+                    #summary
+                    pub async fn #method(&self #sends)
+                    -> ::core::result::Result<#result_ty, ::peerline::runtime::Error> {
+                        self.peer.call(#konst, #client_args).await
+                    }
+                });
+            }
+            OpKind::Stream => {
+                let Some(item) = &op.item else {
+                    return Err(syn::Error::new(
+                        span,
+                        format!("`{}` is a stream op with no `item`", op.name),
+                    ));
+                };
+                let item_ty = rust_type(item, bindings, span);
+                let sink = reserved(
+                    &format!("{}Items", pascal_case(short)),
+                    &format!("the item sink for `{}`", op.name),
+                    &types,
+                    span,
+                )?;
+                let sink_docs = doc_lines(&[
+                    format!("Where a producer puts the items of `{}`.", op.name),
+                    String::new(),
+                    format!(
+                        "A `StreamSender` with the manifest's item type on it. The bare sender \
+                         takes anything serialisable, so a producer that sent the wrong shape — \
+                         or the right shape from the wrong op — would be found by whatever \
+                         decoded it, at the consumer. Here it is `{}` or it is a compile error.",
+                        rust_type_name(item)
+                    ),
+                ]);
+                sinks.push(quote! {
+                    #sink_docs
+                    pub struct #sink(::peerline::runtime::StreamSender);
+
+                    impl #sink {
+                        #[doc = " Put the manifest's item type on a raw sender."]
+                        #[doc = ""]
+                        #[doc = " The registration below does this; it is public so that a test can \
+                                 drive the producer trait without a peer."]
+                        #[must_use]
+                        pub fn new(sender: ::peerline::runtime::StreamSender) -> Self {
+                            Self(sender)
+                        }
+
+                        #[doc = " Emit one item."]
+                        #[doc = ""]
+                        #[doc = " Fails only when the consumer has gone — it cancelled the stream, \
+                                 or the connection closed. That is not an error to raise out of the \
+                                 op: there is nobody left to raise it to."]
+                        pub fn send(&self, item: &#item_ty)
+                        -> ::core::result::Result<(), ::peerline::runtime::Error> {
+                            self.0.send_item(item)
+                        }
+
+                        #[doc = " Whether the consumer has already gone."]
+                        #[must_use]
+                        pub fn is_cancelled(&self) -> bool {
+                            self.0.is_cancelled()
+                        }
+
+                        #[doc = " Resolves when the consumer drops its end."]
+                        #[doc = ""]
+                        #[doc = " A producer reading from somewhere expensive selects on this, so \
+                                 that a cancelled stream stops the work rather than only the \
+                                 sending."]
+                        pub async fn cancelled(&self) {
+                            self.0.cancelled().await;
+                        }
+
+                        #[doc = " The sender underneath, for the things this wrapper does not say."]
+                        #[must_use]
+                        pub fn sender(&self) -> &::peerline::runtime::StreamSender {
+                            &self.0
+                        }
+                    }
+                });
+                methods.push(quote! {
+                    #prose
+                    #summary
+                    fn #method(&self #takes, items: #sink)
+                    -> impl ::core::future::Future<
+                        Output = ::core::result::Result<(), ::peerline::wire::RpcError>,
+                    > + ::core::marker::Send;
+                });
+                registrations.push(quote! {
+                    {
+                        let imp = ::std::sync::Arc::clone(&imp);
+                        peer.on_stream_request(
+                            #konst,
+                            move |args: #args_ty, sender: ::peerline::runtime::StreamSender| {
+                                let imp = ::std::sync::Arc::clone(&imp);
+                                async move { imp.#method(#passes, #sink::new(sender)).await }
+                            },
+                        );
+                    }
+                });
+                calls.push(quote! {
+                    #prose
+                    #summary
+                    pub fn #method(&self #sends)
+                    -> ::core::result::Result<
+                        ::peerline::runtime::StreamReceiver<#item_ty>,
+                        ::peerline::runtime::Error,
+                    > {
+                        self.peer.call_stream(#konst, #client_args)
+                    }
+                });
+            }
+        }
+    }
+
+    let trait_docs = doc_lines(&[
+        format!("What a producer of `{}` answers.", manifest.contract),
+        String::new(),
+        "One method per op, taking and returning the manifest's own shapes. A stream op takes an \
+         item sink instead of returning a result, because that is what a stream is: the items go \
+         out as they are found, and the return value says only whether it ended well."
+            .into(),
+        String::new(),
+        "An implementation writes `async fn` for each of these; the future is spelled out here \
+         rather than as `async fn` in the trait so that it can be required to be `Send`, which is \
+         what lets the registration hand it to a peer."
+            .into(),
+    ]);
+    let register_docs = doc_lines(&[
+        format!(
+            "Register every op of `{}` on `peer`, each with the kind the manifest declares.",
+            manifest.contract
+        ),
+        String::new(),
+        "This is the whole reason the trait exists. Wired by hand, a stream op registered with \
+         `on_request` answers a `call_stream` with a kind mismatch at run time, on the first \
+         call, and no argument or result schema would have caught it. Here there is no call to \
+         name: the kind comes from the same manifest the op constant does."
+            .into(),
+        String::new(),
+        "Call it from `Service::register`, which runs once per connection — so the `Arc` is \
+         cloned per connection and the implementation is shared, not copied."
+            .into(),
+    ]);
+    let client_docs = doc_lines(&[
+        format!("A typed caller for `{}`.", manifest.contract),
+        String::new(),
+        "One method per op: `call` for a unary op, `call_stream` for a stream one, with the \
+         argument and result shapes the manifest declares. What it replaces is a consumer \
+         passing a bare `&str` op name and naming the result type at the call site, where \
+         nothing checks either against the contract."
+            .into(),
+    ]);
+
+    Ok(quote! {
+        #(#sinks)*
+
+        #trait_docs
+        pub trait #trait_name: ::core::marker::Send + ::core::marker::Sync + 'static {
+            #(#methods)*
+        }
+
+        #register_docs
+        pub fn #register_name<I: #trait_name>(
+            peer: &::peerline::runtime::Peer,
+            imp: ::std::sync::Arc<I>,
+        ) {
+            #(#registrations)*
+        }
+
+        #client_docs
+        #[derive(::core::clone::Clone)]
+        pub struct #client_name {
+            peer: ::peerline::runtime::Peer,
+        }
+
+        impl #client_name {
+            #[doc = " Call this contract over an established peer."]
+            #[doc = ""]
+            #[doc = " A `Peer` is a cheap handle, so this takes one by value rather than \
+                     borrowing: a client that outlives the expression that made it is the \
+                     normal case."]
+            #[must_use]
+            pub fn new(peer: ::peerline::runtime::Peer) -> Self {
+                Self { peer }
+            }
+
+            #[doc = " The peer underneath, for ops this contract does not declare."]
+            #[must_use]
+            pub fn peer(&self) -> &::peerline::runtime::Peer {
+                &self.peer
+            }
+
+            #(#calls)*
+        }
+    })
+}
+
+/// A name this expansion needs for itself, checked against the manifest's own.
+///
+/// The manifest names shapes and this generator names three more things in
+/// the same namespace. A collision is a real possibility — `…Client` and
+/// `…Items` are ordinary words — and left alone it lands as a
+/// duplicate-definition error on a generated line, which says nothing about
+/// the manifest or the clause that asked for it.
+fn reserved(
+    name: &str,
+    what: &str,
+    types: &BTreeMap<&str, &TypeDef>,
+    span: Span,
+) -> syn::Result<Ident> {
+    if types.contains_key(name) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "the `runtime` clause generates `{name}` for {what}, and this manifest already \
+                 declares a shape called `{name}`; rename the shape, or drop the clause"
+            ),
+        ));
+    }
+    Ok(format_ident!("{}", name, span = span))
+}
+
+/// `thread.start` to `thread_start`: the manifest's own spelling as a Rust
+/// member name.
+///
+/// Routed through [`screaming_case`] rather than written again, so that the
+/// dots-and-dashes rule has one definition and a name that is `THREAD_START`
+/// as a constant is `thread_start` as a method.
+fn snake_case(name: &str) -> String {
+    screaming_case(name).to_lowercase()
 }
 
 fn errors(manifest: &Manifest, span: Span) -> TokenStream {
@@ -949,22 +1479,28 @@ fn default_expr(
     }
 }
 
+/// The manifest's default for a scalar field, as the Rust expression it is.
+///
+/// Matches on the table's `literal` column rather than on the keyword: seven
+/// of the eleven are a bare numeric literal differing only in which
+/// `serde_json` accessor reads them, and naming the six real answers is what
+/// stops a twelfth keyword quietly acquiring a seventh.
 fn scalar_default(value: &Value, scalar: Scalar) -> TokenStream {
-    match scalar {
-        Scalar::Bool => {
+    match scalar_target(scalar).literal {
+        LiteralForm::Bool => {
             let flag = value.as_bool().expect("validated as a bool");
             quote! { #flag }
         }
-        Scalar::String => {
+        LiteralForm::Text => {
             let text = value.as_str().expect("validated as a string");
             quote! { ::std::string::String::from(#text) }
         }
-        Scalar::Path => {
+        LiteralForm::Path => {
             let text = value.as_str().expect("validated as a string");
             quote! { ::std::path::PathBuf::from(#text) }
         }
-        Scalar::Json => {
-            // The only scalar whose value has no Rust literal, so it is
+        LiteralForm::Json => {
+            // The only form whose value has no Rust literal, so it is
             // written as the JSON it is and parsed once. Validation accepted
             // anything here, so nothing but the parse could fail, and the
             // text came out of a parsed document.
@@ -974,17 +1510,17 @@ fn scalar_default(value: &Value, scalar: Scalar) -> TokenStream {
                     .expect("the manifest's default is JSON this file was parsed from")
             }
         }
-        Scalar::F64 => {
+        LiteralForm::Float => {
             let number = value.as_f64().expect("validated as a number");
             let literal = Literal::f64_unsuffixed(number);
             quote! { #literal }
         }
-        Scalar::I32 | Scalar::I53 | Scalar::I64 => {
+        LiteralForm::Signed => {
             let number = value.as_i64().expect("validated as an integer");
             let literal = Literal::i64_unsuffixed(number);
             quote! { #literal }
         }
-        Scalar::U32 | Scalar::U53 | Scalar::U64 => {
+        LiteralForm::Unsigned => {
             let number = value.as_u64().expect("validated as an integer");
             let literal = Literal::u64_unsuffixed(number);
             quote! { #literal }
@@ -1252,21 +1788,14 @@ fn rust_type(schema: &Schema, bindings: &Bindings, span: Span) -> TokenStream {
             quote! { ::core::option::Option<#inner> }
         }
         Schema::Named(name) => match Scalar::from_keyword(name) {
-            Some(Scalar::String) => quote! { ::std::string::String },
-            Some(Scalar::Bool) => quote! { bool },
-            Some(Scalar::I32) => quote! { i32 },
-            Some(Scalar::U32) => quote! { u32 },
-            // A safe integer is the same Rust as the wide one: the bound
-            // is a promise about the value, and Rust's narrowest exact
-            // integer that holds it is still 64 bits. What the keyword
-            // buys is that a target whose numbers are doubles can be told
-            // the truth, and that a generator can annotate on the strength
-            // of the file instead of a remembered per-field attribute.
-            Some(Scalar::I53) | Some(Scalar::I64) => quote! { i64 },
-            Some(Scalar::U53) | Some(Scalar::U64) => quote! { u64 },
-            Some(Scalar::F64) => quote! { f64 },
-            Some(Scalar::Path) => quote! { ::std::path::PathBuf },
-            Some(Scalar::Json) => quote! { ::serde_json::Value },
+            // The table's `rust` column, parsed back into tokens. Written as
+            // text so that one row can carry the type, the doc spelling, the
+            // TypeScript and the literal form together; a `quote!` per arm
+            // would be a fourth match on the same eleven keywords.
+            Some(scalar) => scalar_target(scalar)
+                .rust
+                .parse()
+                .expect("the table's Rust spellings are types this crate wrote"),
             None => bindings.type_path(name, span),
         },
     }
@@ -1278,14 +1807,7 @@ fn rust_type_name(schema: &Schema) -> String {
         Schema::Array { array } => format!("Vec<{}>", rust_type_name(array)),
         Schema::Nullable { nullable } => format!("Option<{}>", rust_type_name(nullable)),
         Schema::Named(name) => match Scalar::from_keyword(name) {
-            Some(Scalar::String) => "String".into(),
-            Some(Scalar::Path) => "PathBuf".into(),
-            Some(Scalar::Json) => "serde_json::Value".into(),
-            // The doc line names the Rust spelling a caller writes, which
-            // for the safe-integer keywords is the wide type they generate.
-            Some(Scalar::I53) => "i64".into(),
-            Some(Scalar::U53) => "u64".into(),
-            Some(other) => other.keyword().into(),
+            Some(scalar) => scalar_target(scalar).doc.to_owned(),
             None => name.clone(),
         },
     }

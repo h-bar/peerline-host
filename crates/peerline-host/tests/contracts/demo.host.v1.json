@@ -1,0 +1,78 @@
+{
+  "contract": "demo.host",
+  "version": 1,
+  "description": [
+    "A contract that exists to exercise the generated runtime stubs.",
+    "",
+    "It has one op of each shape the generator has to handle differently: arguments and a result, arguments and no result, no arguments at all, and a stream. Every one of them is wired by the generated registration and called through the generated client, over a loopback peer, so that what is asserted is the running code rather than the tokens."
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "GreetArgs",
+      "description": ["Who to greet."],
+      "fields": [
+        { "name": "name", "type": "string", "description": ["The name to put in the greeting."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Greeting",
+      "description": ["What was said back."],
+      "fields": [
+        { "name": "text", "type": "string", "description": ["The greeting itself."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "CountArgs",
+      "description": ["How many items to put on the stream."],
+      "fields": [
+        { "name": "upto", "type": "u32", "description": ["The number of items to emit, starting at zero."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Tick",
+      "description": ["One item on the count stream."],
+      "fields": [
+        { "name": "n", "type": "u32", "description": ["Which item this is."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Tally",
+      "description": ["What the producer has seen so far."],
+      "fields": [
+        { "name": "greeted", "type": "u32", "description": ["How many greetings it has answered."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Fault",
+      "description": ["What went wrong, in a form a caller can branch on."],
+      "fields": [
+        { "name": "detail", "type": "string", "description": ["The particulars."] }
+      ]
+    }
+  ],
+
+  "errors": [
+    { "name": "demo_host", "code": 7701, "data": "Fault",
+      "description": ["Something a producer of this contract could not do."] }
+  ],
+
+  "ops": [
+    { "name": "demo.host.greet", "kind": "unary", "args": "GreetArgs", "result": "Greeting",
+      "errors": ["demo_host"],
+      "description": ["Greet somebody. Arguments and a result, which is the ordinary case."] },
+    { "name": "demo.host.forget", "kind": "unary", "args": "GreetArgs",
+      "description": ["Forget somebody. Answers nothing at all, which is a shape in its own right and not a result that is sometimes absent."] },
+    { "name": "demo.host.tally", "kind": "unary", "result": "Tally",
+      "description": ["How many greetings have been answered. Takes no arguments, which still travels as an empty object because peerline refuses params that are not one."] },
+    { "name": "demo.host.count", "kind": "stream", "args": "CountArgs", "item": "Tick",
+      "errors": ["demo_host"],
+      "description": ["Emit one item per number, then stop. The op whose kind a hand-written registration gets wrong."] }
+  ]
+}

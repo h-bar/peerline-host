@@ -70,7 +70,10 @@
 //! coordinator hands back. A contract's own vocabulary — its ops, their
 //! argument and result shapes, its error codes — is not spelled in Rust at
 //! all. It is a **contract manifest**: a language-neutral JSON file, described
-//! by [`spec`], from which [`contract!`] generates the Rust at compile time.
+//! by [`spec`], from which `contract!` generates the Rust at compile time.
+//! (Written as plain code rather than as a link, here and below: the macro is
+//! behind the default-on `macros` feature, and a link to something a reader's
+//! own feature set may have turned off is a link that does not resolve.)
 //!
 //! ```ignore
 //! peerline_contract::contract!("codex.server/1" in "contracts");
@@ -127,6 +130,12 @@
 
 pub mod coord;
 pub mod env;
+/// The dependency graph a set of contracts induces.
+///
+/// Here rather than in the cluster layer because two crates in two workspaces
+/// derive it from two different inputs and must agree on its shape; see the
+/// module's own docs. Pure `std`, no wire types, nothing serialized.
+pub mod graph;
 pub mod lifeline;
 pub mod manifest;
 
@@ -134,7 +143,7 @@ pub mod manifest;
 /// what makes one valid.
 ///
 /// Re-exported rather than defined here because a proc-macro crate can export
-/// nothing but macros, so [`contract!`] cannot own the format it reads — and
+/// nothing but macros, so `contract!` cannot own the format it reads — and
 /// a second copy of the format, one for the macro and one for everybody else,
 /// is exactly the drift this design exists to make impossible.
 pub use peerline_contract_spec as spec;
@@ -145,11 +154,22 @@ pub use peerline_contract_spec as spec;
 ///
 /// Takes the contract wanted and the directory holding it —
 /// `"codex.server/1" in "contracts"`, the path relative to the invoking
-/// crate's `Cargo.toml` — and two optional clauses: `imports`, binding each
-/// imported contract to the Rust module that supplies it, and `typescript`,
-/// naming the shapes a browser reads. Both are at the call site rather than
-/// in the file because both are facts about this target and not about the
-/// contract. See the crate docs.
+/// crate's `Cargo.toml` — and three optional clauses: `imports`, binding each
+/// imported contract to the Rust module that supplies it; `typescript`,
+/// naming the shapes a browser reads; and `runtime`, asking for the producer
+/// trait, its registration and the client. All three are at the call site
+/// rather than in the file because all three are facts about this target and
+/// not about the contract. See the crate docs.
+///
+/// `runtime` is the one that requires something of the invoking crate: a
+/// `peerline` dependency with its `runtime` feature, under that name. The
+/// macro's own crate docs list every dependency name a generated expansion
+/// hard-codes.
+///
+/// Behind the default-on `macros` feature. A crate that holds these types
+/// without expanding a manifest — a dashboard, a CLI, a supervisor — turns it
+/// off and stops building `syn` and `quote` for a macro it never writes.
+#[cfg(feature = "macros")]
 pub use peerline_contract_macros::contract;
 
 use std::fmt;

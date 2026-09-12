@@ -33,10 +33,16 @@
 //!   generated line naming the op's kind, argument, result and errors.
 //! - `OPS`, the flat list a producer hands to `Produced::with_ops`, and
 //!   `OP_KINDS`, the same list paired with each op's kind — see below.
+//! - `produced()`, that declaration already made: `Produced::with_ops`
+//!   applied to the three constants above, so a producer does not restate
+//!   them.
 //! - One `ERR_…` constant per declared error code.
 //! - One Rust type per named shape, with a constructor, serde derives that
 //!   reproduce the wire form exactly, and the manifest's prose on every type,
 //!   field and variant.
+//! - With the `runtime` clause, and only then: the trait a producer
+//!   implements, the function that registers it, and the client a consumer
+//!   calls through. See below.
 //!
 //! The types **are** the manifest: there is no second copy to keep in step,
 //! so a manifest edit either changes the Rust or fails to compile.
@@ -183,6 +189,107 @@
 //! the failure would otherwise land somewhere that does not mention the
 //! clause.
 //!
+//! # `runtime`, and why the dispatch is generated too
+//!
+//! `OP_KINDS` exists because unary and stream are different peerline calls,
+//! and a producer that registers a stream op with `on_request` answers a
+//! `call_stream` with a kind mismatch — at run time, on the first call. The
+//! table put the manifest's answer where a registration test could compare
+//! against it. What it could not do is make anybody write that test: the
+//! hand-wiring it guards is eight `peer.on_request(ops::OP_X, …)` lines and
+//! one `on_stream_request`, which is exactly the code nobody tests.
+//!
+//! So the wiring is generated from the same table:
+//!
+//! ```ignore
+//! peerline_contract::contract!("demo.thing/2" in "contracts", runtime);
+//!
+//! struct Thing;
+//!
+//! impl DemoThingService for Thing {
+//!     async fn open(&self, args: OpenArgs) -> Result<OpenResult, RpcError> { todo!() }
+//!     async fn watch(&self, args: WatchArgs, items: WatchItems) -> Result<(), RpcError> {
+//!         items.send(&Note::done())?;   // `Note` is the manifest's item type
+//!         Ok(())
+//!     }
+//! }
+//!
+//! // in `Service::register`:
+//! register_demo_thing_handlers(peer, self.thing.clone());
+//! ```
+//!
+//! There is now no line at which a producer *could* name the wrong call,
+//! because it names no call at all. The failure the table was created to
+//! catch stops being catchable and starts being unwritable. A consumer gets
+//! the mirror image: `DemoThingClient` has one method per op with that op's
+//! kind baked in, so a bare `&str` op name and a result type guessed at the
+//! call site both go away.
+//!
+//! Four generated names, for a contract called `demo.thing`: the trait
+//! `DemoThingService`, the registration `register_demo_thing_handlers`, the
+//! client `DemoThingClient`, and one `…Items` sink per stream op —
+//! `WatchItems` for `demo.thing.watch`. A manifest that declares a shape by
+//! one of those names is rejected at the call site rather than left to
+//! collide, because the collision would otherwise land as a
+//! duplicate-definition error on a generated line that mentions neither the
+//! manifest nor the clause.
+//!
+//! ## What the call site must have for it
+//!
+//! `peerline = { version = "…", features = ["runtime"] }`, under exactly that
+//! name. The generated code writes `::peerline::runtime::Peer`,
+//! `::peerline::runtime::StreamSender`, `::peerline::runtime::StreamReceiver`,
+//! `::peerline::runtime::Error` and `::peerline::wire::RpcError`.
+//!
+//! `::peerline` rather than `::peerline_host`: `peerline-host` does not
+//! re-export `Peer` and should not have to. A crate that produces a contract
+//! needs a peer, not a host — and a crate that implements a contract without
+//! being a host would otherwise link a whole transport stack to reach a type
+//! alias.
+//!
+//! ## Why it is a clause rather than always on
+//!
+//! `peerline-contract`, through which this macro is reached, deliberately does
+//! not depend on `peerline`: its types are read by dashboards, CLIs and
+//! non-Rust implementations that have no peer and want none. A proc macro has
+//! no `$crate`, so there is no path this crate can emit that resolves to a
+//! dependency the *invoking* crate has not declared — the path is whatever
+//! that crate named it. That is a constraint of the tool, and the honest
+//! response is to make the requirement explicit at the call site rather than
+//! to emit paths that may or may not resolve. Every invocation written before
+//! this clause existed compiles unchanged and links nothing new.
+//!
+//! ## Why `produced()` is not behind it
+//!
+//! `produced()` names `::peerline_contract`, which every expansion already
+//! requires: `OP_KINDS` is typed `::peerline_contract::spec::OpKind`. Any call
+//! site that can compile the op table can compile `produced()`, so it costs
+//! nobody a dependency and there is nothing to opt into.
+//!
+//! # The names generated code hard-codes
+//!
+//! An expansion is compiled in a crate this macro cannot see, so every path
+//! it emits is written absolutely and resolves against that crate's
+//! dependency names. Those names are therefore part of the interface, and
+//! **renaming one of these dependencies in `Cargo.toml` breaks expansion**
+//! with an error pointing at generated code rather than at the rename:
+//!
+//! - `::serde` and `::serde_json` — on every expansion. `serde` for the
+//!   derives and their attributes, `serde_json` for a `json` field's
+//!   `Value`, for a JSON default, and for the empty argument object of an op
+//!   that takes none.
+//! - `::peerline_contract` — on every expansion of a contract (not of a
+//!   vocabulary): `OP_KINDS`' element type and `produced()`'s return type.
+//! - `::ts_rs` — only where the `typescript` clause names a shape.
+//! - `::peerline` — only under the `runtime` clause.
+//!
+//! A crate that must rename one (two versions of `serde_json` in one build,
+//! say) cannot use the expansion; the way out is a `use` alias in the
+//! expanding module, or a thin crate that expands the manifest under the
+//! ordinary names and re-exports it. This is stated here rather than
+//! discovered because the failure is silent about its own cause: the compiler
+//! reports an unresolved path in code the reader did not write.
+//!
 //! # A generated set is closed, and no attribute says otherwise
 //!
 //! A generated enum or union carries no `#[non_exhaustive]`. A reader who
@@ -271,8 +378,11 @@ use syn::{Ident, LitStr, Token, braced};
 /// contracts directory is a property of the crate, not of whichever module
 /// happened to invoke the macro.
 ///
-/// Two optional clauses follow it — `imports` and `typescript`; see the
-/// crate docs for what each is for and why neither is in the manifest.
+/// Three optional clauses follow it — `imports`, `typescript` and `runtime`;
+/// see the crate docs for what each is for and why none of them is in the
+/// manifest. `runtime` is the one that requires a dependency of the invoking
+/// crate (`peerline`, with its `runtime` feature); the crate docs list every
+/// dependency name a generated expansion hard-codes.
 #[proc_macro]
 pub fn contract(input: TokenStream) -> TokenStream {
     let invocation = syn::parse_macro_input!(input as Invocation);
@@ -290,6 +400,7 @@ struct Invocation {
     directory: LitStr,
     imports: Vec<(LitStr, TokenStream2)>,
     typescript: Vec<Ident>,
+    runtime: bool,
 }
 
 impl Parse for Invocation {
@@ -299,6 +410,7 @@ impl Parse for Invocation {
         let directory: LitStr = input.parse()?;
         let mut imports = Vec::new();
         let mut typescript = Vec::new();
+        let mut runtime = false;
         let mut seen_imports = false;
         let mut seen_typescript = false;
         while !input.is_empty() {
@@ -328,12 +440,27 @@ impl Parse for Invocation {
                     seen_typescript = true;
                     typescript = parse_typescript(input)?;
                 }
+                // The only clause with nothing after it: `imports` and
+                // `typescript` carry a list because there is something to
+                // say about each entry, and this one is a yes or a no about
+                // the whole expansion. A `runtime { … }` taking a subset of
+                // the ops would be a contract half-implemented on purpose,
+                // which is not a thing the manifest can describe.
+                "runtime" => {
+                    if runtime {
+                        return Err(syn::Error::new(
+                            keyword.span(),
+                            "`runtime` is given twice; it is a flag, not a list",
+                        ));
+                    }
+                    runtime = true;
+                }
                 other => {
                     return Err(syn::Error::new(
                         keyword.span(),
                         format!(
-                            "`{other}` is not a clause of `contract!`; the two are `imports` \
-                             and `typescript`"
+                            "`{other}` is not a clause of `contract!`; the three are `imports`, \
+                             `typescript` and `runtime`"
                         ),
                     ));
                 }
@@ -344,6 +471,7 @@ impl Parse for Invocation {
             directory,
             imports,
             typescript,
+            runtime,
         })
     }
 }
@@ -436,8 +564,12 @@ fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
         )
     })?;
 
-    let bindings =
-        generate::Bindings::resolve(manifest, &invocation.imports, &invocation.typescript)?;
+    let bindings = generate::Bindings::resolve(
+        manifest,
+        &invocation.imports,
+        &invocation.typescript,
+        invocation.runtime,
+    )?;
     generate::contract(manifest, &directory, &bindings, span)
 }
 

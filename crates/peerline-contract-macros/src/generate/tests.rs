@@ -42,12 +42,20 @@ fn expand(json: &str) -> String {
         .to_string()
 }
 
+/// The same, with the `runtime` clause said — the trait, the registration
+/// and the client.
+fn expand_with_runtime(json: &str) -> String {
+    alongside(json, &[], &[], &[], true)
+        .expect("the fixture expands")
+        .to_string()
+}
+
 fn tokens(
     json: &str,
     imports: &[(&str, TokenStream)],
     typescript: &[&str],
 ) -> syn::Result<TokenStream> {
-    alongside(json, &[], imports, typescript)
+    alongside(json, &[], imports, typescript, false)
 }
 
 /// Expand `json` with `others` sitting in the same directory, which is the
@@ -58,6 +66,7 @@ fn alongside(
     others: &[&str],
     imports: &[(&str, TokenStream)],
     typescript: &[&str],
+    runtime: bool,
 ) -> syn::Result<TokenStream> {
     let mut all = vec![Manifest::parse(json).expect("the fixture is a valid manifest")];
     let wanted = all[0].id();
@@ -78,7 +87,7 @@ fn alongside(
         .iter()
         .map(|name| format_ident!("{}", name))
         .collect();
-    let bindings = Bindings::resolve(manifest, &imports, &typescript)?;
+    let bindings = Bindings::resolve(manifest, &imports, &typescript, runtime)?;
     contract(manifest, &directory, &bindings, Span::call_site())
 }
 
@@ -152,7 +161,7 @@ fn the_expansion_declares_every_manifest_in_the_directory_as_a_source_input() {
         LitStr::new("demo.vocab/1", Span::call_site()),
         quote!(::demo_vocab),
     )];
-    let bindings = Bindings::resolve(manifest, &imports, &[]).expect("mapped");
+    let bindings = Bindings::resolve(manifest, &imports, &[], false).expect("mapped");
     let tokens = contract(manifest, &directory, &bindings, Span::call_site())
         .expect("expands")
         .to_string();
@@ -300,7 +309,7 @@ fn importing(
     imports: &[(&str, TokenStream)],
     typescript: &[&str],
 ) -> syn::Result<TokenStream> {
-    alongside(json, &[&vocab("string")], imports, typescript)
+    alongside(json, &[&vocab("string")], imports, typescript, false)
 }
 
 /// The manifest says `Shared`; the call site says where Rust keeps it. That
@@ -350,6 +359,7 @@ fn an_imported_shapes_rung_is_read_from_the_manifest_that_declares_it() {
             &[&vocab(shape)],
             &[("demo.vocab/1", quote!(::demo_vocab))],
             &[],
+            false,
         )
         .expect("expands")
         .to_string()
@@ -657,9 +667,213 @@ fn the_clause_may_not_name_an_imported_shape() {
         LitStr::new("demo.vocab/1", Span::call_site()),
         quote!(::demo_vocab),
     )];
-    let err = match Bindings::resolve(&manifest, &imports, &[format_ident!("Shared")]) {
+    let err = match Bindings::resolve(&manifest, &imports, &[format_ident!("Shared")], false) {
         Ok(_) => panic!("`Shared` is imported, so the clause may not name it"),
         Err(err) => err.to_string(),
     };
     assert!(err.contains("imported from another manifest"), "{err}");
+}
+
+// --- `runtime`: the dispatch, generated from the same table as the kinds ---
+
+/// The clause is opt-in because the paths it emits are not this crate's to
+/// promise. Every invocation written before it existed must go on compiling
+/// in a crate that has never heard of `peerline`, which means the expansion
+/// may not so much as name it.
+///
+/// `::peerline_contract` is a different matter and is deliberately not
+/// covered here: `OP_KINDS` has always been typed by it, so it is a
+/// requirement the call site already met.
+#[test]
+fn nothing_names_the_peer_runtime_unless_the_clause_asks_for_it() {
+    let tokens = expansion();
+    assert!(
+        !tokens.contains(":: peerline ::"),
+        "a call site without the clause must link no peer runtime: {tokens}",
+    );
+}
+
+/// The four names the clause adds, for a contract called `demo.thing`.
+#[test]
+fn the_clause_generates_the_trait_the_registration_the_client_and_a_sink() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(tokens.contains("pub trait DemoThingService"), "{tokens}");
+    assert!(
+        tokens.contains("pub fn register_demo_thing_handlers"),
+        "{tokens}",
+    );
+    assert!(tokens.contains("pub struct DemoThingClient"), "{tokens}");
+    assert!(tokens.contains("pub struct WatchItems"), "{tokens}");
+}
+
+/// **The assertion the whole clause exists for.** `go` is unary and `watch`
+/// is a stream, and the registration has to reach for a different peerline
+/// call for each. A generator that emitted `on_request` for both would
+/// produce a producer that answers a `call_stream` with a kind mismatch at
+/// run time — the exact failure `OP_KINDS` was added to make checkable, here
+/// made unwritable instead.
+#[test]
+fn each_op_is_registered_with_the_call_its_declared_kind_names() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(tokens.contains("on_request (OP_GO"), "{tokens}");
+    assert!(tokens.contains("on_stream_request (OP_WATCH"), "{tokens}");
+    // `on_stream_request (OP_WATCH` also matches `on_request (OP_WATCH` as a
+    // substring, so the negative has to be spelled with what precedes it.
+    assert!(
+        !tokens.contains(". on_request (OP_WATCH"),
+        "a stream op registered as unary is the failure this is for: {tokens}",
+    );
+    assert!(
+        !tokens.contains("on_stream_request (OP_GO"),
+        "and the mistake runs both ways: {tokens}",
+    );
+}
+
+/// The client is the mirror image: one method per op, with that op's kind
+/// baked in, so a consumer cannot pass a stream op to `call`.
+#[test]
+fn the_client_calls_each_op_the_way_its_kind_requires() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(tokens.contains("self . peer . call (OP_GO"), "{tokens}");
+    assert!(
+        tokens.contains("self . peer . call_stream (OP_WATCH"),
+        "{tokens}",
+    );
+}
+
+/// A bare `StreamSender` takes anything serialisable, so a producer that put
+/// the wrong shape on a stream would be found by whatever decoded it, at the
+/// consumer, at run time. The sink carries the manifest's item type, which
+/// moves that to the compiler.
+#[test]
+fn the_stream_item_type_is_on_the_sink_rather_than_left_to_the_sender() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(
+        tokens.contains("pub fn send (& self , item : & Note)"),
+        "{tokens}"
+    );
+}
+
+/// An op whose manifest declares no `result` answers nothing at all, every
+/// time — which is `()`. Not an `Option`: a result that is *sometimes* there
+/// is a nullable schema, and the format already distinguishes the two.
+#[test]
+fn an_op_with_no_result_returns_nothing_rather_than_an_option() {
+    let tokens = expand_with_runtime(FIXTURE);
+    assert!(
+        tokens.contains(":: core :: result :: Result < () , :: peerline :: wire :: RpcError >"),
+        "{tokens}",
+    );
+}
+
+/// peerline refuses params that are not a JSON object, so an op with no
+/// arguments still travels as one. A map is what both ends of that spell —
+/// `()` would insist on `null` and be refused before the handler ran.
+#[test]
+fn an_op_with_no_arguments_still_travels_as_an_object() {
+    let json = FIXTURE.replace(r#""kind": "unary", "args": "Args","#, r#""kind": "unary","#);
+    let tokens = expand_with_runtime(&json);
+    assert!(
+        tokens.contains(":: serde_json :: Map :: new ()"),
+        "{tokens}"
+    );
+}
+
+/// `…Client` and `…Items` are ordinary words, and a manifest is free to have
+/// declared one. Left alone the collision lands as a duplicate definition on
+/// a generated line that mentions neither the manifest nor the clause.
+#[test]
+fn a_shape_named_like_a_generated_name_is_rejected_at_the_call_site() {
+    let json = FIXTURE.replace(r#""name": "Level""#, r#""name": "DemoThingClient""#);
+    let err = alongside(&json, &[], &[], &[], true)
+        .expect_err("the name is taken")
+        .to_string();
+    assert!(err.contains("already declares a shape"), "{err}");
+}
+
+/// A vocabulary has no ops, so there is no producer to implement and no
+/// client to call. Asking for the stubs there is a mistake about which
+/// manifest is being expanded, and generating nothing would leave it to be
+/// found as a missing trait somewhere else.
+#[test]
+fn the_clause_is_rejected_on_a_vocabulary() {
+    let err = alongside(&vocab("string"), &[], &[], &[], true)
+        .expect_err("a vocabulary has no producer")
+        .to_string();
+    assert!(err.contains("is a vocabulary"), "{err}");
+}
+
+// --- `produced()`: the declaration nobody should write twice --------------
+
+/// Unconditional, unlike the stubs: it names `::peerline_contract`, which
+/// `OP_KINDS` already required of every call site. So it costs nobody a
+/// dependency, and a producer stops restating a name, a version and an op
+/// list it could restate wrongly.
+#[test]
+fn produced_is_generated_without_any_clause_at_all() {
+    let tokens = expansion();
+    assert!(
+        tokens.contains(
+            ":: peerline_contract :: Produced :: with_ops (CONTRACT , VERSION , OPS . iter () . copied ())"
+        ),
+        "{tokens}",
+    );
+}
+
+/// Nobody produces a vocabulary, so there is nothing for it to declare.
+#[test]
+fn a_vocabulary_declares_nothing_produced() {
+    let tokens = alongside(&vocab("string"), &[], &[], &[], false)
+        .expect("expands")
+        .to_string();
+    assert!(!tokens.contains("fn produced"), "{tokens}");
+}
+
+// --- the scalar table ------------------------------------------------------
+
+/// One row per keyword, and the row is what every question about a scalar is
+/// answered from. The test that matters is that the columns agree with each
+/// other: a `doc` that is not the `rust` spelling with the module path taken
+/// off is a doc line naming a type the caller cannot write.
+#[test]
+fn every_scalar_has_a_row_whose_columns_agree() {
+    for keyword in [
+        "string", "bool", "i32", "u32", "i53", "u53", "i64", "u64", "f64", "path", "json",
+    ] {
+        let scalar = Scalar::from_keyword(keyword).expect("a keyword this crate knows");
+        let target = scalar_target(scalar);
+        assert!(
+            target.rust.ends_with(target.doc),
+            "`{keyword}` documents `{}` but generates `{}`",
+            target.doc,
+            target.rust,
+        );
+        assert!(
+            target.rust.parse::<TokenStream>().is_ok(),
+            "`{keyword}` generates `{}`, which is not a type",
+            target.rust,
+        );
+    }
+}
+
+/// The two rows where `ts_rs` reading the Rust alone gets it wrong, and the
+/// nine where it does not. A safe integer generates an `i64`, which `ts_rs`
+/// maps to `bigint` — correct for a value that may exceed the safe range and
+/// wrong for one the contract says cannot; passthrough JSON is `unknown`
+/// rather than a named import. Everything else is left alone deliberately:
+/// an `i64` really is a `bigint`, and saying so is the warning the keyword
+/// exists to give.
+#[test]
+fn only_the_scalars_rust_cannot_express_carry_a_typescript_override() {
+    let overridden: Vec<&str> = [
+        "string", "bool", "i32", "u32", "i53", "u53", "i64", "u64", "f64", "path", "json",
+    ]
+    .into_iter()
+    .filter(|k| {
+        scalar_target(Scalar::from_keyword(k).expect("a keyword"))
+            .ts
+            .is_some()
+    })
+    .collect();
+    assert_eq!(overridden, ["i53", "u53", "json"]);
 }

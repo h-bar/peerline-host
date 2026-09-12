@@ -20,6 +20,7 @@
 //! | [`OP_RESOLVE`] | unary | the ready producers of one contract |
 //! | [`OP_AWAIT_READY`] | stream | one [`Binding`] per consumed contract as it resolves |
 //! | [`OP_LIST`] | unary | the whole registry, for a dashboard or a CLI |
+//! | [`OP_WATCH`] | stream | the whole registry, then every change to it |
 //! | [`OP_BINDINGS`] | unary | the selections the coordinator actually made |
 //!
 //! **Registered and ready are distinct.** Registered means the coordinator
@@ -104,6 +105,42 @@ pub const OP_RESOLVE: &str = "coord.resolve";
 pub const OP_AWAIT_READY: &str = "coord.await_ready";
 /// Every registered instance and its state. Unary, any args -> [`Listing`].
 pub const OP_LIST: &str = "coord.list";
+/// Watch the registry. A **stream** of [`WatchEvent`]: one
+/// [`WatchEvent::Snapshot`] carrying the whole registry, then one event per
+/// change until the caller cancels. Any args.
+///
+/// This is what an observer should use instead of polling [`OP_LIST`] on a
+/// timer. The dashboard and `peerline-mon --watch` both did that at 2s, which
+/// is simultaneously too slow (a registration is visible up to two seconds
+/// after it happened) and too fast (every observer pulls the entire registry
+/// twenty-five times a minute whether or not anything changed).
+///
+/// # Why a stream and not the pubsub layer
+///
+/// peerline has a pubsub subsystem, and a registry feed looks like a topic. It
+/// is deliberately not used here, for two reasons.
+///
+/// The decisive one is the consumer: the dashboard reaches this op through
+/// `peerline-ts`, which has `callStream` and an async-iterable `StreamReceiver`
+/// but **no pubsub runtime** — its pubsub support stops at the payload types
+/// and `classify`. A pubsub-based watch would work from Rust and would have to
+/// be hand-rolled in the browser, which is exactly the demultiplexing the
+/// runtime exists to stop applications writing.
+///
+/// The second holds even where both are available. A watch is *per consumer,
+/// correlated to the request that opened it* — it begins with a snapshot taken
+/// for that caller and ends when that caller goes away — which is a stream's
+/// shape, not a topic's. [`OP_AWAIT_READY`] is the same shape and the
+/// precedent. Pubsub's shape is one producer fanning identical events out to
+/// subscribers who each missed whatever preceded them; a snapshot would have to
+/// be bolted on beside it.
+///
+/// # Cancellation
+///
+/// Dropping the receiver (or breaking out of the `for await`) cancels the
+/// stream and the coordinator forgets the watcher — the same
+/// cancel-on-drop the streaming layer gives every other stream op.
+pub const OP_WATCH: &str = "coord.watch";
 /// The producer this coordinator handed to each consumer, per contract.
 /// Unary, any args -> [`BindingGraph`].
 ///
@@ -508,6 +545,84 @@ pub struct InstanceInfo {
     /// resolve had nothing in the registry to point at.
     #[serde(default)]
     pub unreachable: Vec<String>,
+}
+
+/// One frame of the [`OP_WATCH`] stream.
+///
+/// # The shape, and why there are only three variants
+///
+/// A watch is a snapshot followed by deltas, and the registry is a map keyed by
+/// instance id — so structurally there are exactly three things a frame can
+/// say: *here is everything*, *here is one entry's current state*, *this entry
+/// is gone*. A consumer that applies them to a map by id ends up with the same
+/// [`Listing`] the coordinator holds, which is precisely what the 2s poll it
+/// replaces used to fetch whole.
+///
+/// The *causes* an observer might care about — registered, became ready,
+/// endpoints changed, started or stopped waiting — are deliberately **not**
+/// variants. They are all "this instance's state changed", they all carry the
+/// same payload, and a consumer that wants to distinguish them can: it is
+/// holding the previous [`InstanceInfo`] for that id, so `!was.ready &&
+/// is.ready` is "became ready" and needs no help from the wire. Spending a
+/// variant per cause would fix today's list of interesting transitions into the
+/// protocol, and every later one would be a breaking change to an internally
+/// tagged enum. Three structural variants close the set instead.
+///
+/// Removal carries no reason for the same reason it needs none today: the
+/// registry has exactly one way to lose an instance, the TTL sweep. If a
+/// deliberate deregistration is ever added it arrives as an additional
+/// `#[serde(default)]` field on [`Self::Remove`], not as a fourth variant.
+///
+/// # Ordering guarantees
+///
+/// [`Self::Snapshot`] is always the first frame and arrives exactly once. No
+/// change can slip between the snapshot and the first delta: the coordinator
+/// takes the snapshot and installs the watcher under a single lock acquisition,
+/// the same discipline [`OP_AWAIT_READY`]'s seed-then-park rests on. Deltas
+/// then arrive in the order the registry applied them.
+///
+/// A consumer may receive an [`Self::Upsert`] for an instance already in its
+/// map (that is the normal case — it means the entry changed) and must treat it
+/// as a replace rather than an insert. It may **not** receive a [`Self::Remove`]
+/// for an id it has never seen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WatchEvent {
+    /// The registry as it stood the moment this watch was installed. Always
+    /// the first frame of the stream, and sent exactly once.
+    Snapshot {
+        /// The whole registry — the identical value [`OP_LIST`] would have
+        /// returned at that instant, carrying the coordinator's own TTL and
+        /// address as well as its instances.
+        ///
+        /// Reusing [`Listing`] rather than restating its fields is the point:
+        /// the snapshot and the poll it replaces cannot drift into describing
+        /// the registry differently, and a consumer switching from one to the
+        /// other reuses its rendering unchanged.
+        #[serde(default)]
+        registry: Listing,
+    },
+    /// One instance's current state, in full. Sent when it registers, when it
+    /// becomes ready, when it heartbeats, when its endpoints or services
+    /// change, and when what it is waiting on changes.
+    ///
+    /// Always the complete [`InstanceInfo`], never a patch: a partial update
+    /// would need the consumer to hold a merge rule that the coordinator also
+    /// holds, and the two would eventually disagree.
+    Upsert {
+        /// The instance, exactly as [`OP_LIST`] would report it now.
+        instance: InstanceInfo,
+    },
+    /// An instance has left the registry — its TTL elapsed with no heartbeat.
+    ///
+    /// This is the event polling could not deliver promptly and the reason the
+    /// coordinator daemon runs a sweep timer while anyone is watching: expiry
+    /// is generated by the sweep, the sweep is lazy, and on a fleet that has
+    /// gone entirely silent there are no ops left to trigger one.
+    Remove {
+        /// The instance id that is gone. Drop it from your view.
+        instance: String,
+    },
 }
 
 /// Reply to [`OP_BINDINGS`] — every selection the coordinator has made and

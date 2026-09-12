@@ -9,13 +9,34 @@ readme = "README.md"
 keywords = ["rpc", "peer-to-peer", "service", "contract", "peerline"]
 categories = ["network-programming", "encoding"]
 
+[features]
+# On by default, so a crate that implements a contract writes nothing and
+# gets `contract!` exactly as it always has.
+#
+# Off is for the other half of this crate's readers. `Binding`, `Endpoints`,
+# `Produced` and the `coord.*` shapes are what a dashboard, a CLI or a
+# supervisor holds, and none of them expands a manifest — but the macro
+# re-export made every one of them build `syn`, `quote` and `proc-macro2`
+# first. A crate that only wants the types says `default-features = false`
+# and pays for none of it.
+#
+# The format itself (`spec`) is *not* behind the feature: it is ordinary
+# types, a manifest on disk is read by a conformance checker that is not a
+# macro, and the whole reason the format is its own crate is that a
+# proc-macro crate can export nothing but macros.
+default = ["macros"]
+macros = ["dep:peerline-contract-macros"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # The contract manifest format and the macro that compiles one into Rust.
 # Both are re-exported, so a crate that implements a contract names this one
 # dependency rather than three — and cannot end up with a macro and a format
-# from two different versions.
-peerline-contract-macros = { workspace = true }
+# from two different versions. That argument is why the two are declared with
+# `workspace = true` here: the versions move together with this crate's own,
+# and turning the macro off (above) drops it from the build without letting a
+# different version in.
+peerline-contract-macros = { workspace = true, optional = true }
 peerline-contract-spec = { workspace = true }
 # The manifest envelope is written by one process and read by another, so the
 # encoding is defined here once rather than spelled on each side.

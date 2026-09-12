@@ -131,7 +131,7 @@ async fn session(
 ) -> Result<(), End> {
     let (peer, driver) = peerline_transport_uds::connect(&ctx.socket)
         .await
-        .map_err(End::Retry)?;
+        .map_err(|e| End::Retry(e.to_string()))?;
 
     // The heartbeat needs to know whether this host is already serving, so
     // that an `UnknownInstance` answer can re-register *and* re-ready. Cloned
