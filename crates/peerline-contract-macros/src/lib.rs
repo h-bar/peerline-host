@@ -113,6 +113,78 @@
 //! clause is an instance of: a key that only makes sense to one language does
 //! not go in the shared file.
 //!
+//! ## `inline`, for an expansion that depends on nothing
+//!
+//! A mapping may be the word `inline` instead of a path:
+//!
+//! ```ignore
+//! peerline_contract::contract!(
+//!     "coagent.runtime/1" in "contracts",
+//!     imports {
+//!         "coagent.rpc/1"   => inline,
+//!         "coagent.util/1"  => ::coagent_util,
+//!     },
+//! );
+//! ```
+//!
+//! The expansion then generates that vocabulary's shapes **here**, out of the
+//! vocabulary's own manifest, exactly as it generates the ones this manifest
+//! declares: same prose, same serde attributes, same derives off the same
+//! ladder, same constructors and `Default`s, flat in the same module. Ops,
+//! fields and — under `runtime` — trait and client signatures name the local
+//! copies. The two modes mix freely, one import at a time, because they answer
+//! a per-vocabulary question.
+//!
+//! `inline` is read as the mode only when it is the whole mapping. A crate
+//! that really is called `inline` is `::inline`, the spelling a path anchored
+//! at a crate root has anyway; `inline::something` is refused rather than
+//! guessed at.
+//!
+//! ### What it buys, and what it costs
+//!
+//! What it buys is that the expansion depends on nothing. A crate can consume
+//! `coagent.runtime/1` without also depending on whichever crate happens to
+//! hold `coagent.rpc/1`'s Rust — which matters most where that crate exists
+//! *only* to be an import target, since inlining is what lets it stop
+//! existing. There is no version to keep in step, no published crate to
+//! coordinate a release with, and one fewer edge in the graph.
+//!
+//! What it costs is Rust identity. A path mapping gives every crate that
+//! writes it the *same* `SessionInfo`, so a value passes between them by being
+//! passed. Two inline expansions of one vocabulary give two unrelated types
+//! with identical fields, and a value crossing from one to the other has to be
+//! converted field by field — or round-tripped through serde, which is the
+//! wire form and is guaranteed to agree, because both copies were generated
+//! from the same manifest by the same generator.
+//!
+//! That applies **within one crate** as readily as between two. A crate that
+//! expands the vocabulary itself *and* inlines it into a contract has two
+//! `SessionInfo`s in scope and will be told so by name resolution; a crate
+//! that inlines the same vocabulary into two different contracts has two, in
+//! two modules, that look interchangeable and are not. Neither is an error —
+//! but neither is a thing to discover from a type mismatch, so it is here.
+//!
+//! ### Which to prefer
+//!
+//! Prefer the **path** where the vocabulary's types cross a crate boundary in
+//! Rust: a producer and a consumer in one workspace, a shared client library,
+//! anything that hands the shape onward rather than encoding it. One identity
+//! is the whole benefit of a vocabulary having a crate at all, and conversion
+//! code at every seam is the cost of giving it up.
+//!
+//! Prefer **`inline`** where the expansion is a leaf: a crate that decodes
+//! these shapes, acts on them, and answers — a CLI, a single service, a test
+//! fixture, a crate published on its own out of a workspace that cannot
+//! publish the vocabulary with it. Also where the alternative is a crate whose
+//! only content is another expansion of the same manifest, which is a
+//! dependency edge bought for nothing.
+//!
+//! The manifest is unmoved by any of this. `imports` in the file still names
+//! one contract and one version, the directory still cross-checks every
+//! imported name against the manifest that declares it, and a shape still has
+//! exactly one description. Only where the Rust comes from changes — which is
+//! the same category of fact the rest of this clause carries.
+//!
 //! ## What this clause is not
 //!
 //! It carries no correctness. Whether `coagent.rpc/1` exists, whether it
@@ -209,12 +281,14 @@
 //! If a target ever needs bundling into a shared file, that is the clause to
 //! extend.
 //!
-//! An imported shape may not be named: its Rust type belongs to the crate
-//! that expands the manifest it came from, and that crate's call site is
-//! where its TypeScript is asked for. A shape that *holds* an unexported
-//! local shape is rejected too, because `ts_rs` derives through members and
-//! the failure would otherwise land somewhere that does not mention the
-//! clause.
+//! A shape imported **to a path** may not be named: its Rust type belongs to
+//! the crate that expands the manifest it came from, and that crate's call
+//! site is where its TypeScript is asked for. A shape imported **`inline`**
+//! may be named, and is treated as what it now is — a shape this expansion
+//! declares, whose derive is therefore this call site's to ask for. A shape
+//! that *holds* an unexported shape is rejected either way, because `ts_rs`
+//! derives through members and the failure would otherwise land somewhere
+//! that does not mention the clause.
 //!
 //! # `runtime`, and why the dispatch is generated too
 //!
@@ -417,6 +491,8 @@ use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Token, braced};
 
+use crate::generate::ImportTarget;
+
 /// Expand a contract manifest into Rust.
 ///
 /// Takes the contract wanted and the directory holding it —
@@ -431,6 +507,14 @@ use syn::{Ident, LitStr, Token, braced};
 /// manifest. `runtime` is the one that requires a dependency of the invoking
 /// crate (`peerline`, with its `runtime` feature); the crate docs list every
 /// dependency name a generated expansion hard-codes.
+///
+/// An `imports` mapping is either a module path — `"coagent.rpc/1" =>
+/// ::coagent_rpc`, naming the crate that already expands that vocabulary — or
+/// the word `inline`, which generates copies of its shapes in this expansion
+/// instead. The crate docs set out what each buys and what it costs; the short
+/// of it is that a path gives every crate one Rust identity per shape, and
+/// `inline` gives an expansion that depends on nothing and values that need
+/// converting at the seam.
 #[proc_macro]
 pub fn contract(input: TokenStream) -> TokenStream {
     let invocation = syn::parse_macro_input!(input as Invocation);
@@ -446,7 +530,7 @@ pub fn contract(input: TokenStream) -> TokenStream {
 struct Invocation {
     wanted: LitStr,
     directory: LitStr,
-    imports: Vec<(LitStr, TokenStream2)>,
+    imports: Vec<(LitStr, ImportTarget)>,
     typescript: Vec<Ident>,
     runtime: bool,
 }
@@ -524,21 +608,55 @@ impl Parse for Invocation {
     }
 }
 
-/// `imports { "coagent.rpc/1" => ::coagent_rpc, … }`
-fn parse_imports(input: ParseStream) -> syn::Result<Vec<(LitStr, TokenStream2)>> {
+/// `imports { "coagent.rpc/1" => ::coagent_rpc, "demo.vocab/1" => inline, … }`
+fn parse_imports(input: ParseStream) -> syn::Result<Vec<(LitStr, ImportTarget)>> {
     let body;
     braced!(body in input);
     let mut out = Vec::new();
     while !body.is_empty() {
         let id: LitStr = body.parse()?;
         body.parse::<Token![=>]>()?;
-        out.push((id, parse_rust_path(&body)?));
+        out.push((id, parse_import_target(&body)?));
         if body.is_empty() {
             break;
         }
         body.parse::<Token![,]>()?;
     }
     Ok(out)
+}
+
+/// One mapping's right-hand side: the keyword `inline`, or a module path.
+///
+/// `inline` is recognised positionally rather than reserved, which is the
+/// treatment the rest of this parser already gives its words — `imports`,
+/// `typescript` and `runtime` are read the same way, off an [`Ident`], and
+/// none of them stops a manifest or a crate using the word elsewhere. Here it
+/// means the mode when it is the *whole* mapping: a bare identifier with no
+/// `::` before or after it.
+///
+/// That leaves a crate genuinely called `inline` reachable as `::inline`,
+/// which is how a path anchored at a crate root is spelled anyway and is what
+/// every mapping in this workspace already writes. What is refused is the one
+/// spelling whose two readings differ and where only the writer knows which
+/// was meant — `inline::something`, which is either that crate or a mode with
+/// a stray path after it.
+fn parse_import_target(input: ParseStream) -> syn::Result<ImportTarget> {
+    if !input.peek(Token![::]) {
+        let ahead = input.fork();
+        if Ident::parse_any(&ahead).is_ok_and(|word| word == "inline") {
+            let keyword = Ident::parse_any(input)?;
+            if input.peek(Token![::]) {
+                return Err(syn::Error::new(
+                    keyword.span(),
+                    "`inline` is the whole mapping — it says this expansion generates its own \
+                     copies of that vocabulary's shapes — so it cannot also head a path; write \
+                     `::inline::…` for a crate that is really called `inline`",
+                ));
+            }
+            return Ok(ImportTarget::Inline(keyword.span()));
+        }
+    }
+    Ok(ImportTarget::Path(parse_rust_path(input)?))
 }
 
 /// A `::`-separated path, taken as tokens.
@@ -619,6 +737,7 @@ fn expand(invocation: &Invocation) -> syn::Result<TokenStream2> {
 
     let bindings = generate::Bindings::resolve(
         manifest,
+        &directory,
         &invocation.imports,
         &invocation.typescript,
         invocation.runtime,
@@ -641,4 +760,107 @@ fn split_id(id: &str, span: proc_macro2::Span) -> syn::Result<(&str, u32)> {
     let (contract, version) = id.rsplit_once('/').ok_or_else(bad)?;
     let version: u32 = version.parse().map_err(|_| bad())?;
     Ok((contract, version))
+}
+
+#[cfg(test)]
+mod parse_tests {
+    //! What a call site is *allowed to write*, which is the one thing the
+    //! token tests in `generate` cannot reach: they are handed an
+    //! [`ImportTarget`] already, so the question of which characters produce
+    //! which mode is only answerable here.
+
+    use super::*;
+
+    fn invocation(src: &str) -> syn::Result<Invocation> {
+        syn::parse2::<Invocation>(src.parse().expect("the source is tokens"))
+    }
+
+    fn targets(src: &str) -> Vec<(String, String)> {
+        invocation(src)
+            .expect("this call site parses")
+            .imports
+            .iter()
+            .map(|(id, target)| {
+                let rendered = match target {
+                    ImportTarget::Inline(_) => "inline".to_string(),
+                    ImportTarget::Path(path) => path.to_string(),
+                };
+                (id.value(), rendered)
+            })
+            .collect()
+    }
+
+    /// The two modes, in one clause, which is the case the feature exists for:
+    /// a contract that hands one vocabulary onward in Rust and only decodes
+    /// the other.
+    #[test]
+    fn a_mapping_is_either_a_path_or_the_word_inline() {
+        assert_eq!(
+            targets(
+                r#""demo.thing/1" in "contracts", imports {
+                    "demo.vocab/1" => inline,
+                    "demo.other/1" => ::demo_other::shapes,
+                }"#
+            ),
+            [
+                ("demo.vocab/1".to_string(), "inline".to_string()),
+                (
+                    "demo.other/1".to_string(),
+                    ":: demo_other :: shapes".to_string()
+                ),
+            ],
+        );
+    }
+
+    /// A trailing comma is optional on the last mapping, as it was before,
+    /// and `inline` does not change that.
+    #[test]
+    fn the_last_mapping_needs_no_trailing_comma() {
+        assert_eq!(
+            targets(r#""demo.thing/1" in "contracts", imports { "demo.vocab/1" => inline }"#),
+            [("demo.vocab/1".to_string(), "inline".to_string())],
+        );
+    }
+
+    /// `inline` is a word, not a reservation. A crate really called `inline`
+    /// is reachable as `::inline`, which is the spelling every mapping in this
+    /// workspace already uses — so nothing that compiled before this feature
+    /// means something different now.
+    #[test]
+    fn a_crate_actually_called_inline_is_still_reachable() {
+        assert_eq!(
+            targets(r#""demo.thing/1" in "contracts", imports { "demo.vocab/1" => ::inline }"#),
+            [("demo.vocab/1".to_string(), ":: inline".to_string())],
+        );
+    }
+
+    /// The one spelling whose two readings differ, and where only the writer
+    /// knows which was meant. Guessing either way would be silent.
+    #[test]
+    fn inline_at_the_head_of_a_path_is_refused_rather_than_guessed_at() {
+        // `expect_err` would want `Debug` on the whole invocation, which
+        // `syn`'s `extra-traits` feature supplies and this crate does not
+        // otherwise need.
+        let err = match invocation(
+            r#""demo.thing/1" in "contracts", imports { "demo.vocab/1" => inline::shapes }"#,
+        ) {
+            Ok(_) => panic!("`inline::shapes` has two readings and must be refused"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("`inline` is the whole mapping"), "{err}");
+        assert!(err.contains("::inline"), "{err}");
+    }
+
+    /// The clauses that were here before parse exactly as they did.
+    #[test]
+    fn the_other_clauses_are_unmoved() {
+        let parsed =
+            invocation(r#""demo.thing/1" in "contracts", typescript { Args, Note }, runtime"#)
+                .expect("parses");
+        assert!(parsed.runtime);
+        assert_eq!(parsed.typescript.len(), 2);
+        assert!(parsed.imports.is_empty());
+        assert_eq!(parsed.wanted.value(), "demo.thing/1");
+        assert_eq!(parsed.directory.value(), "contracts");
+    }
 }

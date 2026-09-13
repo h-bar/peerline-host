@@ -8,7 +8,9 @@
 //!
 //! The one exception is the thing a manifest deliberately does not say,
 //! supplied at the call site and about *this* target rather than about the
-//! contract: which Rust module supplies an imported shape. See [`Bindings`].
+//! contract: where the Rust for an imported shape comes from — a module that
+//! already holds it, or a copy generated here. See [`Bindings`] and
+//! [`ImportTarget`].
 //!
 //! Everything else an imported shape needs is read out of the manifest that
 //! declares it, which the [`Directory`] has open. That is the whole of what
@@ -66,10 +68,53 @@ enum Support {
     Copy,
 }
 
+/// What a call site's `imports` clause says about one vocabulary.
+///
+/// Two answers to the one Rust question an import raises. *Which* shapes an
+/// import brings, and what they are shaped like, are the manifest's answer
+/// and are checked across the directory before this module sees either; where
+/// the Rust for them comes from is not something the manifest can say, and
+/// this is it.
+#[derive(Clone)]
+pub(crate) enum ImportTarget {
+    /// `=> ::coagent_rpc`: some crate has already expanded that vocabulary,
+    /// and this expansion names its types. One Rust identity per shape across
+    /// every crate that maps it this way, so a value passes between them
+    /// untouched.
+    Path(TokenStream),
+    /// `=> inline`: this expansion generates its own copies of the shapes, as
+    /// if the manifest had declared them. Self-contained, at the price of a
+    /// second Rust identity — see the crate docs.
+    ///
+    /// The span is the `inline` keyword's, so that a collision between a copy
+    /// and a name already taken points at the mapping that asked for it.
+    Inline(Span),
+}
+
+/// One shape an `inline` import generates here.
+struct Inlined<'a> {
+    /// The manifest that declares it. Its prose, its fields and its rung are
+    /// what the copy is generated from — exactly as a local shape's are, which
+    /// is the whole claim of the mode: a copy is not a second description.
+    declaring: &'a Manifest,
+    def: &'a TypeDef,
+}
+
 /// What the call site says about this target, which the manifest does not.
-pub(crate) struct Bindings {
-    /// Imported type name to the Rust module path supplying it.
+pub(crate) struct Bindings<'a> {
+    /// Imported type name to the Rust module path supplying it. Only the
+    /// imports mapped to a path are here: an inlined shape's Rust type is
+    /// this expansion's own, so it has no prefix and [`Bindings::type_path`]
+    /// answers for it exactly as it does for a local shape.
     paths: BTreeMap<String, TokenStream>,
+    /// The shapes an `inline` import generates here, in the order they are
+    /// emitted.
+    inlined: Vec<Inlined<'a>>,
+    /// Every type name this expansion declares, to whatever asked for it —
+    /// "this manifest", or the import that inlined it. A map rather than a
+    /// set because a collision is only diagnosable if it can name *both*
+    /// sides; see [`reserved`].
+    declares: BTreeMap<String, String>,
     /// The shapes the call site asked to be exported to TypeScript. Empty
     /// when the clause is absent, which is the case for every crate that
     /// has no business linking `ts_rs`.
@@ -84,7 +129,7 @@ pub(crate) struct Bindings {
     runtime: bool,
 }
 
-impl Bindings {
+impl<'a> Bindings<'a> {
     /// Match the call site's clauses against the manifest's imports.
     ///
     /// Both directions are checked. An import the call site did not map
@@ -92,16 +137,22 @@ impl Bindings {
     /// not declare is a mapping that silently does nothing, which is how a
     /// renamed vocabulary would go unnoticed until a type failed to resolve
     /// somewhere else.
+    ///
+    /// `dir` is here for the `inline` mappings, which need the manifests they
+    /// name open: a copy is generated out of the declaring manifest, and the
+    /// set of shapes to copy is computed from it. A path mapping needs none of
+    /// that, which is why this argument arrived with the mode.
     pub(crate) fn resolve(
-        manifest: &Manifest,
-        imports: &[(LitStr, TokenStream)],
+        manifest: &'a Manifest,
+        dir: &'a Directory,
+        imports: &[(LitStr, ImportTarget)],
         typescript: &[Ident],
         runtime: bool,
     ) -> syn::Result<Self> {
         let span = Span::call_site();
-        let mut given: BTreeMap<String, (&LitStr, &TokenStream)> = BTreeMap::new();
-        for (id, path) in imports {
-            if given.insert(id.value(), (id, path)).is_some() {
+        let mut given: BTreeMap<String, (&LitStr, &ImportTarget)> = BTreeMap::new();
+        for (id, target) in imports {
+            if given.insert(id.value(), (id, target)).is_some() {
                 return Err(syn::Error::new(
                     id.span(),
                     format!("`{}` is mapped twice", id.value()),
@@ -126,23 +177,60 @@ impl Bindings {
             }
         }
 
+        // Two name sets, because they answer two different questions and
+        // exactly one import mode is in both.
+        //
+        // `claims` is every name that means something in this scope, which a
+        // copy must not take: the manifest's own shapes, the bare names a path
+        // mapping resolves, and the copies themselves. `declares` is the
+        // narrower set the expansion actually *defines* — the manifest's own
+        // and the copies — which is what a generated name can collide with.
+        // A path mapping is in the first and not the second: `SessionInfo`
+        // means something here, but what this expansion emits for it is
+        // `::coagent_rpc::SessionInfo`, so the `runtime` clause is free to
+        // generate a `SessionInfo` of its own.
+        let mut claims: BTreeMap<String, String> = BTreeMap::new();
+        let mut declares: BTreeMap<String, String> = BTreeMap::new();
+        for def in &manifest.types {
+            claims.insert(def.name().to_string(), "this manifest".to_string());
+            declares.insert(def.name().to_string(), "this manifest".to_string());
+        }
+
+        // Two passes over the imports, because the second needs the first
+        // finished: a name an `inline` import would generate here has to be
+        // checked against every name a path mapping already supplies, and one
+        // clause may write the two in either order.
         let mut paths = BTreeMap::new();
+        let mut to_inline: Vec<(&peerline_contract_spec::Import, Span)> = Vec::new();
         for (id, import) in &declared {
-            let Some((_, path)) = given.get(id) else {
+            let Some((_, target)) = given.get(id) else {
                 return Err(syn::Error::new(
                     span,
                     format!(
-                        "the manifest imports `{id}`, and nothing here says which Rust module \
-                         supplies its types; add `imports {{ \"{id}\" => ::some_crate }}`"
+                        "the manifest imports `{id}`, and nothing here says where its Rust types \
+                         come from; add `imports {{ \"{id}\" => ::some_crate }}` to name the \
+                         module that already expands it, or `imports {{ \"{id}\" => inline }}` to \
+                         generate copies of its shapes in this expansion"
                     ),
                 ));
             };
-            for name in &import.types {
-                paths.insert(name.clone(), (*path).clone());
+            match target {
+                ImportTarget::Path(path) => {
+                    for name in &import.types {
+                        paths.insert(name.clone(), path.clone());
+                        claims.insert(name.clone(), format!("the import of `{id}`"));
+                    }
+                }
+                ImportTarget::Inline(at) => to_inline.push((import, *at)),
             }
         }
 
-        let exported = resolve_typescript(manifest, &paths, typescript)?;
+        let mut inlined = Vec::new();
+        for (import, at) in to_inline {
+            Self::inline(dir, import, at, &mut claims, &mut declares, &mut inlined)?;
+        }
+
+        let exported = resolve_typescript(manifest, &paths, &inlined, typescript)?;
 
         // A vocabulary has no ops, so there is nothing for a producer to
         // implement and nothing for a client to call. Saying `runtime` at
@@ -162,9 +250,100 @@ impl Bindings {
 
         Ok(Self {
             paths,
+            inlined,
+            declares,
             typescript: exported,
             runtime,
         })
+    }
+
+    /// Work out which shapes one `inline` mapping generates here, and claim
+    /// their names.
+    ///
+    /// # Why it is not just the names the import lists
+    ///
+    /// A path mapping needs no more than the listed names, because the types
+    /// it points at are already compiled: whatever `SessionInfo` holds is the
+    /// other crate's problem and was solved at its own call site. A copy has
+    /// no such luck — it is a `struct` written out here, and every shape its
+    /// fields name has to be a type in this scope. Those are frequently not
+    /// listed, and *should* not have to be: an import lists the shapes this
+    /// contract's wire mentions, which is contract documentation, not a
+    /// build-order declaration.
+    ///
+    /// So the set is the listed shapes and everything they reach, walked
+    /// breadth-first through [`Directory::resolve`] — which keeps going if a
+    /// vocabulary imports from another vocabulary, since the copy needs that
+    /// shape just as much and nothing at this call site could have named it.
+    ///
+    /// # What a collision means here
+    ///
+    /// A name can be claimed once. Two of the three ways to collide are
+    /// unreachable through a *listed* name — the validator already refuses a
+    /// manifest that declares and imports one name, and refuses importing one
+    /// name twice — but neither check sees the shapes a copy drags in behind
+    /// it, and those are exactly the ones nobody at the call site wrote down.
+    /// A silent collision would land as a duplicate definition on a generated
+    /// line naming neither manifest, so it is named here, on both sides.
+    fn inline(
+        dir: &'a Directory,
+        import: &peerline_contract_spec::Import,
+        at: Span,
+        claims: &mut BTreeMap<String, String>,
+        declares: &mut BTreeMap<String, String>,
+        out: &mut Vec<Inlined<'a>>,
+    ) -> syn::Result<()> {
+        let id = import.id();
+        let Some(source) = dir.get(&import.contract, import.version) else {
+            // Unreachable: `Directory::new` refused every manifest whose
+            // imports name a file it does not hold.
+            return Err(syn::Error::new(
+                at,
+                format!("the contracts directory holds no `{id}` to inline"),
+            ));
+        };
+        let mut queue: Vec<(&'a Manifest, String)> = import
+            .types
+            .iter()
+            .map(|name| (source, name.clone()))
+            .collect();
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut cursor = 0;
+        while cursor < queue.len() {
+            let (from, name) = queue[cursor].clone();
+            cursor += 1;
+            let Some((declaring, def)) = dir.resolve(from, &name) else {
+                // Validation insisted every name resolves; a scalar keyword
+                // never reaches here, because `member_names` drops them.
+                continue;
+            };
+            // The same shape reached twice — two listed types holding it, or
+            // two vocabularies importing it from a third — is one copy, not a
+            // collision.
+            if !seen.insert((declaring.id(), name.clone())) {
+                continue;
+            }
+            if let Some(prior) = claims.get(&name) {
+                return Err(syn::Error::new(
+                    at,
+                    format!(
+                        "the `inline` import of `{id}` generates a shape called `{name}` here, \
+                         and {prior} already claims that name; one name cannot be two shapes, so \
+                         rename it in `{}`, or map `{id}` to a crate rather than `inline` so its \
+                         shapes keep that crate's module to themselves",
+                        declaring.id()
+                    ),
+                ));
+            }
+            let who = format!("the `inline` import of `{id}`");
+            claims.insert(name.clone(), who.clone());
+            declares.insert(name.clone(), who);
+            for member in member_names(def) {
+                queue.push((declaring, member));
+            }
+            out.push(Inlined { declaring, def });
+        }
+        Ok(())
     }
 
     /// Whether this shape carries a `ts_rs::TS` derive.
@@ -183,20 +362,32 @@ impl Bindings {
     }
 }
 
-/// Match the `typescript` clause against the manifest's own shapes.
+/// Match the `typescript` clause against the shapes this expansion declares.
 ///
 /// Three ways the clause can be wrong, and all three are a mistake worth a
 /// message rather than a trait error inside `ts_rs`: naming a shape this
-/// manifest does not declare, naming one twice, and naming one that holds a
+/// expansion does not declare, naming one twice, and naming one that holds a
 /// shape the clause left out — the last because `ts_rs` derives recursively
 /// and a member without the derive fails to compile somewhere that does not
 /// mention the clause at all.
-fn resolve_typescript(
-    manifest: &Manifest,
+///
+/// An **inlined** import's shapes are in scope here, and deliberately: the
+/// clause's one prohibition is against naming a type that belongs to another
+/// crate's expansion, and an inlined copy belongs to this one. It is declared
+/// here, derived here, and nowhere else — so its TypeScript is asked for here
+/// too, like any other shape this expansion owns. A shape mapped to a *path*
+/// is still refused, for the unchanged reason: that type is the other crate's,
+/// and so is the derive.
+fn resolve_typescript<'a>(
+    manifest: &'a Manifest,
     imported: &BTreeMap<String, TokenStream>,
+    inlined: &[Inlined<'a>],
     asked: &[Ident],
 ) -> syn::Result<BTreeSet<String>> {
-    let local: BTreeMap<&str, &TypeDef> = manifest.type_map();
+    let mut local: BTreeMap<&str, &TypeDef> = manifest.type_map();
+    for copy in inlined {
+        local.insert(copy.def.name(), copy.def);
+    }
     let mut exported: BTreeSet<String> = BTreeSet::new();
     for name in asked {
         let key = name.to_string();
@@ -205,14 +396,18 @@ fn resolve_typescript(
                 name.span(),
                 format!(
                     "`{key}` is imported from another manifest, so the Rust type is the one that \
-                     manifest's own expansion declares; ask for its TypeScript at that call site"
+                     manifest's own expansion declares; ask for its TypeScript at that call site, \
+                     or map the import `=> inline` and the copy is this expansion's to export"
                 ),
             ));
         }
         if !local.contains_key(key.as_str()) {
             return Err(syn::Error::new(
                 name.span(),
-                format!("`{key}` is not a shape this manifest declares"),
+                format!(
+                    "`{key}` is not a shape this manifest declares, nor one an `inline` import \
+                     generates here"
+                ),
             ));
         }
         if !exported.insert(key.clone()) {
@@ -440,7 +635,7 @@ fn ts_field_attrs(field: &Field) -> TokenStream {
 pub(crate) fn contract(
     manifest: &Manifest,
     dir: &Directory,
-    bindings: &Bindings,
+    bindings: &Bindings<'_>,
     crate_dir: Option<&Path>,
     span: Span,
 ) -> syn::Result<TokenStream> {
@@ -463,6 +658,24 @@ pub(crate) fn contract(
         .iter()
         .map(|def| shape(def, manifest, dir, &types, bindings, span))
         .collect::<syn::Result<Vec<_>>>()?;
+    // The copies an `inline` mapping asked for, generated from the manifest
+    // that declares each — so the prose, the serde attributes, the rung and
+    // the constructors are the ones that manifest's own expansion would have
+    // emitted, and not a second description of the same shape.
+    //
+    // Flat, beside this manifest's own shapes rather than under a module of
+    // their own: the manifest refers to an imported shape by bare name, and a
+    // copy that a field had to reach through a path would be a copy the rest
+    // of the generator could tell apart from a local one. It cannot, and that
+    // is the mode working.
+    let copies = bindings
+        .inlined
+        .iter()
+        .map(|copy| {
+            let declared = copy.declaring.type_map();
+            shape(copy.def, copy.declaring, dir, &declared, bindings, span)
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
     let tracker = rebuild_tracker(dir, crate_dir, span);
 
     Ok(quote! {
@@ -470,6 +683,7 @@ pub(crate) fn contract(
         #ops
         #errors
         #(#shapes)*
+        #(#copies)*
         #stubs
         #tracker
     })
@@ -694,18 +908,22 @@ fn op_summary(op: &OpDef, errors: &BTreeMap<&str, &ErrorDef>) -> Vec<String> {
 /// The whole-contract registration is written in terms of the per-op ones
 /// rather than beside them, so there is exactly one wiring per op and the two
 /// entry points cannot drift.
-fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<TokenStream> {
-    let types = manifest.type_map();
+fn runtime(manifest: &Manifest, bindings: &Bindings<'_>, span: Span) -> syn::Result<TokenStream> {
     let errors = manifest.error_map();
     let base = pascal_case(&manifest.contract);
 
+    // Every shape name the expansion declares, not just the manifest's own: a
+    // copy an `inline` import generates occupies this namespace exactly as a
+    // local shape does, so a vocabulary holding a `…Client` collides with the
+    // clause in precisely the same way.
+    let declared = &bindings.declares;
     let trait_name = reserved(
         &format!("{base}Service"),
         "the producer trait",
-        &types,
+        declared,
         span,
     )?;
-    let client_name = reserved(&format!("{base}Client"), "the client", &types, span)?;
+    let client_name = reserved(&format!("{base}Client"), "the client", declared, span)?;
     let register_name = format_ident!(
         "register_{}_handlers",
         snake_case(&manifest.contract),
@@ -814,7 +1032,7 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
                 let sink = reserved(
                     &format!("{}Items", pascal_case(short)),
                     &format!("the item sink for `{}`", op.name),
-                    &types,
+                    declared,
                     span,
                 )?;
                 let sink_docs = doc_lines(&[
@@ -1049,24 +1267,31 @@ fn runtime(manifest: &Manifest, bindings: &Bindings, span: Span) -> syn::Result<
     })
 }
 
-/// A name this expansion needs for itself, checked against the manifest's own.
+/// A name this expansion needs for itself, checked against the shapes it
+/// already declares.
 ///
 /// The manifest names shapes and this generator names three more things in
 /// the same namespace. A collision is a real possibility — `…Client` and
 /// `…Items` are ordinary words — and left alone it lands as a
 /// duplicate-definition error on a generated line, which says nothing about
 /// the manifest or the clause that asked for it.
+///
+/// `declared` maps each name to whatever claimed it, because there are now
+/// two things that can: the manifest's own `types`, and an `inline` import
+/// generating a copy of a vocabulary's. The second is the one worth naming
+/// precisely — a reader told only "already declares a shape" would go looking
+/// in a file that does not contain it.
 fn reserved(
     name: &str,
     what: &str,
-    types: &BTreeMap<&str, &TypeDef>,
+    declared: &BTreeMap<String, String>,
     span: Span,
 ) -> syn::Result<Ident> {
-    if types.contains_key(name) {
+    if let Some(prior) = declared.get(name) {
         return Err(syn::Error::new(
             span,
             format!(
-                "the `runtime` clause generates `{name}` for {what}, and this manifest already \
+                "the `runtime` clause generates `{name}` for {what}, and {prior} already \
                  declares a shape called `{name}`; rename the shape, or drop the clause"
             ),
         ));

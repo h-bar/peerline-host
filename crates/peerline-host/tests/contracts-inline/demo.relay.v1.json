@@ -1,0 +1,59 @@
+{
+  "contract": "demo.relay",
+  "version": 1,
+  "description": [
+    "A contract that passes `demo.shared/1`'s envelopes about, so that two expansions of it can be put on opposite ends of one connection.",
+    "",
+    "One unary op and one stream op, both naming an imported shape in every position the generator has to resolve: an argument, a result, and a stream item. A call site may map the vocabulary to a module or ask for copies with `inline`, and the point of the test that uses this file is that the two are indistinguishable on the wire."
+  ],
+
+  "imports": [
+    {
+      "contract": "demo.shared",
+      "version": 1,
+      "types": ["Envelope"],
+      "description": ["The shape this contract passes about. `Kind` and `Body` are reached through it and deliberately not listed here: an import names the shapes this contract's own wire mentions, not everything they hold."]
+    }
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "RelayArgs",
+      "description": ["What a relay call carries."],
+      "fields": [
+        { "name": "envelope", "type": "Envelope", "description": ["The envelope to pass on."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "RelayResult",
+      "description": ["What the producer made of it."],
+      "fields": [
+        { "name": "envelope", "type": "Envelope", "description": ["The envelope as the producer saw it, sent straight back."] },
+        { "name": "seen", "type": "u32", "description": ["How many envelopes this producer has relayed, including this one."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "EchoArgs",
+      "description": ["What an echo stream is asked for."],
+      "fields": [
+        { "name": "envelope", "type": "Envelope", "description": ["The envelope to send back."] },
+        { "name": "count", "type": "u32", "description": ["How many copies of it to put on the stream."] }
+      ]
+    }
+  ],
+
+  "errors": [
+    { "name": "refused", "code": 7811, "description": ["The producer would not relay this envelope."] }
+  ],
+
+  "ops": [
+    { "name": "demo.relay.relay", "kind": "unary", "args": "RelayArgs", "result": "RelayResult",
+      "errors": ["refused"],
+      "description": ["Relay one envelope and answer with it. An imported shape in both the argument and the result."] },
+    { "name": "demo.relay.echo", "kind": "stream", "args": "EchoArgs", "item": "Envelope",
+      "description": ["Put the envelope on a stream the asked-for number of times. An imported shape as a stream item, which is the third position the generator resolves."] }
+  ]
+}

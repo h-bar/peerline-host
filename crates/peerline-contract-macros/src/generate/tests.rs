@@ -52,10 +52,21 @@ fn expand_with_runtime(json: &str) -> String {
 
 fn tokens(
     json: &str,
-    imports: &[(&str, TokenStream)],
+    imports: &[(&str, ImportTarget)],
     typescript: &[&str],
 ) -> syn::Result<TokenStream> {
     alongside(json, &[], imports, typescript, false)
+}
+
+/// `=> ::demo_vocab`, the mapping that names a module already holding the
+/// vocabulary's expansion.
+fn to(path: TokenStream) -> ImportTarget {
+    ImportTarget::Path(path)
+}
+
+/// `=> inline`, the mapping that asks for copies here.
+fn inline() -> ImportTarget {
+    ImportTarget::Inline(Span::call_site())
 }
 
 /// Expand `json` with `others` sitting in the same directory, which is the
@@ -64,7 +75,7 @@ fn tokens(
 fn alongside(
     json: &str,
     others: &[&str],
-    imports: &[(&str, TokenStream)],
+    imports: &[(&str, ImportTarget)],
     typescript: &[&str],
     runtime: bool,
 ) -> syn::Result<TokenStream> {
@@ -79,15 +90,15 @@ fn alongside(
         .iter()
         .find(|m| m.id() == wanted)
         .expect("the one just put there");
-    let imports: Vec<(LitStr, TokenStream)> = imports
+    let imports: Vec<(LitStr, ImportTarget)> = imports
         .iter()
-        .map(|(id, path)| (LitStr::new(id, Span::call_site()), path.clone()))
+        .map(|(id, target)| (LitStr::new(id, Span::call_site()), target.clone()))
         .collect();
     let typescript: Vec<Ident> = typescript
         .iter()
         .map(|name| format_ident!("{}", name))
         .collect();
-    let bindings = Bindings::resolve(manifest, &imports, &typescript, runtime)?;
+    let bindings = Bindings::resolve(manifest, &directory, &imports, &typescript, runtime)?;
     // No crate directory: an in-memory directory has no files, so there are no
     // dependency edges to anchor and nothing this argument could change.
     contract(manifest, &directory, &bindings, None, Span::call_site())
@@ -97,7 +108,7 @@ fn expansion() -> String {
     expand(FIXTURE)
 }
 
-fn rejection(json: &str, imports: &[(&str, TokenStream)]) -> String {
+fn rejection(json: &str, imports: &[(&str, ImportTarget)]) -> String {
     importing(json, imports, &[])
         .expect_err("this call site must be rejected")
         .to_string()
@@ -169,13 +180,19 @@ fn crate_with_contracts(tag: &str) -> std::path::PathBuf {
 /// Expand `demo.thing/1` out of `<root>/contracts`, anchoring the dependency
 /// edges at `crate_dir`.
 fn tracked(root: &std::path::Path, crate_dir: Option<&std::path::Path>) -> String {
+    tracked_as(root, crate_dir, to(quote!(::demo_vocab)))
+}
+
+/// The same, with the vocabulary mapped whichever way the caller wants.
+fn tracked_as(
+    root: &std::path::Path,
+    crate_dir: Option<&std::path::Path>,
+    target: ImportTarget,
+) -> String {
     let directory = Directory::load(&root.join("contracts")).expect("the two manifests agree");
     let manifest = directory.get("demo.thing", 1).expect("just written");
-    let imports = vec![(
-        LitStr::new("demo.vocab/1", Span::call_site()),
-        quote!(::demo_vocab),
-    )];
-    let bindings = Bindings::resolve(manifest, &imports, &[], false).expect("mapped");
+    let imports = vec![(LitStr::new("demo.vocab/1", Span::call_site()), target)];
+    let bindings = Bindings::resolve(manifest, &directory, &imports, &[], false).expect("mapped");
     contract(
         manifest,
         &directory,
@@ -381,7 +398,7 @@ fn vocab(shape: &str) -> String {
 /// directory beside it.
 fn importing(
     json: &str,
-    imports: &[(&str, TokenStream)],
+    imports: &[(&str, ImportTarget)],
     typescript: &[&str],
 ) -> syn::Result<TokenStream> {
     alongside(json, &[&vocab("string")], imports, typescript, false)
@@ -392,18 +409,26 @@ fn importing(
 /// never heard of a crate.
 #[test]
 fn an_imported_type_takes_the_path_the_call_site_gave_it() {
-    let tokens = importing(IMPORTING, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
-        .expect("expands")
-        .to_string();
+    let tokens = importing(
+        IMPORTING,
+        &[("demo.vocab/1", to(quote!(::demo_vocab)))],
+        &[],
+    )
+    .expect("expands")
+    .to_string();
     assert!(tokens.contains(":: demo_vocab :: Shared"), "{tokens}");
 }
 
 /// An unmapped import cannot be generated at all, and the error says what to
-/// write rather than leaving a type that does not resolve.
+/// write rather than leaving a type that does not resolve — both spellings of
+/// it, because there is no way for the macro to know which the call site
+/// wanted and offering one would make the other hard to discover.
 #[test]
 fn an_import_the_call_site_did_not_map_is_a_compile_error() {
     let err = rejection(IMPORTING, &[]);
-    assert!(err.contains("which Rust module supplies"), "{err}");
+    assert!(err.contains("where its Rust types come from"), "{err}");
+    assert!(err.contains(r#""demo.vocab/1" => ::some_crate"#), "{err}");
+    assert!(err.contains(r#""demo.vocab/1" => inline"#), "{err}");
 }
 
 /// The other direction. A mapping for something the manifest does not import
@@ -413,8 +438,8 @@ fn a_mapping_the_manifest_does_not_declare_is_rejected() {
     let err = rejection(
         IMPORTING,
         &[
-            ("demo.vocab/1", quote!(::demo_vocab)),
-            ("demo.other/1", quote!(::demo_other)),
+            ("demo.vocab/1", to(quote!(::demo_vocab))),
+            ("demo.other/1", to(quote!(::demo_other))),
         ],
     );
     assert!(err.contains("imports nothing of that name"), "{err}");
@@ -432,7 +457,7 @@ fn an_imported_shapes_rung_is_read_from_the_manifest_that_declares_it() {
         alongside(
             IMPORTING,
             &[&vocab(shape)],
-            &[("demo.vocab/1", quote!(::demo_vocab))],
+            &[("demo.vocab/1", to(quote!(::demo_vocab)))],
             &[],
             false,
         )
@@ -450,6 +475,403 @@ fn an_imported_shapes_rung_is_read_from_the_manifest_that_declares_it() {
 
     let copy = with("i53");
     assert!(copy.contains("marker :: Copy"), "{copy}");
+}
+
+// --- `=> inline`: the same shapes, generated here ---------------------------
+
+/// The mode, in one assertion. `Shared` stops being a path into somebody
+/// else's crate and becomes a `struct` in this expansion, with the
+/// vocabulary's own prose on it — read out of `demo.vocab.v1.json`, which is
+/// the only place that sentence exists.
+#[test]
+fn an_inlined_import_generates_the_vocabularys_shapes_here() {
+    let tokens = importing(IMPORTING, &[("demo.vocab/1", inline())], &[])
+        .expect("expands")
+        .to_string();
+    assert!(tokens.contains("pub struct Shared"), "{tokens}");
+    assert!(
+        !tokens.contains(":: demo_vocab"),
+        "an inlined expansion names no other crate: {tokens}",
+    );
+    assert!(
+        tokens.contains("doc = \" Whatever it holds.\""),
+        "the copy carries the vocabulary's prose, not a second description: {tokens}",
+    );
+    // And the local shape that holds it reaches the copy by bare name, which
+    // is what makes the rest of the generator unable to tell the two apart.
+    assert!(tokens.contains("pub shared : Shared"), "{tokens}");
+}
+
+/// A copy is generated the way a local shape is, not in some reduced form:
+/// the serde attributes are what the wire test at the other end depends on,
+/// and the constructor and the rung are what make it usable at all.
+#[test]
+fn a_copy_is_generated_exactly_as_a_local_shape_is() {
+    let tokens = alongside(
+        IMPORTING,
+        &[&vocab("i53")],
+        &[("demo.vocab/1", inline())],
+        &[],
+        false,
+    )
+    .expect("expands")
+    .to_string();
+    // The rung is read off the *vocabulary*, as it always was — an exact
+    // fixed-size scalar, so the copy is copyable.
+    assert!(tokens.contains("marker :: Copy"), "{tokens}");
+    assert!(
+        tokens.contains("impl Shared { # [doc = \" A `Shared`, given everything it requires.\"]"),
+        "{tokens}",
+    );
+    assert!(tokens.contains("serde :: Serialize"), "{tokens}");
+}
+
+/// The clause answers per vocabulary, so one call site may do both. That is
+/// the case worth pinning: a contract importing something it wants to hand
+/// onward in Rust and something it only decodes.
+#[test]
+fn one_clause_may_inline_one_import_and_map_another_to_a_crate() {
+    const TWO: &str = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "imports": [
+            { "contract": "demo.vocab", "version": 1, "types": ["Shared"],
+              "description": "The shape both contracts carry." },
+            { "contract": "demo.other", "version": 1, "types": ["Elsewhere"],
+              "description": "The shape that stays where it is." }
+        ],
+        "types": [
+            { "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [
+                { "name": "shared", "type": "Shared", "description": "The shared shape." },
+                { "name": "far", "type": "Elsewhere", "description": "The other one." } ] }
+        ],
+        "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." } ]
+    }"#;
+    const OTHER: &str = r#"{
+        "contract": "demo.other", "version": 1, "role": "vocabulary",
+        "description": "A vocabulary somebody else's crate expands.",
+        "types": [
+            { "form": "struct", "name": "Elsewhere", "description": "It stays put.",
+              "fields": [ { "name": "id", "type": "string",
+                            "description": "Which one." } ] }
+        ]
+    }"#;
+    let tokens = alongside(
+        TWO,
+        &[&vocab("string"), OTHER],
+        &[
+            ("demo.vocab/1", inline()),
+            ("demo.other/1", to(quote!(::demo_other))),
+        ],
+        &[],
+        false,
+    )
+    .expect("expands")
+    .to_string();
+    assert!(tokens.contains("pub struct Shared"), "{tokens}");
+    assert!(
+        tokens.contains("pub far : :: demo_other :: Elsewhere"),
+        "{tokens}"
+    );
+    assert!(
+        !tokens.contains("pub struct Elsewhere"),
+        "the path mapping is untouched by the inline one: {tokens}",
+    );
+}
+
+/// An import lists the shapes this contract's *wire* mentions, which is
+/// contract documentation and not a build-order declaration. A path mapping
+/// never needed more, because the other crate had already compiled whatever
+/// those shapes hold; a copy is a `struct` written out here, so every shape
+/// its fields name has to be a type in this scope too.
+#[test]
+fn inlining_brings_the_shapes_the_listed_ones_hold() {
+    const NESTED: &str = r#"{
+        "contract": "demo.vocab", "version": 1, "role": "vocabulary",
+        "description": "The shapes more than one contract carries.",
+        "types": [
+            { "form": "struct", "name": "Shared", "description": "The shared shape.",
+              "fields": [ { "name": "held", "type": "Held",
+                            "description": "What it holds." } ] },
+            { "form": "enum", "name": "Held", "description": "Which sort.",
+              "variants": [ { "name": "one", "description": "The only one." } ] }
+        ]
+    }"#;
+    let tokens = alongside(
+        IMPORTING,
+        &[NESTED],
+        &[("demo.vocab/1", inline())],
+        &[],
+        false,
+    )
+    .expect("expands")
+    .to_string();
+    assert!(tokens.contains("pub struct Shared"), "{tokens}");
+    assert!(
+        tokens.contains("pub enum Held"),
+        "`Held` is not listed in the import and is still needed: {tokens}",
+    );
+}
+
+/// The collision the manifest format cannot see. A name the import *lists*
+/// can never clash with a local one — the validator refuses a manifest that
+/// declares and imports one name — but nothing checks the shapes a copy drags
+/// in behind it, and those are exactly the ones nobody wrote down.
+#[test]
+fn a_copy_colliding_with_a_local_shape_names_both_sides() {
+    const CLASHING: &str = r#"{
+        "contract": "demo.vocab", "version": 1, "role": "vocabulary",
+        "description": "The shapes more than one contract carries.",
+        "types": [
+            { "form": "struct", "name": "Shared", "description": "The shared shape.",
+              "fields": [ { "name": "held", "type": "Args",
+                            "description": "What it holds." } ] },
+            { "form": "struct", "name": "Args", "description": "A name the importer also uses.",
+              "fields": [ { "name": "id", "type": "string",
+                            "description": "Which one." } ] }
+        ]
+    }"#;
+    let err = alongside(
+        IMPORTING,
+        &[CLASHING],
+        &[("demo.vocab/1", inline())],
+        &[],
+        false,
+    )
+    .expect_err("`Args` is declared twice over")
+    .to_string();
+    assert!(
+        err.contains("the `inline` import of `demo.vocab/1`"),
+        "{err}"
+    );
+    assert!(err.contains("`Args`"), "{err}");
+    assert!(
+        err.contains("this manifest already claims that name"),
+        "{err}"
+    );
+    assert!(
+        err.contains("demo.vocab/1` to a crate rather than `inline`"),
+        "{err}"
+    );
+}
+
+/// The same rule against a name a *path* mapping already supplies. The two
+/// would otherwise be one identifier meaning two types, with whichever the
+/// generator reached first winning silently.
+#[test]
+fn a_copy_colliding_with_a_shape_another_import_supplies_is_rejected() {
+    const TWO: &str = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "imports": [
+            { "contract": "demo.vocab", "version": 1, "types": ["Shared"],
+              "description": "The shape both contracts carry." },
+            { "contract": "demo.other", "version": 1, "types": ["Held"],
+              "description": "The shape that stays where it is." }
+        ],
+        "types": [
+            { "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [
+                { "name": "shared", "type": "Shared", "description": "The shared shape." },
+                { "name": "far", "type": "Held", "description": "The other one." } ] }
+        ],
+        "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." } ]
+    }"#;
+    const HOLDER: &str = r#"{
+        "contract": "demo.vocab", "version": 1, "role": "vocabulary",
+        "description": "The shapes more than one contract carries.",
+        "types": [
+            { "form": "struct", "name": "Shared", "description": "The shared shape.",
+              "fields": [ { "name": "held", "type": "Held",
+                            "description": "What it holds." } ] },
+            { "form": "enum", "name": "Held", "description": "Which sort.",
+              "variants": [ { "name": "one", "description": "The only one." } ] }
+        ]
+    }"#;
+    const OTHER: &str = r#"{
+        "contract": "demo.other", "version": 1, "role": "vocabulary",
+        "description": "A different vocabulary that happens to use the name.",
+        "types": [
+            { "form": "enum", "name": "Held", "description": "Which sort, elsewhere.",
+              "variants": [ { "name": "two", "description": "The other one." } ] }
+        ]
+    }"#;
+    let err = alongside(
+        TWO,
+        &[HOLDER, OTHER],
+        &[
+            ("demo.vocab/1", inline()),
+            ("demo.other/1", to(quote!(::demo_other))),
+        ],
+        &[],
+        false,
+    )
+    .expect_err("`Held` would be two types under one name")
+    .to_string();
+    assert!(
+        err.contains("the import of `demo.other/1` already claims"),
+        "{err}"
+    );
+    assert!(err.contains("`Held`"), "{err}");
+}
+
+/// A copy occupies the generated namespace exactly as a local shape does, so
+/// a vocabulary holding a `…Client` collides with the `runtime` clause in
+/// precisely the same way — and the error has to say which file to look in,
+/// because it is not the one the call site names.
+#[test]
+fn a_copy_named_like_a_generated_name_is_rejected_too() {
+    const CLIENTISH: &str = r#"{
+        "contract": "demo.vocab", "version": 1, "role": "vocabulary",
+        "description": "The shapes more than one contract carries.",
+        "types": [
+            { "form": "struct", "name": "DemoThingClient", "description": "An ordinary word.",
+              "fields": [ { "name": "id", "type": "string",
+                            "description": "Which one." } ] }
+        ]
+    }"#;
+    const IMPORTS_IT: &str = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "imports": [
+            { "contract": "demo.vocab", "version": 1, "types": ["DemoThingClient"],
+              "description": "The shape both contracts carry." }
+        ],
+        "types": [
+            { "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [ { "name": "who", "type": "DemoThingClient",
+                            "description": "The shared shape." } ] }
+        ],
+        "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." } ]
+    }"#;
+    let err = alongside(
+        IMPORTS_IT,
+        &[CLIENTISH],
+        &[("demo.vocab/1", inline())],
+        &[],
+        true,
+    )
+    .expect_err("the name is taken")
+    .to_string();
+    assert!(
+        err.contains("the `inline` import of `demo.vocab/1`"),
+        "{err}"
+    );
+    assert!(err.contains("already declares a shape"), "{err}");
+    // And the same manifest mapped to a path is fine, because then the name
+    // is `::demo_vocab::DemoThingClient` and never a bare one.
+    alongside(
+        IMPORTS_IT,
+        &[CLIENTISH],
+        &[("demo.vocab/1", to(quote!(::demo_vocab)))],
+        &[],
+        true,
+    )
+    .expect("a path mapping claims no local name");
+}
+
+/// The point of the `runtime` interplay: a trait method and a client method
+/// take the *copy*, not a path into a crate this expansion does not name.
+/// Anything else would be a signature that cannot compile.
+#[test]
+fn runtime_signatures_name_the_copy_when_the_import_is_inlined() {
+    const STREAMING: &str = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "imports": [
+            { "contract": "demo.vocab", "version": 1, "types": ["Shared"],
+              "description": "The shape both contracts carry." }
+        ],
+        "types": [
+            { "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [ { "name": "id", "type": "string",
+                            "description": "Which one." } ] }
+        ],
+        "ops": [
+            { "name": "demo.thing.go", "kind": "unary", "args": "Args", "result": "Shared",
+              "description": "Do the thing." },
+            { "name": "demo.thing.watch", "kind": "stream", "args": "Args", "item": "Shared",
+              "description": "Watch the thing." }
+        ]
+    }"#;
+    let tokens = alongside(
+        STREAMING,
+        &[&vocab("string")],
+        &[("demo.vocab/1", inline())],
+        &[],
+        true,
+    )
+    .expect("expands")
+    .to_string();
+    assert!(
+        tokens.contains(":: core :: result :: Result < Shared , :: peerline :: wire :: RpcError >"),
+        "the trait answers the copy: {tokens}",
+    );
+    assert!(
+        tokens.contains("pub fn send (& self , item : & Shared)"),
+        "the item sink carries the copy: {tokens}",
+    );
+    assert!(
+        tokens.contains("StreamReceiver < Shared >"),
+        "and so does the client: {tokens}",
+    );
+    assert!(
+        !tokens.contains(":: demo_vocab"),
+        "nothing in the stubs names another crate: {tokens}",
+    );
+}
+
+/// An inlined shape is this expansion's, so its TypeScript is this call
+/// site's to ask for — the clause's one prohibition is against exporting a
+/// type that belongs to another crate's expansion, and this is not one.
+#[test]
+fn the_typescript_clause_may_name_an_inlined_shape() {
+    let tokens = importing(
+        IMPORTING,
+        &[("demo.vocab/1", inline())],
+        &["Shared", "Args"],
+    )
+    .expect("expands")
+    .to_string();
+    assert_eq!(
+        tokens.matches("derive (:: ts_rs :: TS)").count(),
+        2,
+        "both shapes carry the derive: {tokens}",
+    );
+}
+
+/// And it is held to the same member rule. `ts_rs` derives through members
+/// whether the member was written here or copied here, so leaving the copy
+/// out of the clause fails inside `ts_rs` unless the macro says it first.
+#[test]
+fn an_inlined_member_left_out_of_the_typescript_clause_is_named() {
+    let err = importing(IMPORTING, &[("demo.vocab/1", inline())], &["Args"])
+        .expect_err("`Args` holds a `Shared`")
+        .to_string();
+    assert!(err.contains("add `Shared` to the clause"), "{err}");
+}
+
+/// The rebuild edges are directory-wide and were before this feature, which
+/// is what makes inlining safe: the copies are generated out of a file this
+/// crate does not name and would otherwise have no reason to watch. Asserted
+/// against the inline mapping specifically, because "it already worked" is
+/// exactly the kind of claim that stops being true quietly.
+#[test]
+fn an_inlined_vocabularys_file_is_a_source_input_of_this_crate() {
+    let root = crate_with_contracts("inlined-edges");
+    let tokens = tracked_as(&root, Some(&root), inline());
+
+    assert!(tokens.contains("pub struct Shared"), "{tokens}");
+    assert_eq!(tokens.matches("include_bytes").count(), 2, "{tokens}");
+    assert!(
+        tokens.contains("contracts/demo.vocab.v1.json"),
+        "editing the vocabulary must rebuild the crate that copied it: {tokens}",
+    );
+    std::fs::remove_dir_all(&root).expect("cleaned up");
 }
 
 /// A vocabulary has no producer, so the two lists a producer registers from
@@ -527,7 +949,7 @@ fn a_flattened_field_writes_its_types_keys_beside_its_siblings() {
         r#"{ "name": "shared", "type": "Shared","#,
         r#"{ "name": "shared", "type": "Shared", "flatten": true,"#,
     );
-    let tokens = importing(&json, &[("demo.vocab/1", quote!(::demo_vocab))], &[])
+    let tokens = importing(&json, &[("demo.vocab/1", to(quote!(::demo_vocab)))], &[])
         .expect("expands")
         .to_string();
     assert!(tokens.contains("# [serde (flatten)]"), "{tokens}");
@@ -736,16 +1158,14 @@ fn the_clause_may_only_name_shapes_the_manifest_declares() {
 /// An imported shape's Rust type belongs to the expansion of the manifest it
 /// came from, so its TypeScript is asked for there.
 #[test]
-fn the_clause_may_not_name_an_imported_shape() {
-    let manifest = Manifest::parse(IMPORTING).expect("valid");
-    let imports = vec![(
-        LitStr::new("demo.vocab/1", Span::call_site()),
-        quote!(::demo_vocab),
-    )];
-    let err = match Bindings::resolve(&manifest, &imports, &[format_ident!("Shared")], false) {
-        Ok(_) => panic!("`Shared` is imported, so the clause may not name it"),
-        Err(err) => err.to_string(),
-    };
+fn the_clause_may_not_name_a_shape_imported_to_a_path() {
+    let err = importing(
+        IMPORTING,
+        &[("demo.vocab/1", to(quote!(::demo_vocab)))],
+        &["Shared"],
+    )
+    .expect_err("`Shared` is another expansion's type")
+    .to_string();
     assert!(err.contains("imported from another manifest"), "{err}");
 }
 
