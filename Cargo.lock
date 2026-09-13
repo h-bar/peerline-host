@@ -2335,6 +2335,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerline-contract-ts"
+version = "0.0.7"
+dependencies = [
+ "peerline-contract-spec",
+ "serde_json",
+]
+
+[[package]]
 name = "peerline-host"
 version = "0.0.7"
 dependencies = [

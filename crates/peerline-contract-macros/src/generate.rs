@@ -507,6 +507,11 @@ struct ScalarTarget {
     /// The TypeScript this maps to when `ts_rs` reading the Rust alone would
     /// get it wrong, and `None` when it would not.
     ///
+    /// `peerline-contract-ts` carries its own copy of this column (a
+    /// proc-macro crate exports nothing but macros, so it cannot share
+    /// ours); its `scalar` module cross-checks the two tables in a test.
+    /// A new scalar edits both, and that test is what says so.
+    ///
     /// Two rows carry one. A safe integer generates an `i64`, which `ts_rs`
     /// maps to `bigint` — correct for a value that may exceed the safe range
     /// and wrong for one the contract says cannot. Passthrough JSON generates

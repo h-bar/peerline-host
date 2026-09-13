@@ -1,0 +1,237 @@
+{
+  "contract": "demo.every",
+  "version": 1,
+  "description": [
+    "A contract that exercises every feature of the manifest format the TypeScript emitter has to answer for.",
+    "",
+    "Nobody would write this contract: it is not a design, it is a checklist. Every scalar keyword appears, every one of the three field states appears, both taggings appear, a variant travels under a wire spelling that is not its name, a field's keys are written beside its siblings, a shape is imported from another file, and every one of those carries the prose the format requires — which is what the golden files assert becomes a doc comment."
+  ],
+
+  "imports": [
+    { "contract": "demo.vocab", "version": 1, "types": ["Meta", "Direction"],
+      "description": ["The event envelope and the direction it travelled, shared with every other contract that carries events. Restating them here would be a second definition with nothing saying the two are the same."] }
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "Scalars",
+      "description": [
+        "Every scalar keyword the format has, once each, plus the two ways a list is written.",
+        "",
+        "This shape exists so that a change to the scalar table shows up as a diff in a golden file rather than as a surprise in somebody's browser."
+      ],
+      "fields": [
+        { "name": "text", "type": "string",
+          "description": ["UTF-8 text."] },
+        { "name": "flag", "type": "bool",
+          "description": ["True or false."] },
+        { "name": "small_signed", "type": "i32",
+          "description": ["A signed 32-bit integer. Inside a double's exact range by construction."] },
+        { "name": "small_unsigned", "type": "u32",
+          "description": ["An unsigned 32-bit integer."] },
+        { "name": "safe_signed", "type": "i53",
+          "description": ["A signed integer the contract promises is inside the range a double holds exactly."] },
+        { "name": "safe_unsigned", "type": "u53",
+          "description": ["The unsigned half of the same promise."] },
+        { "name": "wide_signed", "type": "i64",
+          "description": ["A signed integer that may exceed the safe range. Saying so is the warning the keyword exists to give: a target whose only number is a double must carry this as an arbitrary-precision value or lose it."] },
+        { "name": "wide_unsigned", "type": "u64",
+          "description": ["The unsigned half of the same warning."] },
+        { "name": "fraction", "type": "f64",
+          "description": ["A double."] },
+        { "name": "where_it_runs", "type": "path",
+          "description": ["A filesystem path, as a string. Resolved on the producer's machine, which is the fact the keyword carries and the type does not."] },
+        { "name": "passthrough", "type": "json",
+          "description": ["Arbitrary JSON, forwarded without being interpreted."] },
+        { "name": "lines", "type": { "array": "string" },
+          "description": ["A list of a scalar."] },
+        { "name": "directions", "type": { "array": "Direction" },
+          "description": ["A list of an imported named type."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Filter",
+      "description": ["A predicate whose every field is null rather than absent, because that is the form this wire already had before it was written down."],
+      "fields": [
+        { "name": "since_ms", "type": "i53", "nullable": true,
+          "description": ["Exclusive lower bound, or null for the start of the log."] },
+        { "name": "direction", "type": "Direction", "nullable": true,
+          "description": ["Keep only this direction, or null to keep both."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "States",
+      "description": [
+        "One field in each of the four states a field can be in.",
+        "",
+        "Required, absent-able, null-able and defaulted are four different things on the wire, and the whole reason the format spends three keys on them is that a decoder in another language has to be told which. This is where the emitter proves it passes all four through."
+      ],
+      "fields": [
+        { "name": "required_text", "type": "string",
+          "description": ["Always written, and an object without it is malformed."] },
+        { "name": "optional_text", "type": "string", "optional": true,
+          "description": ["May be absent, and absence means nothing was said. A writer omits the key rather than writing null."] },
+        { "name": "nullable_text", "type": "string", "nullable": true,
+          "description": ["Always written, and null when there is nothing to say."] },
+        { "name": "include_history", "type": "bool", "default": true,
+          "description": [
+            "Whether to merge ended sessions into the answer.",
+            "",
+            "Absent means true, which is what a person looking at a list wants. A reader who assumed false would quietly get a different answer than the contract gives, which is why the value is in the manifest rather than in each implementation."
+          ] },
+        { "name": "page_size", "type": "i53", "default": 50,
+          "description": ["How many rows at most. Absent means a page a human can read."] },
+        { "name": "label", "type": "string", "default": "unnamed",
+          "description": ["What to call this in a listing."] },
+        { "name": "backend", "type": "Backend", "default": "claude-code",
+          "description": ["Which backend to assume. The default is written as the wire spelling and not as the variant name, because the wire is what a default is a value of."] },
+        { "name": "filter", "type": "Filter", "default": {},
+          "description": ["The row predicate. Absent means the filter that selects everything."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Request",
+      "description": ["What a caller sends, whose own keys are the ones on the wire."],
+      "fields": [
+        { "name": "subject", "type": "string",
+          "description": ["What the request is about."] },
+        { "name": "attempts", "type": "u32",
+          "description": ["How many times the caller has tried."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Trace",
+      "description": ["Where a request came from, carried alongside it rather than inside it."],
+      "fields": [
+        { "name": "origin", "type": "string",
+          "description": ["Who asked."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "StartArgs",
+      "description": [
+        "The caller's own request, plus what this producer needs on top of it.",
+        "",
+        "The request is carried whole and its keys are the ones on the wire. Re-spelling them here would be a second definition of a shape the caller already sends."
+      ],
+      "fields": [
+        { "name": "request", "type": "Request", "flatten": true,
+          "description": ["The caller's request. Not a key: its own keys are written here."] },
+        { "name": "max_event_ts", "type": "i53", "optional": true,
+          "description": ["The resume seed, when the caller has one."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Envelope",
+      "description": ["A shape whose every field is flattened, so there is no object half of its own at all."],
+      "fields": [
+        { "name": "request", "type": "Request", "flatten": true,
+          "description": ["The request, whole."] },
+        { "name": "trace", "type": "Trace", "flatten": true,
+          "description": ["Where it came from, whole."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Ack",
+      "description": ["An answer with nothing in it. A shape with no keys is not the same as a shape that could have any, which is what the generated type has to say."],
+      "fields": []
+    },
+    {
+      "form": "enum",
+      "name": "Backend",
+      "description": ["Which backend a session runs against."],
+      "variants": [
+        { "name": "claude_code", "wire": "claude-code",
+          "description": ["Two words on the wire, hyphenated. A live TypeScript consumer reads this exact spelling, so it is the contract and not a rendering choice."] },
+        { "name": "codex",
+          "description": ["One word, so the name and the wire value are the same and only one of them is written."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Event",
+      "description": ["One thing that happened."],
+      "fields": [
+        { "name": "meta", "type": "Meta",
+          "description": ["When it happened and which way it went. An imported shape, used as a field's type."] },
+        { "name": "line", "type": "string",
+          "description": ["The raw line that crossed."] }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "Item",
+      "tag": "item",
+      "description": [
+        "One item on the watch stream, internally tagged.",
+        "",
+        "Internal tagging is the form to prefer for a new contract: a reader dispatches on one key without knowing the arm names in advance, which is exactly what a TypeScript discriminated union narrows on."
+      ],
+      "variants": [
+        { "name": "event", "payload": "Event",
+          "description": ["One event, carried whole. Its keys sit beside the discriminator, so a consumer that already holds one puts it on the stream and takes it off again rather than taking it apart and rebuilding it."] },
+        { "name": "gap",
+          "description": ["Events this reader will never receive, reported rather than skipped."],
+          "fields": [
+            { "name": "lost", "type": "u64",
+              "description": ["How many, as an upper bound. Wide because a gap in a long-running stream has no small bound."] },
+            { "name": "note", "type": "string", "optional": true,
+              "description": ["Why, when the producer knows."] }
+          ] },
+        { "name": "done", "wire": "finished",
+          "description": ["The stream has nothing further. An arm with no payload and no fields at all, travelling under a wire spelling that is not its name."] }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "Choice",
+      "tagging": "external",
+      "description": [
+        "Which backends a read keeps, externally tagged.",
+        "",
+        "Externally tagged because one arm carries a list, and there is nowhere inside a JSON array to put a discriminator key. That case is the entire reason the format has two taggings."
+      ],
+      "variants": [
+        { "name": "only", "payload": { "array": "Backend" },
+          "description": ["Keep rows whose backend is in the set. An empty set keeps nothing."] },
+        { "name": "except", "payload": { "array": "Backend" },
+          "description": ["Drop rows whose backend is in the set. An empty set drops nothing."] },
+        { "name": "named", "wire": "by-name",
+          "description": ["Keep rows matching a name, with the criteria spelled out as this arm's own keys rather than as a shape."],
+          "fields": [
+            { "name": "prefix", "type": "string",
+              "description": ["The prefix to match."] },
+            { "name": "case_sensitive", "type": "bool", "default": false,
+              "description": ["Whether case matters. Absent means it does not."] }
+          ] },
+        { "name": "everything",
+          "description": ["Keep every row. An externally tagged arm with neither a payload nor fields is a bare string on the wire, not an object with a null value."] }
+      ]
+    }
+  ],
+
+  "errors": [
+    { "name": "demo_every_refused", "code": 9101, "data": "Ack",
+      "description": ["The producer declined. Carries an empty shape, which is enough to exercise an error with typed data."] }
+  ],
+
+  "ops": [
+    { "name": "demo.every.list", "kind": "unary", "args": "States", "result": { "array": "Event" },
+      "description": ["Every matching event."],
+      "errors": ["demo_every_refused"] },
+    { "name": "demo.every.latest", "kind": "unary", "args": "States", "result": { "nullable": "Event" },
+      "description": ["The newest matching event, or nothing at all when there is none. Not an absent result: this op answers, and sometimes the answer is that there is none."] },
+    { "name": "demo.every.start", "kind": "unary", "args": "StartArgs", "result": "Ack",
+      "description": ["Start a session and answer that it started."] },
+    { "name": "demo.every.watch", "kind": "stream", "args": "StartArgs", "item": "Item",
+      "description": ["The session's items, as they happen."] }
+  ]
+}

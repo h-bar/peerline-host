@@ -1,0 +1,351 @@
+{
+  "contract": "coagent.rpc",
+  "version": 1,
+  "role": "vocabulary",
+  "description": [
+    "The shapes that travel in more than one coagent contract.",
+    "",
+    "A session's identity, the stamp on every event, the classification of an event line and the tag naming which agent backend is running: each of these appears on the wire of `coagent.runtime/1`, `coagent.storage/1` and `coagent.manager/1`, and in some cases in all three. This file declares them once so that an implementor reads one definition rather than three restatements with nothing saying they are the same shape.",
+    "",
+    "Nobody produces this file. It declares no ops and no error codes, because an op is something a producer answers and an error code is something a producer raises, and a vocabulary has neither. It exists to be imported.",
+    "",
+    "Why a vocabulary rather than three copies",
+    "",
+    "Two services interoperate because their wire shapes match, never because they happen to share a type in one language. But an implementor still has to know that the session object the manager hands back is the same session object the store persists, and that the direction tag on a stored row is the same tag the runtime stamps. Three separate declarations would leave that unsaid, and would drift the moment one of them grew a field.",
+    "",
+    "What a generator does with this file is its own business. It may emit one set of types shared by all three contracts, or a set per contract; either is correct, because the assertion this file makes is about the wire and not about anybody's type system.",
+    "",
+    "Integer widths and the browsers that read this",
+    "",
+    "Every timestamp here is declared `i53`: an integer bounded at plus or minus 9007199254740991, which every target represents exactly, including one whose only number is a double. A millisecond count of the present day is around 1.76 times 10 to the 12th, six thousand times inside that bound and past the year 285000 before it approaches it, so nothing is given up by saying so.",
+    "",
+    "It is said here, in the contract, because it is a fact about the value and not about anybody's language. Before this file could state it, the only place it could be written was a per-field annotation on one implementation, in a language the other implementors do not read — and an implementor who read `i64` and promoted these to an arbitrary-precision type would have changed the JSON these values are compared against without anything warning them. A field that genuinely needed the wider range would be declared `i64`, and that declaration is a warning: it says a reader whose integers are doubles has a problem here."
+  ],
+
+  "types": [
+    {
+      "form": "enum",
+      "name": "BackendKind",
+      "description": [
+        "Which agent backend a session is running against.",
+        "",
+        "This is the discriminator that tells a reader how to interpret the session's opaque `config` payload: the value names the backend, and the backend owns the shape of its own configuration. A reader that does not recognise the value cannot interpret the configuration and must say so rather than guess.",
+        "",
+        "There is deliberately no unspecified or unknown value. A session with no backend is not a session, and an absent or unrecognised tag is a decoding failure at the boundary, which is where that failure is cheapest to diagnose.",
+        "",
+        "The store that persists sessions encodes these as small integers in its own tables — 1 for the claude-code backend, 2 for codex — as a private storage detail. That encoding is not on this wire and no implementor needs it; the wire values are the strings below."
+      ],
+      "variants": [
+        {
+          "name": "claude_code",
+          "wire": "claude-code",
+          "description": [
+            "The claude-code backend: one long-lived child process per session, driven over its standard input and output."
+          ]
+        },
+        {
+          "name": "codex",
+          "description": [
+            "The codex backend: one thread on a shared codex app-server process, addressed over JSON-RPC."
+          ]
+        }
+      ]
+    },
+
+    {
+      "form": "enum",
+      "name": "CoagentEventKind",
+      "description": [
+        "The lifecycle classification of one event line.",
+        "",
+        "Every line a backend emits, and every payload a client sends, is classified into exactly one of these before it is stored or published. The classification is deliberately coarse: it names what *stage* of a conversation the line belongs to and nothing about its content. Message text, tool calls and their results all live inside the line itself and are invisible at this level.",
+        "",
+        "Why the set is closed, and why it is this set",
+        "",
+        "These fifteen values mirror the first level of the unified event surface a client renders. Keeping them in step one-for-one is what lets a consumer scope a history read by lifecycle stage without parsing a single event body. Refinements below the first level are deliberately absent: a consumer that needs them has the line.",
+        "",
+        "A line the classifier cannot place carries no kind at all rather than a catch-all value. That is a third state, distinct from every value here, and every filter must decide what to do with it explicitly — see the kind filter in `coagent.storage/1`, whose exclusions deliberately let unclassified rows through.",
+        "",
+        "The three streaming kinds",
+        "",
+        "`message-started`, `partial-message` and `message-stopped` are one group and travel together. Without the deltas the open and close markers are noise, because a complete payload arrives separately as `full-message`. Every policy in this system that scopes streaming history scopes all three or none of them.",
+        "",
+        "A store persists each value as the literal string below, which is also what this wire carries; there is no second spelling."
+      ],
+      "variants": [
+        {
+          "name": "session_started",
+          "wire": "session-started",
+          "description": [
+            "The backend process is up and the session can take a turn."
+          ]
+        },
+        {
+          "name": "session_stopped",
+          "wire": "session-stopped",
+          "description": ["The session is no longer running."]
+        },
+        {
+          "name": "turn_started",
+          "wire": "turn-started",
+          "description": ["A new turn began."]
+        },
+        {
+          "name": "turn_stopped",
+          "wire": "turn-stopped",
+          "description": ["The in-flight turn ended."]
+        },
+        {
+          "name": "message_started",
+          "wire": "message-started",
+          "description": [
+            "A streaming message opened. One of the three streaming kinds."
+          ]
+        },
+        {
+          "name": "partial_message",
+          "wire": "partial-message",
+          "description": [
+            "One chunk of a streaming message. One of the three streaming kinds."
+          ]
+        },
+        {
+          "name": "message_stopped",
+          "wire": "message-stopped",
+          "description": [
+            "The streaming message finished. One of the three streaming kinds.",
+            "",
+            "Not every backend emits one. The codex backend closes a message on the same line that carries its committed content, and that line is classified `full-message`, so a codex session's history contains no rows of this kind at all. A reader that treats the absence of a close marker as an unfinished message would be wrong about every codex transcript."
+          ]
+        },
+        {
+          "name": "full_message",
+          "wire": "full-message",
+          "description": [
+            "A complete message payload delivered in one line.",
+            "",
+            "On the output side this also closes whatever message was open, which is what makes a codex transcript readable without a close marker. On the input side it is what a user actually said, and the first one after a closed region is what opens the next region."
+          ]
+        },
+        {
+          "name": "usage_updated",
+          "wire": "usage-updated",
+          "description": ["Token accounting changed."]
+        },
+        {
+          "name": "error",
+          "description": [
+            "A backend-level or translation-level failure not tied to a particular tool call."
+          ]
+        },
+        {
+          "name": "compact_started",
+          "wire": "compact-started",
+          "description": [
+            "The backend began compacting its conversation context."
+          ]
+        },
+        {
+          "name": "compact_stopped",
+          "wire": "compact-stopped",
+          "description": ["Compaction finished."]
+        },
+        {
+          "name": "compacted_context",
+          "wire": "compacted-context",
+          "description": [
+            "The summary the backend produced for the history it compacted."
+          ]
+        },
+        {
+          "name": "backend_notification",
+          "wire": "backend-notification",
+          "description": [
+            "Something the backend announced that is not part of the turn lifecycle."
+          ]
+        },
+        {
+          "name": "raw",
+          "description": [
+            "A backend payload nothing recognised, preserved exactly as it arrived."
+          ]
+        }
+      ]
+    },
+
+    {
+      "form": "enum",
+      "name": "EventDirection",
+      "description": [
+        "Which way one event line travelled.",
+        "",
+        "A session's log interleaves both directions in one ordered sequence, so the direction is what separates what the user said from what the agent answered. It is also half of the rule that decides when a conversation region opens: only an input-direction line can open one.",
+        "",
+        "A store encodes these as small integers in its own tables — 1 for input, 2 for output — as a private storage detail that is not on this wire."
+      ],
+      "variants": [
+        {
+          "name": "input",
+          "description": [
+            "A payload the client sent: the session's opening message, or a follow-up turn."
+          ]
+        },
+        {
+          "name": "output",
+          "description": ["A line the backend emitted."]
+        }
+      ]
+    },
+
+    {
+      "form": "struct",
+      "name": "EventMeta",
+      "description": [
+        "The stamp every event carries: when it happened on this session's timeline, and which way it went.",
+        "",
+        "It is one shape rather than two loose fields because both of its halves travel together everywhere they travel at all — on a live publication, on a persisted row, and on the metadata-only projection a history fold reads. A reader that holds this holds an event's whole position in the conversation."
+      ],
+      "fields": [
+        {
+          "name": "timestamp_ms",
+          "type": "i53",
+          "description": [
+            "The event's position on the session's timeline, in milliseconds.",
+            "",
+            "Assigned by the producer, and monotonically increasing within one session. It is not a wall clock and must not be read as one: it is a cursor. Every place in this system that resumes a stream, bounds a history read or compares two events for order does so on this value, and it is chosen so those comparisons are total and stable.",
+            "",
+            "A session resumed from persisted history mints its first new timestamp above every one already stored, so that a resumed session's live events never sort into its own past."
+          ]
+        },
+        {
+          "name": "direction",
+          "type": "EventDirection",
+          "description": ["Who produced this line."]
+        }
+      ]
+    },
+
+    {
+      "form": "struct",
+      "name": "SessionInfo",
+      "description": [
+        "One session's identity and the metadata that is fixed for its whole life.",
+        "",
+        "Everything here is decided when the session is created and never changes afterwards, which is what makes it safe for a manager to hand out, a store to persist and a client to cache. Anything that varies during a session — what the agent is doing, how far its history reaches — is somewhere else.",
+        "",
+        "The configuration is opaque on purpose",
+        "",
+        "A session's configuration is carried as two flat fields: a backend tag and an uninterpreted JSON value. Nothing on this wire, and nothing in the store, parses the value. The component that drives the named backend parses it, at the point where it starts a process, and it is the only thing that knows the shape.",
+        "",
+        "That is what keeps the whole session layer backend-agnostic: adding a backend adds a value to the tag and a shape nobody else has to learn. A client that wants a typed view of the configuration narrows it by the tag on its own side.",
+        "",
+        "A stored configuration that no longer parses as the shape its backend expects is a row a reader may skip, loudly, rather than a reason to fail the whole listing. That is a deliberate availability choice: one corrupt row must not hide every healthy session behind it."
+      ],
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "description": [
+            "The session's identity, assigned by the backend when the session is created.",
+            "",
+            "It comes from the backend rather than from the manager because the backend is what a resume has to address: continuing a conversation means handing this value back to the same kind of backend. The consequence is that a session has no id until its backend has produced one, and several shapes in the other contracts carry an absent session id for exactly that window."
+          ]
+        },
+        {
+          "name": "backend",
+          "type": "BackendKind",
+          "description": [
+            "Which backend this session runs against, and therefore how to read the configuration below."
+          ]
+        },
+        {
+          "name": "config",
+          "type": "json",
+          "description": [
+            "The backend's own configuration, passed through uninterpreted. See the note above on why it is opaque."
+          ]
+        },
+        {
+          "name": "working_dir",
+          "type": "string",
+          "description": [
+            "The directory the backend process runs in.",
+            "",
+            "Carried as text rather than as a resolved path because it is resolved on the machine that runs the backend, which is not necessarily the machine that asked for the session."
+          ]
+        },
+        {
+          "name": "created_at_ms",
+          "type": "i53",
+          "description": [
+            "The timestamp of the session's first input event — the moment the opening message was published.",
+            "",
+            "On the same timeline as every event stamp, and therefore comparable with them. It is not the moment a process was spawned; a manager that needs that has its own separate clock for it, because an instance can exist before its session does."
+          ]
+        }
+      ]
+    },
+
+    {
+      "form": "struct",
+      "name": "StartParams",
+      "description": [
+        "Everything a caller supplies to open a session.",
+        "",
+        "This shape travels in two contracts and is written beside its siblings in both, rather than under a key of its own: a client sends it to the manager, and the manager forwards exactly what it received to the runtime that will hold the session, adding its own fields around it. Re-spelling the six fields in each place would be two definitions to keep in step with each other and with the client.",
+        "",
+        "Everything here is the caller's intent. Nothing in it is derived, resolved or defaulted by an intermediary; the fields a manager supplies on the caller's behalf are declared separately in the contract that carries them, so that reading this shape tells an implementor exactly what a client is responsible for."
+      ],
+      "fields": [
+        {
+          "name": "backend",
+          "type": "BackendKind",
+          "description": ["Which backend to run."]
+        },
+        {
+          "name": "config",
+          "type": "json",
+          "description": [
+            "That backend's own configuration, uninterpreted by everything between the caller and the backend process."
+          ]
+        },
+        {
+          "name": "working_dir",
+          "type": "string",
+          "description": [
+            "The directory to run the backend in, resolved on the machine that runs it."
+          ]
+        },
+        {
+          "name": "initial_payload_json",
+          "type": "string",
+          "description": [
+            "The session's first turn, in the backend's own payload encoding.",
+            "",
+            "It travels in the request body rather than in any out-of-band channel because it is user text plus attachments and can be large. A session that failed to open because its opening message was too long for an environment variable would be a baffling failure, so this channel has no such limit."
+          ]
+        },
+        {
+          "name": "resume",
+          "type": "string",
+          "optional": true,
+          "description": [
+            "A prior backend conversation to continue, named in the backend's own terms.",
+            "",
+            "This is the disk-level resume: it continues a conversation that is no longer held by any live process, by asking the backend to reopen it. Absent means a fresh conversation."
+          ]
+        },
+        {
+          "name": "binary",
+          "type": "string",
+          "optional": true,
+          "description": [
+            "An explicit executable to run instead of resolving the backend's well-known name.",
+            "",
+            "Resolved on the machine that runs the backend. Absent means the well-known name is looked up in that machine's search path."
+          ]
+        }
+      ]
+    }
+  ]
+}

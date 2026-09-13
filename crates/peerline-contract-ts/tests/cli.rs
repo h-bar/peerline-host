@@ -1,0 +1,232 @@
+//! The binary, and `--check` in particular.
+//!
+//! `--check` is the half of this tool a build depends on, and its contract is
+//! that it **writes nothing, anywhere** — a check that regenerates the tree it
+//! is checking always passes. So the tests here assert the absence of writes
+//! as carefully as they assert the exit codes.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const BIN: &str = env!("CARGO_BIN_EXE_peerline-contract-ts");
+
+fn contracts() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/contracts")
+}
+
+/// A scratch directory of our own, removed first so a previous failed run
+/// cannot make this one pass.
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "peerline-contract-ts-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("the binary must run")
+}
+
+/// Every `.ts` file under `dir`, with its contents, as one comparable value.
+fn snapshot(dir: &Path) -> Vec<(String, String)> {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = listing
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read_to_string(&p).unwrap_or_default(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn generate_then_check_is_clean_and_check_writes_nothing() {
+    let out = scratch("clean");
+    let dir = out.to_string_lossy().into_owned();
+    let src = contracts().to_string_lossy().into_owned();
+
+    let generated = run(&[&src, &dir]);
+    assert!(
+        generated.status.success(),
+        "generating failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let before = snapshot(&out);
+    assert!(!before.is_empty(), "nothing was written");
+
+    let checked = run(&["--check", &src, &dir]);
+    assert!(
+        checked.status.success(),
+        "a freshly generated tree must pass --check: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert_eq!(
+        before,
+        snapshot(&out),
+        "--check must not write, and must not touch what is there"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A file whose contents have drifted: the first of the three failures
+/// `--check` looks for.
+#[test]
+fn check_fails_on_drift_and_names_the_file_and_the_line() {
+    let out = scratch("drift");
+    let dir = out.to_string_lossy().into_owned();
+    let src = contracts().to_string_lossy().into_owned();
+    assert!(run(&[&src, &dir]).status.success());
+
+    let victim = out.join("Backend.ts");
+    let original = std::fs::read_to_string(&victim).unwrap();
+    std::fs::write(&victim, original.replace("\"codex\"", "\"codexx\"")).unwrap();
+
+    let checked = run(&["--check", &src, &dir]);
+    assert!(!checked.status.success(), "drift must fail the check");
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("Backend.ts"), "{stderr}");
+    assert!(stderr.contains("differs"), "{stderr}");
+    assert!(
+        stderr.contains("codexx") && stderr.contains("Run the same command without `--check`"),
+        "the report should show the offending line and say what to do: {stderr}"
+    );
+    // Still no writes, even on the failing path.
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        original.replace("\"codex\"", "\"codexx\""),
+        "--check must not repair what it found"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A file that is committed and no longer generated — the failure a diff of
+/// contents alone cannot see, and the way a renamed type leaves its old
+/// binding behind for somebody to import.
+#[test]
+fn check_fails_on_a_file_that_is_no_longer_generated() {
+    let out = scratch("stale");
+    let dir = out.to_string_lossy().into_owned();
+    let src = contracts().to_string_lossy().into_owned();
+    assert!(run(&[&src, &dir]).status.success());
+
+    std::fs::write(out.join("Ghost.ts"), "export type Ghost = string;\n").unwrap();
+    // Something that is not ours is not ours to call stale.
+    std::fs::write(out.join("package.json"), "{}\n").unwrap();
+
+    let checked = run(&["--check", &src, &dir]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("Ghost.ts"), "{stderr}");
+    assert!(stderr.contains("no longer generated"), "{stderr}");
+    assert!(
+        !stderr.contains("package.json"),
+        "a hand-written file in the output directory is not this tool's to \
+         judge: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A missing file, i.e. a shape that has been added to the manifest and never
+/// regenerated.
+#[test]
+fn check_fails_when_a_generated_file_is_absent() {
+    let out = scratch("absent");
+    let dir = out.to_string_lossy().into_owned();
+    let src = contracts().to_string_lossy().into_owned();
+    assert!(run(&[&src, &dir]).status.success());
+    std::fs::remove_file(out.join("Item.ts")).unwrap();
+
+    let checked = run(&["--check", &src, &dir]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        stderr.contains("Item.ts") && stderr.contains("not committed"),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// `--check` against a directory that does not exist is a failure with a
+/// report, not a crash: it is what a first run in CI looks like.
+#[test]
+fn check_against_nothing_reports_every_file_as_missing() {
+    let out = scratch("empty");
+    let checked = run(&[
+        "--check",
+        &contracts().to_string_lossy(),
+        &out.to_string_lossy(),
+    ]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("not committed"), "{stderr}");
+    assert!(
+        !out.exists(),
+        "--check must not create the directory either"
+    );
+}
+
+/// A bad manifest is a usage-class failure, distinguishable from drift by its
+/// exit code — so a build script can tell "the contract is broken" from "the
+/// bindings are stale".
+#[test]
+fn a_broken_contracts_directory_exits_differently_from_drift() {
+    let out = scratch("broken");
+    let checked = run(&["/nonexistent/contracts", &out.to_string_lossy()]);
+    assert_eq!(
+        checked.status.code(),
+        Some(2),
+        "a directory that cannot be read is exit 2, not exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("peerline-contract-ts:"), "{stderr}");
+}
+
+#[test]
+fn the_options_are_rejected_when_misspelled() {
+    let out = scratch("opts");
+    for bad in [
+        vec!["--layout", "files"],
+        vec!["--wide-integers", "int64"],
+        vec!["--defaults", "maybe"],
+        vec!["--nonsense"],
+    ] {
+        let mut args = bad.clone();
+        let src = contracts().to_string_lossy().into_owned();
+        let dst = out.to_string_lossy().into_owned();
+        args.push(&src);
+        args.push(&dst);
+        let result = run(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "`{bad:?}` should be a usage error, not a silent default"
+        );
+    }
+    assert!(!out.exists(), "nothing should have been written");
+}
+
+#[test]
+fn help_is_help_and_succeeds() {
+    let out = run(&["--help"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--check"), "{stdout}");
+    assert!(stdout.contains("<contracts-dir> <out-dir>"), "{stdout}");
+}

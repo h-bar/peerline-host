@@ -1,0 +1,35 @@
+{
+  "contract": "demo.vocab",
+  "version": 1,
+  "role": "vocabulary",
+  "description": [
+    "Shapes that travel in more than one contract, so that the generator has something to import.",
+    "",
+    "A vocabulary declares no ops and no errors: nobody produces one and nobody calls it. What it is for here is the cross-file half of the emitter — a type used in one file and declared in another is the only thing an import statement can be tested on."
+  ],
+
+  "types": [
+    {
+      "form": "enum",
+      "name": "Direction",
+      "description": ["Which way an event travelled. Imported rather than restated, so that both contracts are documented as speaking the same set."],
+      "variants": [
+        { "name": "input", "wire": "in",
+          "description": ["From the caller. The wire value is shorter than the name, which is the whole reason the two are separate keys."] },
+        { "name": "output", "wire": "out",
+          "description": ["From the producer."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Meta",
+      "description": ["When an event happened and which way it went."],
+      "fields": [
+        { "name": "timestamp_ms", "type": "i53",
+          "description": ["Milliseconds since the epoch, assigned by the producer. A wall-clock millisecond count sits many orders of magnitude inside the safe range, so it is declared exact rather than wide."] },
+        { "name": "direction", "type": "Direction",
+          "description": ["Which way it went."] }
+      ]
+    }
+  ]
+}
