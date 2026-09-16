@@ -40,9 +40,17 @@
 //!   this crate actually declares.
 //! - **An op or error added to, or removed from, the manifest.** The declared
 //!   sets must equal the pinned tables below.
+//! - **A newtype that stopped being transparent.** `HostId` is declared a
+//!   newtype over `string`, and the one property that makes that a description
+//!   rather than a change is that it adds nothing to the bytes. The Rust value
+//!   is compared against the bare JSON string in both directions, because a
+//!   round trip cannot see the difference — a wrapper that invented an
+//!   envelope would encode and decode its own invention perfectly.
 //! - **A manifest that no longer validates**, or a directory whose files
 //!   disagree with each other: `Directory::load` runs every rule in the format
-//!   including the cross-file ones.
+//!   including the cross-file ones. That now includes `coord/1`'s declared
+//!   code band: every error code in the file must be inside 1000..=1099, and
+//!   no other manifest in this directory may claim a number in it.
 //!
 //! # What it does not catch
 //!
@@ -380,6 +388,48 @@ fn check_enum<T: Serialize>(manifest: &Manifest, name: &str, values: &[(&str, T)
             declared.wire()
         );
     }
+}
+
+/// A newtype: that the manifest declares one, what it says it wraps, and —
+/// the only part that is about bytes — that the Rust value **is** the inner
+/// value rather than an envelope around it.
+///
+/// Transparency is the whole content of the newtype form, and it is the one
+/// thing a round trip cannot check: a generator that invented a one-element
+/// array for `HostId` would encode and decode its own invention perfectly.
+/// So the wire form is asserted against a literal, in both directions.
+fn check_newtype<T>(manifest: &Manifest, name: &str, inner: &str, value: &T, wire: &Value)
+where
+    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let types = manifest.type_map();
+    let Some(TypeDef::Newtype { newtype, .. }) = types.get(name).copied() else {
+        panic!(
+            "`{}` declares no newtype named `{name}`. It is a transparent newtype in Rust, so a \
+             declaration of `string` would be the format saying less than the Rust does.",
+            manifest.id()
+        );
+    };
+    let Schema::Named(keyword) = newtype else {
+        panic!("`{name}` is declared over `{newtype:?}`, which is not a plain named shape");
+    };
+    assert_eq!(
+        keyword, inner,
+        "`{name}` is declared over `{keyword}` and the Rust type wraps a `{inner}`"
+    );
+
+    let encoded = serde_json::to_value(value).expect("a newtype serialises");
+    assert_eq!(
+        &encoded, wire,
+        "`{name}` is declared a newtype, which is wire-identical to what it wraps — it must \
+         encode as the bare `{inner}` and not as an object, an array or a tagged anything"
+    );
+    let decoded: T = serde_json::from_value(wire.clone())
+        .unwrap_or_else(|err| panic!("`{name}` must decode from the bare `{inner}`: {err}"));
+    assert_eq!(
+        &decoded, value,
+        "`{name}` decoded from its own wire form is a different value"
+    );
 }
 
 /// The name a plain named schema carries, for comparing an op's declared
@@ -731,6 +781,20 @@ fn the_vocabulary_shapes_match_the_hand_written_types() {
     check_struct(m, "IrohDial", &endpoints().iroh[0]);
     check_struct(m, "Endpoints", &endpoints());
     check_struct(m, "Binding", &binding());
+
+    // `HostId` is a `#[serde(transparent)]` newtype over `String` in Rust, and
+    // the manifest says so as of the format's newtype form. It used to declare
+    // `Endpoints.host` as a bare `string`, with the fact that Rust wraps it
+    // listed in `contracts/README.md` under things the format could not say —
+    // which meant the one property the wrapper must have, that it adds nothing
+    // to the bytes, was asserted nowhere.
+    check_newtype(
+        m,
+        "HostId",
+        "string",
+        &HostId::new("pl-0123456789abcdef0123456789abcdef"),
+        &Value::String("pl-0123456789abcdef0123456789abcdef".to_string()),
+    );
 
     check_enum(
         m,

@@ -6,13 +6,31 @@ coordinator, in the language-neutral contract-manifest format that
 
 - **`coord.v1.json`** — the `coord.*` ops: register, await_ready, ready,
   heartbeat, update, resolve, list, bindings, watch. Nine ops, nineteen wire
-  types, four error codes.
+  types, four error codes, claiming the code band **1000–1099**.
 - **`peerline.contract.v1.json`** — a *vocabulary*: the shapes a service
   declares about itself and the coordinates it is handed back. No ops, and
   nothing produces it. It is separate because the same shapes travel on paths
   that `coord/1` is only one of — a binary writes `Produced` and `Consumed`
   into the probe file a supervisor reads with no coordinator involved, and a
   dashboard renders `Endpoints` and `Binding` without calling an op at all.
+
+## The code band `coord/1` claims
+
+`coord.v1.json` declares `"codes": { "start": 1000, "end": 1099 }`, both ends
+inclusive. Its four codes are 1001–1004, so the band is ninety-five numbers
+wider than it needs to be, deliberately: it reserves room, so that a fifth
+error can be added here without anyone re-deriving which numbers are free.
+
+Declaring it asserts two things the loader now checks rather than two things
+the prose used to hope for: every code in the file is inside the band, and no
+other manifest in this directory may claim a number inside it. A vocabulary
+cannot claim a band — it declares no errors — so `peerline.contract.v1.json`
+has none and is unaffected.
+
+The rule is enforced **per directory**. `cluster/1` lives in
+`peerline-cluster/contracts/` and declares no error codes at all, so nothing
+here constrains it; the note in that file about not colliding with 1001–1004
+is prose for that reason and stays prose.
 
 If you are implementing a joiner in a language that is not Rust, read
 `coord.v1.json` first and then this file. The manifest is exhaustive about
@@ -36,10 +54,10 @@ Rust types and could not pass those values to one another. So the Rust in
 
 What makes that safe rather than merely cheap is
 `crates/peerline-contract/tests/coord_manifest_drift.rs`. It serialises real
-Rust values and checks field names, the three field states, default values,
-union tags, arm spellings, op names, op kinds and error codes against what
-these files declare. **Edit one side and that test fails naming the type and
-the field.** Its module documentation states precisely what it does and does
+Rust values and checks field names, the field states, default values, union
+tags, arm spellings, newtype transparency, op names, op kinds and error codes
+against what these files declare. **Edit one side and that test fails naming
+the type and the field.** Its module documentation states precisely what it does and does
 not catch; read it before trusting it for more.
 
 A non-Rust implementation is checked against these files and nothing else.
@@ -105,9 +123,11 @@ configured address simply does not join a cluster.
 ### The `HostId` derivation
 
 **This is the one unwritten contract most likely to bite a non-Rust joiner, and
-it fails silently.** It is stated in full in the prose of `Endpoints.host` in
-`peerline.contract.v1.json`, and repeated here because this is the file
-somebody reads first.
+it fails silently.** It is stated in full in the prose of the `HostId` newtype
+in `peerline.contract.v1.json` — it moved there from `Endpoints.host` when the
+type gained a declaration of its own, because the derivation is a fact about
+the token and not about the one field that happens to carry it — and it is
+repeated here because this is the file somebody reads first.
 
 `Endpoints.host` is an opaque token naming the *filesystem namespace* in which
 that set's `uds` paths mean anything. A consumer considers the `uds` list only
@@ -167,10 +187,15 @@ If the Host API is ever rewritten around generated types — option (b) in
 hand-written Rust are deliberately not identical. None of them is a wire
 difference, and none is catchable by the drift test.
 
-- **`Endpoints.host` is declared `string`.** In Rust it is `HostId`, a
-  transparent newtype over `String`, which is the same JSON string. The format
-  has no newtype form, and `Connection::dial` and `uds_usable_from` are keyed
-  on the type — so a generated `String` would not compile at those call sites.
+- ~~**`Endpoints.host` is declared `string`.**~~ **Closed, 2026-09-17.** The
+  format grew a newtype form, `peerline.contract.v1.json` declares
+  `HostId` as `{ "form": "newtype", "newtype": "string" }`, and
+  `Endpoints.host` is declared as `HostId`. A generated type would now be the
+  same transparent newtype the hand-written Rust already is, so
+  `Connection::dial` and `uds_usable_from` — both keyed on the type — would
+  compile against it. The drift test asserts the property that makes this a
+  description rather than a change: `HostId` encodes as the bare JSON string
+  and decodes from one, with no envelope.
 - **`Endpoints.uds` is declared as an array of `path`.** In Rust it is
   `Vec<String>`; a generated type would be `Vec<PathBuf>`. `path` is the
   truthful declaration — those strings are resolved on a particular machine,

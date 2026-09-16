@@ -38,10 +38,20 @@
     "",
     "`coord.heartbeat` is a request for the same reason one step later. It was a notification at first, on the argument that nothing is lost if one goes missing since the next is a second away. That argument is about a dropped heartbeat and it holds. The failure it misses is a heartbeat that arrives and finds no entry to refresh — a coordinator that expired an instance which had already readied, through a stalled process, a paused virtual machine, or a time-to-live set too tight. It cannot say so, and the host goes on heartbeating into a registry that has forgotten it. `coord.ready` is sent once, at startup, so it cannot catch a loss that happens later; the heartbeat is the only call still being made. The cost is one response per host per second, which is nothing.",
     "",
+    "The code band this contract claims",
+    "",
+    "The four codes below are 1001 to 1004, and the band declared beside this description is 1000 to 1099. The band is the wider of the two on purpose: it says which numbers are this contract's to spend, so a fifth error can be added here without anyone re-deriving whether some other manifest in this directory has taken the next number. Ninety-five unused codes is the room being reserved, not an estimate of how many this contract will ever need.",
+    "",
+    "Declaring it asserts two things a checker can act on: every code in this file is inside the band, and no other manifest in this directory may claim a number in it. Before the band existed, both were prose — the second one unwritten entirely, since a contract with no reserved range can only be found to have collided after the fact.",
+    "",
+    "The band is per directory, which is the unit the one-code-space rule is enforced in. `cluster/1` lives in another repository's contracts directory and declares no codes at all, so nothing here constrains it and it constrains nothing here; the note in that file about not colliding with 1001 to 1004 stays prose for exactly that reason.",
+    "",
     "Op naming",
     "",
     "These are application-level op names. The `$peerline/` prefix is reserved for protocol ops and is deliberately not used here, so a coordinator is an ordinary peerline service that happens to answer these."
   ],
+
+  "codes": { "start": 1000, "end": 1099 },
 
   "imports": [
     {
