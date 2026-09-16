@@ -59,6 +59,7 @@ fn ours() -> BTreeMap<PathBuf, String> {
     // that choice cannot reach this comparison. `default_fields_never_arises`
     // below is that statement as a test rather than as a comment.
     emit_directory(&dir, &Options::default())
+        .expect("one manifest cannot declare a type name twice; the validator said so")
 }
 
 fn ours_file(name: &str) -> String {

@@ -1,0 +1,46 @@
+{
+  "contract": "pipe.events",
+  "version": 1,
+  "description": [
+    "The other half of the collision: a `Session` that is not `pipe.rpc`'s.",
+    "",
+    "Here a session is a subscription — an identity and whether it is still delivering — and `Frame` is what it delivers. The shared name is the point of the fixture, and `Frame` is here so one file needs both kinds of import: a sibling inside its folder and a vocabulary shape outside it."
+  ],
+
+  "imports": [
+    { "contract": "pipe.vocab", "version": 1, "types": ["Meta"],
+      "description": ["When each frame crossed, in the shared spelling."] }
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "Session",
+      "description": ["A subscription, which this contract also calls a session."],
+      "fields": [
+        { "name": "id", "type": "string",
+          "description": ["The producer-assigned identity."] },
+        { "name": "active", "type": "bool",
+          "description": ["Whether frames are still being delivered."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Frame",
+      "description": ["One delivered line. A local shape beside an imported one, so this file's imports go both ways: into its own folder and out of it."],
+      "fields": [
+        { "name": "session", "type": "Session",
+          "description": ["Whose stream this is. A sibling, so its import stays inside the folder."] },
+        { "name": "meta", "type": "Meta",
+          "description": ["When it crossed. Imported, so its import leaves the folder."] },
+        { "name": "line", "type": "string",
+          "description": ["The bytes that crossed, as text."] }
+      ]
+    }
+  ],
+
+  "ops": [
+    { "name": "pipe.events.watch", "kind": "stream", "args": "Session", "item": "Frame",
+      "description": ["The frames, as they cross."] }
+  ]
+}

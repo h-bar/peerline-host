@@ -1,0 +1,33 @@
+{
+  "contract": "pipe.rpc",
+  "version": 1,
+  "description": [
+    "One of the two contracts that declare a `Session`.",
+    "",
+    "Its `Session` is the caller's view — an identity and when it began — and `pipe.events` declares a different shape under the same name. Neither is wrong: each spelling is right in its own scope, which is exactly the situation the folder layout exists to write down and the flat per-type layout exists to refuse."
+  ],
+
+  "imports": [
+    { "contract": "pipe.vocab", "version": 1, "types": ["Meta"],
+      "description": ["When the session began, in the shared spelling rather than a private restatement of it."] }
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "Session",
+      "description": ["A running session, as the rpc caller sees it."],
+      "fields": [
+        { "name": "id", "type": "string",
+          "description": ["The producer-assigned identity."] },
+        { "name": "started", "type": "Meta",
+          "description": ["When it began. An imported shape, so this file's import crosses folders."] }
+      ]
+    }
+  ],
+
+  "ops": [
+    { "name": "pipe.rpc.get", "kind": "unary", "args": "Session", "result": "Session",
+      "description": ["The session, restated. An op is here because a contract with none is a name rather than a contract; the fixture's subject is the types."] }
+  ]
+}

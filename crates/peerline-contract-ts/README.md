@@ -26,6 +26,45 @@ The full mapping table — every scalar, the three field states, both taggings,
 flatten, imports — and the reasoning for each decision is in the crate docs
 (`cargo doc --open -p peerline-contract-ts`).
 
+## Three layouts, and the day two manifests share a name
+
+The default layout is one flat file per type, because that is what the
+existing `ts_rs` bindings are. Nothing in the format forbids two manifests in
+one directory each declaring a `Session` — type names are unique *within* a
+manifest — and one flat directory cannot hold both, so that layout refuses
+such a directory with an error naming the type, both manifests, and the two
+ways out:
+
+```console
+$ peerline-contract-ts contracts/ bindings/
+peerline-contract-ts: `Session` is declared by `coagent.events/1` and by
+`coagent.rpc/1`, and one file per type would write both to `Session.ts` —
+whichever sorts last would silently win. Use the folder layout
+(`--layout folder`), which gives every manifest its own directory, or narrow
+the run to one of them (`--only`)
+```
+
+`--layout folder` is a folder per manifest, one file per type inside it. The
+folder is the manifest's own file stem — `coagent.rpc.v1`, a name the format
+already owns, since the directory loader requires `<contract>.v<version>.json`
+— and collisions are impossible by construction: within a folder the
+validator holds names unique, and across folders the filesystem does. The
+files are byte-identical to the flat layout's except that a cross-manifest
+import crosses folders (`../coagent.vocab.v1/SessionId`). With `--barrel`,
+each folder gets an `index.ts` and the root gets namespace re-exports —
+`export type * as CoagentRpc from "./coagent.rpc.v1/index";` (TypeScript
+5.0), with a `V<n>` suffix on the namespace only when the directory holds the
+same contract at more than one version. The alternatives — prefixed flat
+filenames, renaming a colliding type on the fly — are rejected in the crate
+docs, next to the layout's reasoning.
+
+`--only <contract>[/<version>]` (repeatable) generates a subset under any
+layout: the named contracts **plus their transitive imports, always**,
+because the emitted files import those shapes by relative path and a subset
+that dangled would only be caught by a downstream type-checker. A bare name
+is every version the directory holds; an unknown name or version is an error
+listing what the directory does hold.
+
 ## The `typescript { … }` clause is not going anywhere
 
 There is an older route from a manifest to TypeScript: `contract!` expands the

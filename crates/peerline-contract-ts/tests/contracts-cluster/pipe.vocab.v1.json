@@ -1,0 +1,22 @@
+{
+  "contract": "pipe.vocab",
+  "version": 1,
+  "role": "vocabulary",
+  "description": [
+    "The one shape both pipe contracts carry, so that the folder layout has an import that leaves one folder and enters another.",
+    "",
+    "This directory is the collision fixture: `pipe.rpc` and `pipe.events` each declare their own `Session`, which the format permits — type names are unique within a manifest, not across a directory — and which one flat directory of `<Type>.ts` files cannot write. The manifests are a checklist for the folder layout the way `demo.every` is a checklist for the mapping."
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "Meta",
+      "description": ["When something happened, shared by both contracts rather than restated in each."],
+      "fields": [
+        { "name": "timestamp_ms", "type": "i53",
+          "description": ["Milliseconds since the epoch, assigned by the producer. Many orders of magnitude inside the safe range, so declared exact rather than wide."] }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "contract": "pipe.rpc",
+  "version": 2,
+  "description": [
+    "The same contract one breaking change later: `Session` gained a required `title`.",
+    "",
+    "Two versions of one contract in one directory is the case the root barrel's namespace rule exists for. A plain `PipeRpc` would be one namespace naming two different `Session`s, so both of this contract's namespaces carry their version — and `pipe.vocab`'s, held at one version, carries none."
+  ],
+
+  "imports": [
+    { "contract": "pipe.vocab", "version": 1, "types": ["Meta"],
+      "description": ["When the session began, in the shared spelling rather than a private restatement of it."] }
+  ],
+
+  "types": [
+    {
+      "form": "struct",
+      "name": "Session",
+      "description": ["A running session, as the rpc caller sees it — now with the title a listing renders."],
+      "fields": [
+        { "name": "id", "type": "string",
+          "description": ["The producer-assigned identity."] },
+        { "name": "title", "type": "string",
+          "description": ["What a listing calls it. Required, which is the breaking change that made this a version 2."] },
+        { "name": "started", "type": "Meta",
+          "description": ["When it began."] }
+      ]
+    }
+  ],
+
+  "ops": [
+    { "name": "pipe.rpc.get", "kind": "unary", "args": "Session", "result": "Session",
+      "description": ["The session, restated."] }
+  ]
+}

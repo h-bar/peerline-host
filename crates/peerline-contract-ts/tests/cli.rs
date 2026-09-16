@@ -14,6 +14,12 @@ fn contracts() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/contracts")
 }
 
+/// The collision fixture: two manifests declaring one `Session`. See
+/// `tests/contracts-cluster/`'s own prose.
+fn cluster() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/contracts-cluster")
+}
+
 /// A scratch directory of our own, removed first so a previous failed run
 /// cannot make this one pass.
 fn scratch(name: &str) -> PathBuf {
@@ -182,6 +188,157 @@ fn check_against_nothing_reports_every_file_as_missing() {
     );
 }
 
+/// The folder layout round-trips through `--check` like the flat ones — and
+/// the three failures `--check` looks for reach inside the folders.
+#[test]
+fn folder_layout_generates_checks_clean_and_sees_inside_the_folders() {
+    let out = scratch("folder");
+    let dir = out.to_string_lossy().into_owned();
+    let src = cluster().to_string_lossy().into_owned();
+
+    let generated = run(&["--layout", "folder", "--barrel", &src, &dir]);
+    assert!(
+        generated.status.success(),
+        "generating failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(
+        out.join("pipe.rpc.v1/Session.ts").is_file()
+            && out.join("pipe.events.v1/Session.ts").is_file(),
+        "the two Sessions land in their own folders"
+    );
+    let checked = run(&["--check", "--layout", "folder", "--barrel", &src, &dir]);
+    assert!(
+        checked.status.success(),
+        "a freshly generated tree must pass --check: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    // Drift inside a folder is found and named by its relative path.
+    let victim = out.join("pipe.vocab.v1/Meta.ts");
+    let original = std::fs::read_to_string(&victim).unwrap();
+    std::fs::write(&victim, original.replace("timestamp_ms", "timestamp")).unwrap();
+    let checked = run(&["--check", "--layout", "folder", "--barrel", &src, &dir]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("pipe.vocab.v1/Meta.ts"), "{stderr}");
+    std::fs::write(&victim, original).unwrap();
+
+    // A stale file inside a manifest-named folder is ours to call stale; a
+    // folder that is not named like a manifest is not ours to look into.
+    std::fs::write(
+        out.join("pipe.vocab.v1/Ghost.ts"),
+        "export type Ghost = string;\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(out.join("src")).unwrap();
+    std::fs::write(
+        out.join("src/handwritten.ts"),
+        "export type Mine = string;\n",
+    )
+    .unwrap();
+    let checked = run(&["--check", "--layout", "folder", "--barrel", &src, &dir]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        stderr.contains("pipe.vocab.v1/Ghost.ts") && stderr.contains("no longer generated"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("handwritten.ts"),
+        "a hand-written folder is not this tool's to judge: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A directory two of whose manifests declare one type name is refused under
+/// the default layout, as a usage-class failure that names the ways out.
+#[test]
+fn a_type_name_collision_is_a_pointed_usage_error() {
+    let out = scratch("collide");
+    let result = run(&[&cluster().to_string_lossy(), &out.to_string_lossy()]);
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "a directory the layout cannot write is exit 2, not a silent overwrite"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    for needle in [
+        "`Session`",
+        "`pipe.events/1`",
+        "`pipe.rpc/1`",
+        "--layout folder",
+        "--only",
+    ] {
+        assert!(stderr.contains(needle), "{stderr}");
+    }
+    assert!(!out.exists(), "nothing may be written on the failing path");
+}
+
+/// `--only` narrows the run, pulls imports in, and composes with `--check` —
+/// including against a tree that also holds contracts the run did not name.
+#[test]
+fn only_generates_the_subset_and_checks_it_inside_a_fuller_tree() {
+    let out = scratch("only");
+    let dir = out.to_string_lossy().into_owned();
+    let src = cluster().to_string_lossy().into_owned();
+
+    let generated = run(&["--layout", "folder", "--only", "pipe.rpc/1", &src, &dir]);
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(
+        out.join("pipe.rpc.v1/Session.ts").is_file() && out.join("pipe.vocab.v1/Meta.ts").is_file(),
+        "the pinned contract and its transitive import"
+    );
+    assert!(
+        !out.join("pipe.rpc.v2").exists() && !out.join("pipe.events.v1").exists(),
+        "nothing that was not named or imported"
+    );
+
+    // Regenerate the whole directory over it, then check the subset: the
+    // files the run did not generate are not its to call stale.
+    assert!(run(&["--layout", "folder", &src, &dir]).status.success());
+    let checked = run(&[
+        "--check",
+        "--layout",
+        "folder",
+        "--only",
+        "pipe.rpc/1",
+        &src,
+        &dir,
+    ]);
+    assert!(
+        checked.status.success(),
+        "a subset check must not judge the rest of the tree: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// An `--only` that names nothing the directory holds is a usage error whose
+/// message lists what it does hold.
+#[test]
+fn only_an_unknown_contract_is_a_usage_error_listing_the_directory() {
+    let out = scratch("only-unknown");
+    let result = run(&[
+        "--only",
+        "pipe.rcp",
+        &cluster().to_string_lossy(),
+        &out.to_string_lossy(),
+    ]);
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    for needle in ["`pipe.rcp`", "`pipe.rpc/1`", "`pipe.vocab/1`"] {
+        assert!(stderr.contains(needle), "{stderr}");
+    }
+    assert!(!out.exists());
+}
+
 /// A bad manifest is a usage-class failure, distinguishable from drift by its
 /// exit code — so a build script can tell "the contract is broken" from "the
 /// bindings are stale".
@@ -205,6 +362,7 @@ fn the_options_are_rejected_when_misspelled() {
         vec!["--layout", "files"],
         vec!["--wide-integers", "int64"],
         vec!["--defaults", "maybe"],
+        vec!["--only", "demo.every/one"],
         vec!["--nonsense"],
     ] {
         let mut args = bad.clone();
@@ -229,4 +387,6 @@ fn help_is_help_and_succeeds() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--check"), "{stdout}");
     assert!(stdout.contains("<contracts-dir> <out-dir>"), "{stdout}");
+    assert!(stdout.contains("--only"), "{stdout}");
+    assert!(stdout.contains("folder"), "{stdout}");
 }

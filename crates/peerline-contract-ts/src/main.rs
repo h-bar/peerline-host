@@ -30,7 +30,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use peerline_contract_spec::Directory;
-use peerline_contract_ts::{DefaultFields, Layout, Options, WideIntegers, emit_directory};
+use peerline_contract_ts::{
+    ContractSelector, DefaultFields, Layout, Options, WideIntegers, emit_directory,
+};
 
 const USAGE: &str = "\
 peerline-contract-ts — TypeScript from peerline contract manifests
@@ -46,9 +48,19 @@ OPTIONS:
     --check              Generate nothing. Compare what would be generated
                          against <out-dir> and exit non-zero if they differ.
                          Writes nothing, anywhere.
-    --layout <type|manifest>
+    --layout <type|manifest|folder>
                          One file per named type (default, and what the
-                         existing ts-rs bindings are), or one per manifest.
+                         existing ts-rs bindings are), one per manifest, or a
+                         folder per manifest with one file per type inside —
+                         the layout for a directory whose manifests share
+                         type names, which `type` refuses.
+    --only <contract>[/<version>]
+                         Generate only this contract — plus its transitive
+                         imports, always, because the emitted files import
+                         them by path. Bare name means every version the
+                         directory holds. Repeatable. Under `--check`, the
+                         named contracts' files are checked and the rest of
+                         the tree is not judged stale.
     --wide-integers <bigint|number>
                          What `i64` and `u64` become. `bigint` is the default
                          and the truthful one; `number` is an opt-out for a
@@ -84,7 +96,7 @@ fn run() -> Result<ExitCode, String> {
     };
 
     let dir = Directory::load(&args.contracts).map_err(|e| e.to_string())?;
-    let generated = emit_directory(&dir, &args.opts);
+    let generated = emit_directory(&dir, &args.opts).map_err(|e| e.to_string())?;
     if generated.is_empty() {
         return Err(format!(
             "`{}` holds manifests that declare no types, so there is nothing to generate",
@@ -93,13 +105,19 @@ fn run() -> Result<ExitCode, String> {
     }
 
     if args.check {
-        return check(&args.out, &generated);
+        return check(&args.out, &generated, &args.opts);
     }
 
     std::fs::create_dir_all(&args.out)
         .map_err(|e| format!("cannot create `{}`: {e}", args.out.display()))?;
     for (name, text) in &generated {
         let path = args.out.join(name);
+        // The folder layout writes into subdirectories the flat layouts
+        // never make.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create `{}`: {e}", parent.display()))?;
+        }
         std::fs::write(&path, text)
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
@@ -117,6 +135,7 @@ fn run() -> Result<ExitCode, String> {
 fn check(
     out: &Path,
     generated: &std::collections::BTreeMap<PathBuf, String>,
+    opts: &Options,
 ) -> Result<ExitCode, String> {
     let mut drifted: Vec<String> = Vec::new();
 
@@ -139,21 +158,20 @@ fn check(
     // A file that is committed and no longer generated. Only `.ts` files are
     // considered ours: a hand-written `package.json` or a `tsconfig.json`
     // sitting in the output directory is not this generator's to call stale.
-    let committed: BTreeSet<PathBuf> = match std::fs::read_dir(out) {
-        Ok(listing) => listing
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
-            .filter_map(|p| p.file_name().map(PathBuf::from))
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
-        Err(e) => return Err(format!("cannot read `{}`: {e}", out.display())),
-    };
-    for name in committed.difference(&generated.keys().cloned().collect()) {
-        drifted.push(format!(
-            "  {}: committed but no longer generated",
-            name.display()
-        ));
+    //
+    // Skipped under `--only`, and not reluctantly: a subset run generates
+    // files for some contracts, so a committed file it did not generate is
+    // either stale or belongs to a contract it was not asked about, and
+    // nothing in a subset can tell those apart. The full run is the one that
+    // can, and the one whose job it is.
+    if opts.only.is_none() {
+        for name in committed_ts(out, opts.layout)?.difference(&generated.keys().cloned().collect())
+        {
+            drifted.push(format!(
+                "  {}: committed but no longer generated",
+                name.display()
+            ));
+        }
     }
 
     if drifted.is_empty() {
@@ -175,6 +193,64 @@ fn check(
     }
     eprintln!("Run the same command without `--check` to regenerate it.");
     Ok(ExitCode::FAILURE)
+}
+
+/// Every committed `.ts` file that is this generator's to judge, as paths
+/// relative to `out`.
+///
+/// The flat layouts own the top level and nothing below it. The folder layout
+/// also owns one level down — but only inside directories named the way the
+/// format names a manifest, `<contract>.v<version>`, because that folder name
+/// is a fact the format owns and nothing else in an output directory is: a
+/// hand-written `src/` or a `node_modules/` beside the generated folders is
+/// not this generator's to call stale.
+fn committed_ts(out: &Path, layout: Layout) -> Result<BTreeSet<PathBuf>, String> {
+    fn ts_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+        match std::fs::read_dir(dir) {
+            Ok(listing) => Ok(listing
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "ts"))
+                .collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("cannot read `{}`: {e}", dir.display())),
+        }
+    }
+
+    let mut committed: BTreeSet<PathBuf> = ts_files(out)?
+        .into_iter()
+        .filter_map(|p| p.file_name().map(PathBuf::from))
+        .collect();
+    if layout != Layout::Folder {
+        return Ok(committed);
+    }
+    let listing = match std::fs::read_dir(out) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(committed),
+        Err(e) => return Err(format!("cannot read `{}`: {e}", out.display())),
+    };
+    for entry in listing.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !path.is_dir() || !is_manifest_stem(&name) {
+            continue;
+        }
+        for file in ts_files(&path)? {
+            if let Some(file_name) = file.file_name() {
+                committed.insert(PathBuf::from(&name).join(file_name));
+            }
+        }
+    }
+    Ok(committed)
+}
+
+/// Whether a directory name is `<contract>.v<version>` — the shape
+/// `Directory::load` enforces on manifest file names, and therefore the shape
+/// of every folder this generator writes.
+fn is_manifest_stem(name: &str) -> bool {
+    name.rsplit_once(".v").is_some_and(|(contract, version)| {
+        !contract.is_empty() && !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// Where two files first disagree, as one sentence.
@@ -235,10 +311,32 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
                 opts.layout = match value("--layout")?.as_str() {
                     "type" => Layout::Type,
                     "manifest" => Layout::Manifest,
+                    "folder" => Layout::Folder,
                     other => {
-                        return Err(format!("`--layout {other}`: expected `type` or `manifest`"));
+                        return Err(format!(
+                            "`--layout {other}`: expected `type`, `manifest` or `folder`"
+                        ));
                     }
                 }
+            }
+            "--only" => {
+                let picked = value("--only")?;
+                let selector = match picked.split_once('/') {
+                    None => ContractSelector {
+                        contract: picked,
+                        version: None,
+                    },
+                    Some((contract, version)) => ContractSelector {
+                        contract: contract.to_string(),
+                        version: Some(version.parse().map_err(|_| {
+                            format!(
+                                "`--only {picked}`: expected `<contract>` or \
+                                 `<contract>/<version>`, and `{version}` is not a version number"
+                            )
+                        })?),
+                    },
+                };
+                opts.only.get_or_insert_with(Vec::new).push(selector);
             }
             "--wide-integers" => {
                 opts.wide_integers = match value("--wide-integers")?.as_str() {

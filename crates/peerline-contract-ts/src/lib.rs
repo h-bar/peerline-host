@@ -12,7 +12,7 @@
 //! use peerline_contract_ts::{Options, emit_directory};
 //!
 //! let dir = Directory::load(std::path::Path::new("contracts"))?;
-//! for (path, text) in emit_directory(&dir, &Options::default()) {
+//! for (path, text) in emit_directory(&dir, &Options::default())? {
 //!     std::fs::write(std::path::Path::new("bindings").join(path), text)?;
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -233,8 +233,88 @@
 //!
 //! [`Layout::Type`] is one file per named type, which is what `ts_rs` produces
 //! and therefore the default. [`Layout::Manifest`] is one file per manifest,
-//! named after it. Either can be accompanied by an `index.ts` barrel; see
-//! [`Options::barrel`].
+//! named after it. [`Layout::Folder`] is a folder per manifest with one file
+//! per type inside it — the layout for a directory whose manifests share type
+//! names, which the flat layout refuses. Any of them can be accompanied by an
+//! `index.ts` barrel; see [`Options::barrel`].
+//!
+//! ## When two manifests declare one name
+//!
+//! Nothing in the format forbids `coagent.rpc/1` and `coagent.events/1` each
+//! declaring a `Session`. The validator holds type names unique *within* one
+//! manifest, and each manifest's spelling is right in its own scope — a
+//! directory of contracts grown around one product does this routinely.
+//! Under [`Layout::Type`] both would land at `Session.ts` in one directory,
+//! and whichever manifest sorted last would silently win — so that layout now
+//! refuses such a directory with [`EmitError::DuplicateTypeName`], naming the
+//! type and both manifests. Under [`Layout::Folder`] the collision is
+//! impossible by construction: within a folder the validator's per-manifest
+//! uniqueness holds the names apart, and across folders the filesystem's
+//! namespace does.
+//!
+//! The folder is named by the manifest's file stem — `coagent.rpc.v1` — which
+//! is a fact the format owns rather than an invention of this crate:
+//! `Directory::load` already requires every manifest to be named
+//! `<contract>.v<version>.json`, so the folder is that name minus the
+//! extension, and an implementor who can find the manifest can find the
+//! folder. Within a folder the files are byte-identical to what
+//! [`Layout::Type`] writes, except that an import of a type from another
+//! manifest crosses folders: `../coagent.vocab.v1/SessionId` instead of
+//! `./SessionId`.
+//!
+//! Two alternatives were rejected. **Prefixed flat filenames**
+//! (`coagent.rpc.v1.Session.ts`) keep one directory at the price of renaming
+//! every file, colliding or not — every existing import specifier breaks,
+//! which is the compatibility the flat layout exists to preserve, and the
+//! common case pays for the rare one. **Renaming on the fly** (`Session`
+//! becomes `RpcSession` in whichever file collided) emits a type name the
+//! manifest does not declare, so the generated tree stops being checkable
+//! against the contract by name — the property every suite in this crate
+//! leans on — and which file gets the ugly name depends on sort order.
+//!
+//! ## Barrels
+//!
+//! Under the flat layouts, [`Options::barrel`] is one `index.ts` re-exporting
+//! every name. Under [`Layout::Folder`] it is one `index.ts` *per folder*,
+//! re-exporting that manifest's types:
+//!
+//! ```ts
+//! export type * from "./Session";
+//! ```
+//!
+//! and a root `index.ts` that re-exports each folder as a namespace, because
+//! a flat root re-export would recreate exactly the collision the layout
+//! exists to avoid:
+//!
+//! ```ts
+//! export type * as CoagentRpc from "./coagent.rpc.v1/index";
+//! ```
+//!
+//! The namespace is the contract name's dotted segments pascal-cased by the
+//! spec's own helper — the same mapping every generator applies to the
+//! manifest's spellings, so `coagent.rpc` is `CoagentRpc` here for the same
+//! reason `session_gone` is `SessionGone` everywhere. A version suffix (`V1`,
+//! `V2`) is appended **only when the directory holds the same contract at
+//! more than one version**: two versions under one name would be one
+//! namespace naming two different shapes, and suffixing the common
+//! single-version case would make every import carry a digit that
+//! distinguishes nothing. The rule is a function of the directory's contents
+//! alone — not of any subset being emitted — so a namespace never changes
+//! spelling because an [`Options::only`] run narrowed the set beside it.
+//! `export type * as` (and `export type * from`) need TypeScript 5.0, which
+//! is this crate's floor for the folder barrels and for nothing else.
+//!
+//! ## `only`: a subset that cannot dangle
+//!
+//! [`Options::only`] emits the named contracts **plus their transitive
+//! imports, always**. The pull-in is not optional because the emitted files
+//! are not optional about it: a generated type names its imported shapes by
+//! relative path, so a subset that left an imported manifest out would emit
+//! import specifiers pointing at files that do not exist — a lie the
+//! type-checker only catches downstream, in whichever repository committed
+//! the subset. A bare contract name selects every version the directory
+//! holds; a pinned version selects one; a name or version the directory does
+//! not hold is [`EmitError`] listing what it does.
 //!
 //! # What this crate does not emit
 //!
@@ -265,9 +345,10 @@ mod render;
 mod scalar;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 
-use peerline_contract_spec::{Directory, Manifest};
+use peerline_contract_spec::{Directory, Manifest, pascal_case};
 
 pub use scalar::WideIntegers;
 
@@ -286,20 +367,133 @@ pub enum DefaultFields {
     Required,
 }
 
-/// One file per type, or one per manifest.
+/// One file per type, one per manifest, or a folder per manifest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
     /// `Session.ts`, `Backend.ts`, … — one file per named type, importing its
     /// siblings by name. What `ts_rs` produces, and therefore the default, so
     /// that a downstream swapping generators diffs contents rather than a
     /// reorganised tree.
+    ///
+    /// One flat directory means one namespace: a directory whose manifests
+    /// declare the same bare type name twice is refused with
+    /// [`EmitError::DuplicateTypeName`] rather than letting the second file
+    /// silently overwrite the first.
     #[default]
     Type,
     /// `demo.wire.v1.ts` — one file per manifest, holding every shape it
     /// declares and importing only across manifests. Fewer files, fewer
     /// imports, and the file name is the manifest's own.
     Manifest,
+    /// `demo.wire.v1/Session.ts` — a folder per manifest, one file per type
+    /// inside it. The folder name is the manifest's file stem, which the
+    /// format already owns: `Directory::load` requires
+    /// `<contract>.v<version>.json`, so the folder is that name minus the
+    /// extension. Within a folder the files are what [`Type`](Self::Type)
+    /// writes, except that an import from another manifest crosses folders
+    /// (`../demo.vocab.v1/Meta`). Name collisions are impossible by
+    /// construction: the validator holds names unique within one manifest,
+    /// and the filesystem holds the folders apart across manifests.
+    Folder,
 }
+
+/// One contract [`Options::only`] asks for, by name or pinned to a version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractSelector {
+    /// The contract name, spelled as the manifest's own `contract` key
+    /// spells it: `"coagent.rpc"`.
+    pub contract: String,
+    /// One version, or `None` for every version the directory holds.
+    pub version: Option<u32>,
+}
+
+/// Why a directory cannot be emitted as asked.
+///
+/// [`emit_directory`] is a function from a validated directory and options to
+/// files, and there are exactly two ways the *combination* goes wrong: the
+/// flat per-type layout is asked to put two declarations at one path, and a
+/// subset names a contract the directory does not hold. Anything wrong with a
+/// manifest itself was already [`Directory::load`]'s to refuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmitError {
+    /// Two manifests declare a type with the same bare name, and
+    /// [`Layout::Type`] writes every declaration to `<Name>.ts` in one
+    /// directory — so the second would silently overwrite the first, and a
+    /// consumer would import whichever manifest happened to sort last.
+    DuplicateTypeName {
+        /// The name both manifests declare.
+        name: String,
+        /// The id (`contract/version`) of the manifest declaring it first,
+        /// in file-name order.
+        first: String,
+        /// The id of the manifest declaring it again.
+        second: String,
+    },
+    /// [`Options::only`] names a contract no manifest in the directory
+    /// declares.
+    UnknownContract {
+        /// The name asked for.
+        contract: String,
+        /// Every id the directory does hold, so the error is also the
+        /// answer.
+        directory: Vec<String>,
+    },
+    /// [`Options::only`] pins a version of a contract the directory holds —
+    /// at other versions.
+    UnknownVersion {
+        /// The contract name, which does exist.
+        contract: String,
+        /// The version asked for.
+        version: u32,
+        /// The versions the directory holds it at.
+        directory: Vec<u32>,
+    },
+}
+
+impl fmt::Display for EmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateTypeName {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "`{name}` is declared by `{first}` and by `{second}`, and one file per type \
+                 would write both to `{name}.ts` — whichever sorts last would silently win. \
+                 Use the folder layout (`--layout folder`), which gives every manifest its own \
+                 directory, or narrow the run to one of them (`--only`)"
+            ),
+            Self::UnknownContract {
+                contract,
+                directory,
+            } => write!(
+                f,
+                "no contract is named `{contract}`; the directory holds {}",
+                directory
+                    .iter()
+                    .map(|id| format!("`{id}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::UnknownVersion {
+                contract,
+                version,
+                directory,
+            } => write!(
+                f,
+                "`{contract}` has no version {version}; the directory holds it at {}",
+                directory
+                    .iter()
+                    .map(|v| format!("version {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EmitError {}
 
 /// What to generate and how.
 ///
@@ -311,14 +505,27 @@ pub struct Options {
     pub wide_integers: WideIntegers,
     /// Whether a defaulted field gets a `?`.
     pub defaults: DefaultFields,
-    /// One file per type or one per manifest.
+    /// One file per type, one per manifest, or a folder per manifest.
     pub layout: Layout,
-    /// Also emit an `index.ts` re-exporting every generated type.
+    /// Also emit an `index.ts` re-exporting every generated type. Under
+    /// [`Layout::Folder`], one per folder plus a root of namespace
+    /// re-exports; see the crate docs.
     ///
     /// Off by default: a barrel is a convenience for a package that wants one
     /// import specifier, and a file the generator did not previously write is
     /// a diff a downstream did not ask for.
     pub barrel: bool,
+    /// Generate only these contracts — plus their transitive imports,
+    /// always.
+    ///
+    /// The pull-in is not optional because the emitted files are not
+    /// optional about it: a generated type names its imported shapes by
+    /// relative path, so a subset that left an imported manifest out would
+    /// emit import specifiers pointing at files that do not exist — a lie
+    /// the type-checker only catches downstream. `None` is the whole
+    /// directory. An empty list selects nothing and emits nothing, which no
+    /// caller should want; the CLI cannot produce it.
+    pub only: Option<Vec<ContractSelector>>,
 }
 
 /// One manifest as a single TypeScript module.
@@ -366,7 +573,8 @@ pub fn emit(manifest: &Manifest, opts: &Options) -> String {
     out
 }
 
-/// Every manifest in a directory, as the files a generator writes.
+/// Every manifest in a directory — or the subset [`Options::only`] asks for —
+/// as the files a generator writes.
 ///
 /// Keyed by path relative to the output directory, so a caller joins them onto
 /// wherever the bindings live. Sorted, because a build that writes them in a
@@ -376,13 +584,28 @@ pub fn emit(manifest: &Manifest, opts: &Options) -> String {
 /// contract is written in: it is what has already checked that every import
 /// resolves and that no two contracts claim one error code, which is what lets
 /// this function assume every name it meets has somewhere to come from.
-pub fn emit_directory(dir: &Directory, opts: &Options) -> BTreeMap<PathBuf, String> {
+///
+/// # Errors
+///
+/// [`EmitError::DuplicateTypeName`] when [`Layout::Type`] meets a bare type
+/// name declared by two manifests, and [`EmitError::UnknownContract`] or
+/// [`EmitError::UnknownVersion`] when [`Options::only`] names something the
+/// directory does not hold. Nothing else fails: a loaded [`Directory`] is
+/// already valid.
+pub fn emit_directory(
+    dir: &Directory,
+    opts: &Options,
+) -> Result<BTreeMap<PathBuf, String>, EmitError> {
+    let manifests = selected(dir, opts)?;
     let mut files: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut exports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Under `Layout::Folder`, the manifests that got a folder, with the
+    // namespace each is re-exported under — the root barrel's raw material.
+    let mut folders: Vec<(String, String)> = Vec::new();
 
     match opts.layout {
         Layout::Manifest => {
-            for manifest in dir.manifests() {
+            for manifest in &manifests {
                 let module = file_for(manifest);
                 let names: BTreeSet<String> = manifest
                     .types
@@ -396,8 +619,19 @@ pub fn emit_directory(dir: &Directory, opts: &Options) -> BTreeMap<PathBuf, Stri
             }
         }
         Layout::Type => {
-            for manifest in dir.manifests() {
+            // One flat directory is one namespace, so a bare name declared
+            // twice is not a file to write but an error to raise — otherwise
+            // the second declaration would silently overwrite the first.
+            let mut declared_in: BTreeMap<String, String> = BTreeMap::new();
+            for manifest in &manifests {
                 for decl in render::decls(&manifest.types, opts) {
+                    if let Some(first) = declared_in.insert(decl.name.clone(), manifest.id()) {
+                        return Err(EmitError::DuplicateTypeName {
+                            name: decl.name,
+                            first,
+                            second: manifest.id(),
+                        });
+                    }
                     // Every reference lives in its own file under this
                     // layout, local or imported alike, so the import path is
                     // the name and the manifest's own `imports` are not
@@ -421,20 +655,165 @@ pub fn emit_directory(dir: &Directory, opts: &Options) -> BTreeMap<PathBuf, Stri
                 }
             }
         }
+        Layout::Folder => {
+            for manifest in &manifests {
+                let stem = file_for(manifest);
+                let imported = manifest.imported_types();
+                let mut names: BTreeSet<String> = BTreeSet::new();
+                for decl in render::decls(&manifest.types, opts) {
+                    let mut out = header(&manifest.id(), &decl.name);
+                    for name in &decl.refers_to {
+                        // A sibling stays `./Name`, exactly as under the flat
+                        // per-type layout; a name this manifest imports lives
+                        // in the declaring manifest's own folder, one level
+                        // up and back down.
+                        let module = match imported.get(name.as_str()) {
+                            Some(import) => {
+                                format!("../{}.v{}/{name}", import.contract, import.version)
+                            }
+                            None => module_for_type(name),
+                        };
+                        out.push_str(&import_line(&BTreeSet::from([name.clone()]), &module));
+                    }
+                    if !decl.refers_to.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&decl.text);
+                    names.insert(decl.name.clone());
+                    files.insert(PathBuf::from(format!("{stem}/{}.ts", decl.name)), out);
+                }
+                if names.is_empty() {
+                    // A manifest declaring no types gets no folder, and so no
+                    // barrel entry either.
+                    continue;
+                }
+                if opts.barrel {
+                    let mut out = header(&manifest.id(), "index");
+                    for name in &names {
+                        out.push_str(&format!("export type * from \"./{name}\";\n"));
+                    }
+                    files.insert(PathBuf::from(format!("{stem}/index.ts")), out);
+                }
+                folders.push((namespace_for(dir, manifest), stem));
+            }
+        }
     }
 
     if opts.barrel {
-        let mut out = String::from(
-            "// Generated by peerline-contract-ts. Do not edit.\n\
-             //\n\
-             // Every shape the contracts directory declares, in one specifier.\n\n",
-        );
-        for (module, names) in &exports {
-            out.push_str(&import_line_kw("export type", names, module));
+        match opts.layout {
+            Layout::Type | Layout::Manifest => {
+                let mut out = String::from(
+                    "// Generated by peerline-contract-ts. Do not edit.\n\
+                     //\n\
+                     // Every shape the contracts directory declares, in one specifier.\n\n",
+                );
+                for (module, names) in &exports {
+                    out.push_str(&import_line_kw("export type", names, module));
+                }
+                files.insert(PathBuf::from("index.ts"), out);
+            }
+            Layout::Folder => {
+                // Namespaces rather than a flat re-export, which would
+                // recreate exactly the collision this layout exists to avoid.
+                let mut out = String::from(
+                    "// Generated by peerline-contract-ts. Do not edit.\n\
+                     //\n\
+                     // Every contract in the directory, as a namespace named after it.\n\n",
+                );
+                for (namespace, stem) in &folders {
+                    out.push_str(&format!(
+                        "export type * as {namespace} from \"./{stem}/index\";\n"
+                    ));
+                }
+                files.insert(PathBuf::from("index.ts"), out);
+            }
         }
-        files.insert(PathBuf::from("index.ts"), out);
     }
-    files
+    Ok(files)
+}
+
+/// The manifests a run covers: all of them, or [`Options::only`]'s picks plus
+/// every manifest those transitively import. In file-name order either way,
+/// so the subset is as deterministic as the whole.
+fn selected<'a>(dir: &'a Directory, opts: &Options) -> Result<Vec<&'a Manifest>, EmitError> {
+    let Some(only) = &opts.only else {
+        return Ok(dir.manifests().iter().collect());
+    };
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    for selector in only {
+        let versions: Vec<&Manifest> = dir
+            .manifests()
+            .iter()
+            .filter(|m| m.contract == selector.contract)
+            .collect();
+        if versions.is_empty() {
+            return Err(EmitError::UnknownContract {
+                contract: selector.contract.clone(),
+                directory: dir.manifests().iter().map(Manifest::id).collect(),
+            });
+        }
+        match selector.version {
+            // A bare name is every version the directory holds: the caller
+            // named a contract, and the directory says what that comes to.
+            None => wanted.extend(versions.iter().map(|m| m.id())),
+            Some(version) => match versions.iter().find(|m| m.version == version) {
+                Some(m) => {
+                    wanted.insert(m.id());
+                }
+                None => {
+                    return Err(EmitError::UnknownVersion {
+                        contract: selector.contract.clone(),
+                        version,
+                        directory: versions.iter().map(|m| m.version).collect(),
+                    });
+                }
+            },
+        }
+    }
+    // The transitive imports, always — see `Options::only` for why a subset
+    // is never allowed to dangle.
+    let mut queue: Vec<&Manifest> = dir
+        .manifests()
+        .iter()
+        .filter(|m| wanted.contains(&m.id()))
+        .collect();
+    while let Some(manifest) = queue.pop() {
+        for import in &manifest.imports {
+            if wanted.insert(import.id()) {
+                // Every import resolves; the directory checked so on load.
+                if let Some(source) = dir.get(&import.contract, import.version) {
+                    queue.push(source);
+                }
+            }
+        }
+    }
+    Ok(dir
+        .manifests()
+        .iter()
+        .filter(|m| wanted.contains(&m.id()))
+        .collect())
+}
+
+/// The namespace a folder is re-exported under: the contract name's dotted
+/// segments pascal-cased by the spec's own helper, with `V<n>` appended only
+/// when the directory holds the same contract at more than one version.
+///
+/// The suffix rule reads the whole [`Directory`] rather than the emitted
+/// subset, deliberately: a namespace that changed spelling because a `--only`
+/// run narrowed the set beside it would break the import of a consumer who
+/// asked for less, not different.
+fn namespace_for(dir: &Directory, manifest: &Manifest) -> String {
+    let versions = dir
+        .manifests()
+        .iter()
+        .filter(|m| m.contract == manifest.contract)
+        .count();
+    let base = pascal_case(&manifest.contract);
+    if versions > 1 {
+        format!("{base}V{}", manifest.version)
+    } else {
+        base
+    }
 }
 
 /// The banner every generated file carries.
