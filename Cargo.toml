@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/h-bar/peerline-host"
@@ -29,13 +29,13 @@ repository = "https://github.com/h-bar/peerline-host"
 # without a version cannot be packaged at all.
 [workspace.dependencies]
 # The sibling protocol repo, checked out alongside this one.
-peerline = { path = "../peerline/crates/peerline", version = "0.0.7", features = ["runtime"] }
-peerline-transport-ws = { path = "../peerline/crates/peerline-transport-ws", version = "0.0.7" }
-peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds", version = "0.0.7" }
-peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh", version = "0.0.7" }
+peerline = { path = "../peerline/crates/peerline", version = "0.0.8", features = ["runtime"] }
+peerline-transport-ws = { path = "../peerline/crates/peerline-transport-ws", version = "0.0.8" }
+peerline-transport-uds = { path = "../peerline/crates/peerline-transport-uds", version = "0.0.8" }
+peerline-transport-iroh = { path = "../peerline/crates/peerline-transport-iroh", version = "0.0.8" }
 # Workspace members, same pattern.
-peerline-contract = { path = "crates/peerline-contract", version = "0.0.7" }
-peerline-contract-macros = { path = "crates/peerline-contract-macros", version = "0.0.7" }
-peerline-contract-spec = { path = "crates/peerline-contract-spec", version = "0.0.7" }
-peerline-contract-ts = { path = "crates/peerline-contract-ts", version = "0.0.7" }
-peerline-host = { path = "crates/peerline-host", version = "0.0.7" }
+peerline-contract = { path = "crates/peerline-contract", version = "0.0.8" }
+peerline-contract-macros = { path = "crates/peerline-contract-macros", version = "0.0.8" }
+peerline-contract-spec = { path = "crates/peerline-contract-spec", version = "0.0.8" }
+peerline-contract-ts = { path = "crates/peerline-contract-ts", version = "0.0.8" }
+peerline-host = { path = "crates/peerline-host", version = "0.0.8" }

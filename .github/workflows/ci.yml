@@ -43,5 +43,5 @@ jobs:
   # No `cargo package` job, unlike the peerline repository's CI: every
   # publishable crate here depends on the peerline crates by path + version,
   # and packaging resolves that version requirement against the crates.io
-  # index — it fails until peerline 0.0.7 is actually published there.
+  # index — it fails until peerline 0.0.8 is actually published there.
   # Packaging is verified by the release itself, in dependency order.
