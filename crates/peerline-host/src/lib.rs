@@ -118,7 +118,7 @@
 //!
 //! # `unsafe`
 //!
-//! One module, [`lifeline`], adopts a file descriptor the kernel handed this
+//! One module, `lifeline` (private), adopts a file descriptor the kernel handed this
 //! process across an `exec` — the one thing in this crate that cannot be
 //! spelled safely, since only the caller can know that an integer names a
 //! descriptor it owns. It stats the descriptor before claiming it, so the
