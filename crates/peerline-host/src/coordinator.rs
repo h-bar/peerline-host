@@ -29,6 +29,32 @@
 //! It does **not** re-run `await_ready` and does **not** call `Service::bind`
 //! again: both are one-shot startup steps, and a second `OnceLock::set` inside
 //! a service would be a silent no-op anyway.
+//!
+//! # Where this host can be reached is not fixed at `Ready`
+//!
+//! A host keeps serving as long as anything is listening, so a transport whose
+//! accept loop dies costs that transport rather than the process — and the
+//! coordinates registered at startup then name an address that can only fail to
+//! dial. The serving stage reports each such loss by republishing the set this
+//! host is *currently* answering on, and [`updates`] turns every change into a
+//! `coord.update`.
+//!
+//! Two consequences are worth stating, because both look like missing code:
+//!
+//! **There is no retry ladder for an update, and there must not be one.**
+//! [`register`] reads the live endpoint set rather than a copy frozen at bind,
+//! so a reconnect re-registers the coordinates this host is serving on *now* —
+//! which is precisely the replacement an update would have made. A session that
+//! cannot send an update is a session that is about to end, and the reconnect
+//! at the other side of it carries the same fact. Queueing one would be a
+//! second mechanism racing the one that already works.
+//!
+//! **An update does not re-assert readiness.** Losing a transport is not a
+//! lifecycle event: this host was serving before it and is serving after it.
+//! Only a *re-registration* clears readiness, and only because it can arrive
+//! from a process that has not started serving yet — which is exactly why the
+//! `UnknownInstance` recovery below re-`ready`s and the ordinary update path
+//! does not.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -39,10 +65,11 @@ use futures::StreamExt;
 use peerline::runtime::{Error, Peer, StreamReceiver};
 use peerline_contract::coord::{
     AwaitReadyArgs, ERR_INSTANCE_EXISTS, ERR_UNKNOWN_INSTANCE, ERR_UNRESOLVED, Heartbeat,
-    HeartbeatResult, OP_AWAIT_READY, OP_HEARTBEAT, OP_READY, OP_REGISTER, OP_RESOLVE, ReadyArgs,
-    ReadyResult, RegisterAck, RegisterArgs, ResolveArgs, ResolveResult, ServiceEntry,
+    HeartbeatResult, OP_AWAIT_READY, OP_HEARTBEAT, OP_READY, OP_REGISTER, OP_RESOLVE, OP_UPDATE,
+    ReadyArgs, ReadyResult, RegisterAck, RegisterArgs, ResolveArgs, ResolveResult,
+    ServiceEndpoints, ServiceEntry, UpdateAck, UpdateArgs,
 };
-use peerline_contract::{Binding, ContractId};
+use peerline_contract::{Binding, ContractId, Endpoints};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -69,17 +96,76 @@ const RECONNECT_MAX: Duration = Duration::from_secs(5);
 const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(10);
 
 /// Everything the client needs to speak for this host. Built once; a reconnect
-/// re-sends exactly the same registration, which is what makes it a *refresh*
-/// rather than a collision.
+/// re-sends the same *identity*, which is what makes it a refresh rather than a
+/// collision — and the coordinates this host is serving on at that moment,
+/// which is what makes it also an update.
 pub(crate) struct CoordCtx {
     pub socket: PathBuf,
     pub instance: String,
     pub pid: u32,
+    /// What this host mounts and declares, in mount order.
+    ///
+    /// The `endpoints` on each entry are the ones that bound and are **not**
+    /// read after construction: [`CoordCtx::services`] overlays the live set
+    /// over them, so nothing here can send a coordinate this host has stopped
+    /// answering on. They are kept because they are the initial value of that
+    /// live set and because a `ServiceEntry` has nowhere to be without one.
     pub entries: Vec<ServiceEntry>,
+    /// Where this host is reachable **now** — one entry per mounted service, in
+    /// the same order as [`Self::entries`], republished by the serving stage
+    /// whenever a transport stops answering.
+    pub endpoints: watch::Receiver<Vec<Endpoints>>,
     /// Whether anything is consumed at all. With nothing to wait for, the
     /// `AwaitReady` step is skipped rather than round-tripped.
     pub awaits: bool,
     pub await_timeout: Duration,
+}
+
+impl CoordCtx {
+    /// This host's services carrying the coordinates it is serving on right
+    /// now — what [`OP_REGISTER`] sends, at startup and on every reconnect.
+    ///
+    /// The overlay is positional because the two vectors are built from one
+    /// iteration over the same mount list, in `Host::with_coordinator`. A live
+    /// set that is somehow shorter falls back to the entry's own endpoints
+    /// rather than inventing an empty one: guessing "unreachable" from a
+    /// bookkeeping mismatch would withdraw a service that is answering
+    /// perfectly well, which is the one outcome worse than a stale coordinate.
+    fn services(&self) -> Vec<ServiceEntry> {
+        let live = self.endpoints.borrow();
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| ServiceEntry {
+                endpoints: live
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| entry.endpoints.clone()),
+                ..entry.clone()
+            })
+            .collect()
+    }
+
+    /// The same set, as [`OP_UPDATE`] carries it: names and coordinates, and
+    /// nothing an update is not allowed to restate.
+    fn update_args(&self) -> UpdateArgs {
+        let live = self.endpoints.borrow();
+        UpdateArgs {
+            instance: self.instance.clone(),
+            services: self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| ServiceEndpoints {
+                    service: entry.service.clone(),
+                    endpoints: live
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| entry.endpoints.clone()),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// How a session ended.
@@ -149,14 +235,29 @@ async fn session(
     // The heartbeat needs to know whether this host is already serving, so
     // that an `UnknownInstance` answer can re-register *and* re-ready. Cloned
     // rather than shared: `lifecycle` holds the receiver mutably to wait on it.
+    // `updates` needs it for the same recovery, by the same route.
     let heartbeat_serving = serving.clone();
+    let update_serving = serving.clone();
+
+    // Marked as seen **before** the registration below, not after. A transport
+    // that dies while `register` is in flight would otherwise be marked seen by
+    // a registration that may or may not have included it, and the loss would
+    // be reported to nobody. Taking the mark first means the worst case is one
+    // update restating what the registration already said, which `coord.update`
+    // is a full replacement precisely so that it can absorb.
+    let mut update_endpoints = ctx.endpoints.clone();
+    drop(update_endpoints.borrow_and_update());
+
     let work = async {
         register(&peer, ctx).await?;
         // From here on the heartbeat runs beside everything else. Nothing
         // below may starve it: a service parked in `await_ready` for longer
         // than the TTL would otherwise be expired while perfectly healthy.
+        // `updates` joins it rather than being spawned, for the reason the
+        // whole client is a future: dropping this host drops all three at once.
         tokio::select! {
             e = heartbeat(&peer, ctx, heartbeat_serving) => Err(e),
+            e = updates(&peer, ctx, update_endpoints, update_serving) => Err(e),
             r = lifecycle(&peer, ctx, bindings_tx, serving) => r,
         }
     };
@@ -235,11 +336,19 @@ async fn lifecycle(
     )))
 }
 
+/// Declare this host: its identity, and where it is reachable **now**.
+///
+/// The coordinates come from the live set rather than from what bound, and that
+/// is what makes a reconnect self-correcting. A host that lost its ws listener
+/// while the coordinator was down re-registers without it, and the registry is
+/// right again with no update needing to have survived the outage. Endpoints are
+/// deliberately excluded from the coordinator's identity comparison (§6), so a
+/// shrunken set refreshes the entry rather than colliding with it.
 async fn register(peer: &Peer, ctx: &CoordCtx) -> Result<(), End> {
     let args = RegisterArgs {
         instance: ctx.instance.clone(),
         pid: ctx.pid,
-        services: ctx.entries.clone(),
+        services: ctx.services(),
     };
     match peer.call::<_, RegisterAck>(OP_REGISTER, &args).await {
         Ok(ack) => {
@@ -284,30 +393,124 @@ async fn heartbeat(peer: &Peer, ctx: &CoordCtx, serving: watch::Receiver<bool>) 
                 warn!(instance = %ctx.instance,
                       "peerline-host: the coordinator has forgotten this instance \
                        (expired, or it restarted); re-registering");
-                if let Err(end) = register(peer, ctx).await {
+                if let Err(end) = recover(peer, ctx, &serving).await {
                     return end;
-                }
-                if *serving.borrow() {
-                    let args = ReadyArgs {
-                        instance: ctx.instance.clone(),
-                    };
-                    match peer.call::<_, ReadyResult>(OP_READY, &args).await {
-                        Ok(ReadyResult::Ok) => {
-                            info!(instance = %ctx.instance, "peerline-host: ready again")
-                        }
-                        // Expired again between those two calls. The next beat
-                        // is a second away and takes the same path; looping
-                        // here would be a tight retry against a coordinator
-                        // that is evidently struggling.
-                        Ok(ReadyResult::UnknownInstance) => warn!(
-                            instance = %ctx.instance,
-                            "peerline-host: expired again immediately after re-registering"
-                        ),
-                        Err(e) => return retry_or_fatal("coord.ready", e),
-                    }
                 }
             }
             Err(e) => return retry_or_fatal("coord.heartbeat", e),
+        }
+    }
+}
+
+/// The one recovery this client has: re-register, and re-`ready` if this host
+/// is already serving.
+///
+/// Shared by [`heartbeat`] and [`updates`] because it is the same recovery from
+/// the same condition — the coordinator no longer holds this instance — reached
+/// by two routes. Two copies would eventually do two different things about one
+/// state, which is the whole failure the single `UnknownInstance` value exists
+/// to make impossible.
+///
+/// For an update it is also *the update*: [`register`] sends the coordinates
+/// this host is serving on now, so there is nothing left to re-send afterwards.
+///
+/// `Ok(())` covers "expired again between those two calls" as well as success.
+/// The next heartbeat is a second away and takes this same path; looping here
+/// would be a tight retry against a coordinator that is evidently struggling.
+async fn recover(peer: &Peer, ctx: &CoordCtx, serving: &watch::Receiver<bool>) -> Result<(), End> {
+    register(peer, ctx).await?;
+    if !*serving.borrow() {
+        return Ok(());
+    }
+    let args = ReadyArgs {
+        instance: ctx.instance.clone(),
+    };
+    match peer.call::<_, ReadyResult>(OP_READY, &args).await {
+        Ok(ReadyResult::Ok) => {
+            info!(instance = %ctx.instance, "peerline-host: ready again");
+            Ok(())
+        }
+        Ok(ReadyResult::UnknownInstance) => {
+            warn!(
+                instance = %ctx.instance,
+                "peerline-host: expired again immediately after re-registering"
+            );
+            Ok(())
+        }
+        Err(e) => Err(retry_or_fatal("coord.ready", e)),
+    }
+}
+
+/// Tell the coordinator where this host is reachable, every time that changes.
+///
+/// Never returns while the connection is up: like [`heartbeat`], this runs
+/// beside the lifecycle for the whole session.
+///
+/// # What a change is, and what it is not
+///
+/// The serving stage republishes the whole endpoint set whenever a transport
+/// stops answering, and only when that actually removed a coordinate. So every
+/// wake-up here has something to say, and what it says is a **full
+/// replacement** — `coord.update` is defined that way on purpose, and the
+/// consequence is that this needs no memory of what it sent last, no diff, and
+/// no ordering guarantee beyond "the latest value wins", which is what a
+/// `watch` gives for free.
+///
+/// # Failure is not retried here
+///
+/// A transport-level failure ends the session, and the reconnect re-registers
+/// with the current coordinates — the same replacement this would have sent.
+/// That is the entire retry story, and adding a ladder would put a second
+/// mechanism in the way of the one that already covers it.
+///
+/// A protocol-level failure is *not* fatal, which is the one place this departs
+/// from [`retry_or_fatal`]. `coord.update` declares exactly one error, and it is
+/// handled above it; anything else is a coordinator that does not know the op —
+/// an older one, or a read-only surface, neither of which retrying or exiting
+/// improves. A host that is serving correctly on its remaining transports must
+/// not die because the registry will not take a correction.
+async fn updates(
+    peer: &Peer,
+    ctx: &CoordCtx,
+    mut endpoints: watch::Receiver<Vec<Endpoints>>,
+    serving: watch::Receiver<bool>,
+) -> End {
+    loop {
+        if endpoints.changed().await.is_err() {
+            // The serving stage dropped its sender: this host is on its way
+            // down. Park, so the heartbeat beside us keeps running until the
+            // whole future is dropped — the same reason `lifecycle` parks.
+            return std::future::pending().await;
+        }
+        let args = ctx.update_args();
+        let reachable = args
+            .services
+            .iter()
+            .filter(|s| !s.endpoints.is_empty())
+            .count();
+        match peer.call::<_, UpdateAck>(OP_UPDATE, &args).await {
+            Ok(ack) => info!(
+                instance = %ack.id,
+                services = args.services.len(),
+                reachable,
+                "peerline-host: a transport stopped; withdrew its coordinates"
+            ),
+            Err(Error::Rpc(e)) if e.code == ERR_UNKNOWN_INSTANCE => {
+                warn!(instance = %ctx.instance,
+                      "peerline-host: the coordinator has forgotten this instance \
+                       (expired, or it restarted); re-registering with current coordinates");
+                if let Err(end) = recover(peer, ctx, &serving).await {
+                    return end;
+                }
+            }
+            // Not fatal, deliberately — see this function's docs.
+            Err(Error::Rpc(e)) => warn!(
+                instance = %ctx.instance, error = %e.message, code = e.code,
+                "peerline-host: the coordinator refused coord.update; it may be older than \
+                 this host. Coordinates for a transport that has stopped are still \
+                 advertised there, and the next reconnect re-registers the current set"
+            ),
+            Err(e) => return End::Retry(format!("coord.update: {e}")),
         }
     }
 }
@@ -711,8 +914,12 @@ async fn resolve_once(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::future::Future;
+
     use peerline_contract::{Consumed, Endpoints, HostId};
+
+    use super::*;
+    use crate::serving::{LiveEndpoints, Serve, TransportServe, serve_all};
 
     /// A binding to a socket nobody is listening on, so the first `connect`
     /// fails and reports the loss — the same report an established connection
@@ -896,6 +1103,316 @@ mod tests {
 
         coordinator.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // A transport dies, and the coordinator is told
+    // -----------------------------------------------------------------------
+
+    /// Everything a stub coordinator saw, so a test can assert on the calls
+    /// rather than on a log line.
+    #[derive(Default)]
+    struct CoordLog {
+        registers: Vec<RegisterArgs>,
+        updates: Vec<UpdateArgs>,
+        readies: usize,
+    }
+
+    impl CoordLog {
+        fn read(log: &Arc<std::sync::Mutex<Self>>) -> std::sync::MutexGuard<'_, Self> {
+            log.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    /// A coordinator that answers the registration lifecycle and records it.
+    ///
+    /// The same shape as [`fake_coordinator`] and for the same reason: standing
+    /// up the real coordinator would point a dependency the wrong way down the
+    /// arrow (`peerline-cluster` depends on this crate, never the reverse). The
+    /// four ops here are the entire set this client sends on a session that
+    /// consumes nothing.
+    ///
+    /// `refuse_first_update` makes the stub answer the first `coord.update`
+    /// with `ERR_UNKNOWN_INSTANCE`, which is how the recovery path is reached
+    /// without having to make a stub expire anything.
+    fn recording_coordinator(
+        socket: PathBuf,
+        log: Arc<std::sync::Mutex<CoordLog>>,
+        refuse_first_update: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        use peerline::wire::RpcError;
+
+        tokio::spawn(async move {
+            let _ = peerline_transport_uds::serve(&socket, move |_| {
+                let log = log.clone();
+                Ok(Arc::new(move |peer: &Peer| {
+                    let l = log.clone();
+                    peer.on_request(OP_REGISTER, move |args: RegisterArgs| {
+                        let l = l.clone();
+                        async move {
+                            let id = args.instance.clone();
+                            CoordLog::read(&l).registers.push(args);
+                            Ok::<_, RpcError>(RegisterAck { id })
+                        }
+                    });
+                    let l = log.clone();
+                    peer.on_request(OP_READY, move |_: ReadyArgs| {
+                        let l = l.clone();
+                        async move {
+                            CoordLog::read(&l).readies += 1;
+                            Ok::<_, RpcError>(ReadyResult::Ok)
+                        }
+                    });
+                    peer.on_request(OP_HEARTBEAT, move |_: Heartbeat| async move {
+                        Ok::<_, RpcError>(HeartbeatResult::Ok)
+                    });
+                    let l = log.clone();
+                    peer.on_request(OP_UPDATE, move |args: UpdateArgs| {
+                        let l = l.clone();
+                        async move {
+                            let id = args.instance.clone();
+                            let first = {
+                                let mut g = CoordLog::read(&l);
+                                let first = g.updates.is_empty();
+                                g.updates.push(args);
+                                first
+                            };
+                            if refuse_first_update && first {
+                                return Err(RpcError {
+                                    code: ERR_UNKNOWN_INSTANCE,
+                                    message: "unknown instance".into(),
+                                    data: None,
+                                });
+                            }
+                            Ok(UpdateAck { id })
+                        }
+                    });
+                }) as peerline_transport_uds::PeerHandler)
+            })
+            .await;
+        })
+    }
+
+    /// One service reachable on ws and uds — the premise, since losing one
+    /// transport has to be distinguishable from losing everything.
+    fn on_both() -> Endpoints {
+        Endpoints {
+            host: HostId::new("pl-test"),
+            ws: vec!["ws://127.0.0.1:9000/storage".to_string()],
+            uds: vec!["/tmp/storage.sock".to_string()],
+            iroh: Vec::new(),
+        }
+    }
+
+    fn ctx_for(sock: &Path, endpoints: watch::Receiver<Vec<Endpoints>>) -> Arc<CoordCtx> {
+        let mut entry = ServiceEntry::new("storage", on_both());
+        entry
+            .produces
+            .push(peerline_contract::Produced::new("storage", 1));
+        Arc::new(CoordCtx {
+            socket: sock.to_path_buf(),
+            instance: "storage-0".into(),
+            pid: 4242,
+            entries: vec![entry],
+            endpoints,
+            // Nothing consumed, so `await_ready` is skipped and the session is
+            // register -> ready with the heartbeat and the updates beside it.
+            awaits: false,
+            await_timeout: Duration::from_secs(5),
+        })
+    }
+
+    /// A ws accept loop that runs until it is told to die, the way a listener
+    /// that is taken away mid-serve does.
+    fn ws_until(killed: oneshot::Receiver<()>) -> Serve {
+        Box::pin(async move {
+            let _ = killed.await;
+            Err(HostError::Serve("ws serve: listener gone".into()))
+        })
+    }
+
+    /// The uds loop, which never stops — so the host keeps serving and
+    /// `serve_all` never resolves, which is the whole scenario.
+    fn uds_forever() -> Serve {
+        Box::pin(std::future::pending::<Result<(), HostError>>())
+    }
+
+    /// **The staleness, closed end to end.** A transport dies while the host
+    /// goes on serving, and the coordinator is told — with the *whole* current
+    /// set, which is what `coord.update` is defined to carry.
+    ///
+    /// Before this the coordinates published at `Ready` were the only ones a
+    /// coordinator ever had, so the dead ws URL stayed in the registry for the
+    /// life of the process and every consumer resolving this contract was
+    /// handed an address that could only fail to dial.
+    #[tokio::test]
+    async fn a_dead_transport_is_reported_to_the_coordinator_as_an_update() {
+        let dir = scratch("coord-update");
+        let sock = dir.join("coord.sock");
+        let log = Arc::new(std::sync::Mutex::new(CoordLog::default()));
+        let coordinator = recording_coordinator(sock.clone(), log.clone(), false);
+
+        let (live, live_rx) = LiveEndpoints::watched(vec![on_both()]);
+        let (bindings_tx, _bindings_rx) = oneshot::channel();
+        let (serving_tx, serving_rx) = watch::channel(false);
+        let mut client = Box::pin(client(ctx_for(&sock, live_rx), bindings_tx, serving_rx));
+
+        let (kill_ws, ws_killed) = oneshot::channel::<()>();
+        let mut serve = Box::pin(serve_all(
+            vec![
+                TransportServe::new("ws", |e| e.ws.clear(), ws_until(ws_killed)),
+                TransportServe::new("uds", |e| e.uds.clear(), uds_forever()),
+            ],
+            live,
+        ));
+
+        // The host starts serving, so the client says `ready` — the state a
+        // transport has to die *in* for any of this to be interesting.
+        serving_tx
+            .send(true)
+            .expect("the client holds the receiver");
+        drive(&mut client, &mut serve, "register and ready", || {
+            let g = CoordLog::read(&log);
+            (!g.registers.is_empty() && g.readies > 0).then_some(())
+        })
+        .await;
+
+        // Nothing has changed yet, so nothing has been sent. Without this the
+        // test would pass on a client that updated on a timer.
+        assert!(
+            CoordLog::read(&log).updates.is_empty(),
+            "a host that has lost nothing sent an update"
+        );
+
+        kill_ws.send(()).expect("the ws loop is still running");
+        let sent = drive(&mut client, &mut serve, "an update", || {
+            CoordLog::read(&log).updates.first().cloned()
+        })
+        .await;
+
+        assert_eq!(sent.instance, "storage-0");
+        assert_eq!(sent.services.len(), 1, "one mounted service, one entry");
+        assert_eq!(sent.services[0].service, "storage");
+        assert!(
+            sent.services[0].endpoints.ws.is_empty(),
+            "the dead transport's URL was still advertised: {:?}",
+            sent.services[0].endpoints.ws
+        );
+        assert_eq!(
+            sent.services[0].endpoints.uds,
+            on_both().uds,
+            "an update carries the whole current set, not a diff — the transport that \
+             is still answering has to be in it, or the coordinator withdraws that too"
+        );
+        assert_eq!(
+            sent.services[0].endpoints.host,
+            on_both().host,
+            "the host token names a filesystem namespace, not a listener"
+        );
+
+        // One change, one update. A second would mean something is resending.
+        assert_eq!(CoordLog::read(&log).updates.len(), 1);
+        assert_eq!(
+            CoordLog::read(&log).registers.len(),
+            1,
+            "an ordinary update must not re-register"
+        );
+
+        coordinator.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ERR_UNKNOWN_INSTANCE` takes the path this client already had, and the
+    /// re-registration it sends carries the coordinates the host is serving on
+    /// **now** — so the recovery is itself the update, and nothing has to be
+    /// re-sent afterwards.
+    ///
+    /// That property is the reason there is no retry ladder for an update, so
+    /// it is worth a test rather than a comment.
+    #[tokio::test]
+    async fn an_update_answered_unknown_instance_re_registers_with_the_current_endpoints() {
+        let dir = scratch("coord-update-unknown");
+        let sock = dir.join("coord.sock");
+        let log = Arc::new(std::sync::Mutex::new(CoordLog::default()));
+        let coordinator = recording_coordinator(sock.clone(), log.clone(), true);
+
+        let (live, live_rx) = LiveEndpoints::watched(vec![on_both()]);
+        let (bindings_tx, _bindings_rx) = oneshot::channel();
+        let (serving_tx, serving_rx) = watch::channel(false);
+        let mut client = Box::pin(client(ctx_for(&sock, live_rx), bindings_tx, serving_rx));
+
+        let (kill_ws, ws_killed) = oneshot::channel::<()>();
+        let mut serve = Box::pin(serve_all(
+            vec![
+                TransportServe::new("ws", |e| e.ws.clear(), ws_until(ws_killed)),
+                TransportServe::new("uds", |e| e.uds.clear(), uds_forever()),
+            ],
+            live,
+        ));
+
+        serving_tx
+            .send(true)
+            .expect("the client holds the receiver");
+        drive(&mut client, &mut serve, "the first register", || {
+            let g = CoordLog::read(&log);
+            (!g.registers.is_empty() && g.readies > 0).then_some(())
+        })
+        .await;
+
+        kill_ws.send(()).expect("the ws loop is still running");
+        let second = drive(&mut client, &mut serve, "a second register", || {
+            CoordLog::read(&log).registers.get(1).cloned()
+        })
+        .await;
+
+        assert!(
+            second.services[0].endpoints.ws.is_empty(),
+            "the re-registration put the dead transport's URL back: {:?}",
+            second.services[0].endpoints.ws
+        );
+        assert_eq!(
+            second.services[0].endpoints.uds,
+            on_both().uds,
+            "and dropped one that was still answering"
+        );
+        assert_eq!(
+            second.services[0].produces.len(),
+            1,
+            "a re-registration still declares what this host produces"
+        );
+
+        // Readiness is re-asserted, because a re-registration clears it and
+        // this host is serving. That is the half a bare re-register would miss.
+        drive(&mut client, &mut serve, "ready again", || {
+            (CoordLog::read(&log).readies >= 2).then_some(())
+        })
+        .await;
+
+        coordinator.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Poll `done` while keeping the client and the serving future running, so
+    /// that a test never waits on a future nobody is driving — and so that
+    /// either of them resolving is an immediate, named failure rather than a
+    /// timeout with nothing to say.
+    async fn drive<T>(
+        client: &mut (impl Future<Output = HostError> + Unpin),
+        serve: &mut (impl Future<Output = Result<(), HostError>> + Unpin),
+        what: &str,
+        mut done: impl FnMut() -> Option<T>,
+    ) -> T {
+        for _ in 0..600 {
+            if let Some(value) = done() {
+                return value;
+            }
+            tokio::select! {
+                e = &mut *client => panic!("the coordinator client stopped waiting for {what}: {e}"),
+                r = &mut *serve => panic!("the host stopped serving waiting for {what}: {r:?}"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        panic!("timed out waiting for {what}");
     }
 
     /// ...and the required case is untouched, which is what makes the change

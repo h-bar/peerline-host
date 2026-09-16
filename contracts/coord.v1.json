@@ -16,6 +16,14 @@
     "",
     "On a `unknown_instance` answer from either `coord.ready` or `coord.heartbeat`, the joiner re-registers and re-sends `coord.ready`. It must not re-run `coord.await_ready`: that is a one-shot startup step, its bindings are already in hand, and re-running it parks the process on dependencies it has already resolved.",
     "",
+    "Staying reachable is part of staying registered",
+    "",
+    "Registration states where a process can be reached, and a process may go on running after some of that stops being true. A host that binds several transports keeps serving as long as any one of them is listening, so an accept loop that dies costs that transport and not the process — and the coordinates registered at startup then name an address that can only fail to dial. `coord.update` is how a joiner corrects that: whenever the set of transports it is actually answering on changes, it sends the coordinates it is serving on now, and the coordinator replaces what it holds.",
+    "",
+    "The update carries the whole set rather than the part that changed. The sender is the only party that knows where it is listening, which makes a full replacement idempotent — sent twice, or sent after a reconnect that already re-registered the same coordinates, it changes nothing — where a delta would require the coordinator to hold a merge rule that the sender also holds. It follows that a registered service the update does not mention is left with no coordinates at all: a sender that under-reports makes a service unselectable, which is visible in a listing's unreachable field and is the conservative direction, whereas a merge would keep handing out the stale address that this op exists to withdraw.",
+    "",
+    "A joiner that never loses a transport never sends this op, and a coordinator that never receives one behaves exactly as it always has.",
+    "",
     "Joining is a lifecycle, not a vocabulary",
     "",
     "This file describes the ops, their shapes and their error codes exhaustively, and that is less than everything a joiner must do. It does not and cannot express: that the sequence above has that order; that a supervised child must write its probe file to the path in `PEERLINE_MANIFEST_OUT` and hold its lifeline descriptor open until end-of-file; that the coordinator's socket arrives in `PEERLINE_COORD_SOCK`; or that the host token in `Endpoints` must be derived exactly as `peerline.contract/1` says. An implementor needs the README beside this file as well as this file.",
@@ -277,6 +285,81 @@
             "No such instance: its entry expired, or the coordinator restarted since it registered.",
             "",
             "Re-register, and send ready again if already serving. Do not re-run the await-ready stream."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "ServiceEndpoints",
+      "description": [
+        "One service's current coordinates, as an update reports them.",
+        "",
+        "Why this is not a service entry",
+        "",
+        "A service entry carries produced and consumed contracts as well as endpoints, and both of those default to empty. An update built out of one could not say \"my coordinates changed\" without also appearing to say something about the contracts it declares — and since the empty list is both the default and a meaningful value, a coordinator could not tell an update that omitted them from one that withdrew them. The declarations belong to registration and to nothing else, so the shape that carries an update has no field for them."
+      ],
+      "fields": [
+        {
+          "name": "service",
+          "type": "string",
+          "description": [
+            "Which mounted service these coordinates belong to, spelled exactly as the registration spelled it. A name the registration did not declare is not an error and is ignored: it names nothing the coordinator holds."
+          ]
+        },
+        {
+          "name": "endpoints",
+          "type": "Endpoints",
+          "description": [
+            "Where that service is reachable now, on every transport that is still answering.",
+            "",
+            "Empty is legal and meaningful: it says this service can no longer be dialled on anything. That is the same state a service whose every transport failed to bind is registered in, and it makes the service unselectable rather than removing it."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "UpdateArgs",
+      "description": [
+        "Where this instance is reachable now, in full.",
+        "",
+        "This is the whole set, not the part that changed. The coordinator replaces what it holds, so a registered service absent from the list is left with no coordinates at all.",
+        "",
+        "What it deliberately does not carry: the process id, the produced and consumed contracts, or anything else registration established. An update is not a re-registration. It does not clear readiness, it cannot collide on an instance id, and it cannot be refused for cardinality, because it changes nothing any of those three are about. A process that has really changed what it declares has restarted, and a restart re-registers."
+      ],
+      "fields": [
+        {
+          "name": "instance",
+          "type": "string",
+          "description": ["The instance whose coordinates these are, as registered."]
+        },
+        {
+          "name": "services",
+          "type": { "array": "ServiceEndpoints" },
+          "default": [],
+          "description": [
+            "Every service this process mounts, with the coordinates it is serving on right now.",
+            "",
+            "An empty list is legal and says the whole instance is unreachable: every transport it had is gone, and it is still running. It is not a deregistration — the entry stays, its consumed contracts still gate its own readiness, and the time-to-live is still what eventually removes it."
+          ]
+        }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "UpdateAck",
+      "description": [
+        "The instance whose coordinates were replaced, echoed back.",
+        "",
+        "It echoes for the reason a registration acknowledgement does: a caller that sees its own id come back has confirmation that the coordinator applied the replacement to the entry it meant. Its own shape rather than a reuse of the registration acknowledgement, because the two answer different questions and a field added to one would otherwise be an unannounced field on the other."
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": [
+            "The instance id that was updated. Always equal to the `instance` that was sent."
           ]
         }
       ]
@@ -620,9 +703,13 @@
       "name": "unknown_instance",
       "code": 1002,
       "description": [
-        "The named instance is not registered. Answered by the await-ready stream when the caller never registered, or when its entry has already expired.",
+        "The named instance is not registered: the caller never registered, or its entry has already expired.",
         "",
-        "The ready and heartbeat ops deliberately do not use this code. They answer a value instead, because at those two points the caller has a defined next step and driving a state machine off an error code is worse than driving it off a value."
+        "Raised by the await-ready stream and by the update op. Both name an instance the coordinator is expected to already hold, and neither has anything it can do with an entry that is not there.",
+        "",
+        "The ready and heartbeat ops deliberately do not use this code. They answer a value instead, because those two are lifecycle transitions whose answer a caller branches its own state machine on — each was very nearly a notification, and the argument for making them requests was precisely that the state they report must not be droppable. An update is a plain write against an entry that is supposed to already exist, and \"there is no such entry\" is what this code already means.",
+        "",
+        "The recovery is identical wherever it comes from: re-register, and send ready again if already serving. Do not re-run the await-ready stream."
       ]
     },
     {
@@ -707,6 +794,26 @@
       "args": "Heartbeat",
       "result": "HeartbeatResult",
       "errors": []
+    },
+    {
+      "name": "coord.update",
+      "kind": "unary",
+      "description": [
+        "Replace where this instance is reachable, without re-declaring what it produces.",
+        "",
+        "Sent mid-serve, whenever the set of transports the sender is actually answering on changes. A process that keeps serving after one of its transports stops listening has coordinates in the registry that name an address which can only fail to dial, and this is how it withdraws them.",
+        "",
+        "It replaces rather than patches, and it covers the whole instance: a registered service the args do not mention is left with no coordinates. See the contract description for why a full set is the only shape that is safe to send twice.",
+        "",
+        "An update is also proof that the sender is alive, so it refreshes the last-seen time exactly as a heartbeat does. A sender that has just sent one need not immediately send the other.",
+        "",
+        "Readiness is untouched. Unlike a re-registration — which asserts where a process can be reached and therefore clears readiness until the process says it is serving again — an update comes from a process that is already serving and says nothing about whether it is. Clearing readiness here would take a host that lost one transport out of every consumer's reach entirely, which is the opposite of the correction being made.",
+        "",
+        "On `unknown_instance`: re-register, and send ready again if already serving. The re-registration carries the current coordinates, so it is itself the update, and nothing further need be sent."
+      ],
+      "args": "UpdateArgs",
+      "result": "UpdateAck",
+      "errors": ["unknown_instance"]
     },
     {
       "name": "coord.resolve",

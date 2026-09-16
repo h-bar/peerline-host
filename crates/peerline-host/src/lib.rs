@@ -176,7 +176,7 @@ pub use peerline_contract::env::{COORD_SOCK_ENV, SERVICE_UDS_ENV};
 // long as anything is listening, which is a policy rather than a detail of
 // whichever `futures` combinator the serving stage happened to reach for —
 // see [`serving`].
-use serving::{TransportServe, serve_all};
+use serving::{LiveEndpoints, TransportServe, serve_all};
 
 // One mount entry per transport. Only defined when that transport is
 // compiled in: `Mount` has no setter for a disabled one, so nothing can be
@@ -703,9 +703,11 @@ impl Host {
     /// One thing that is deliberately **not** in that list: a transport whose
     /// accept loop dies while serving. A host keeps serving as long as
     /// anything is listening, and only the last live transport's failure ends
-    /// the run — with the coordinates already published for the dead transport
-    /// left stale. [`BoundHost::serve_until`] documents the rule and what it
-    /// costs; this method is that method with the binding in front of it.
+    /// the run — with the dead transport's coordinates withdrawn from the
+    /// coordinator rather than left to be dialled.
+    /// [`BoundHost::serve_until`] documents the rule, the withdrawal, and the
+    /// window that is still open; this method is that method with the binding
+    /// in front of it.
     ///
     /// With `PEERLINE_MANIFEST_OUT` set it binds nothing, writes the manifest
     /// to that path and returns `Ok(())`.
@@ -936,7 +938,7 @@ impl Host {
 
         let entries: Vec<ServiceEntry> = prepared
             .iter()
-            .zip(endpoints)
+            .zip(endpoints.iter().cloned())
             .map(|(p, endpoints)| ServiceEntry {
                 service: p.name.to_string(),
                 endpoints,
@@ -945,11 +947,22 @@ impl Host {
             })
             .collect();
         let awaits = entries.iter().any(|e| !e.consumes.is_empty());
+
+        // What this host is reachable on *now*, which is what bound until a
+        // transport stops answering. The serving stage owns the sender and
+        // subtracts each dead transport; the coordinator client holds the
+        // receiver and turns every change into a `coord.update`. Built here
+        // because this is the one place that has both ends in hand — and it is
+        // built only on this path, since a host with no coordinator has nobody
+        // to tell.
+        let (live, live_endpoints) = LiveEndpoints::watched(endpoints);
+
         let ctx = Arc::new(CoordCtx {
             socket: socket.clone(),
             instance: self.instance_id(prepared),
             pid: std::process::id(),
             entries,
+            endpoints: live_endpoints,
             awaits,
             await_timeout: self.await_timeout.unwrap_or(DEFAULT_AWAIT_READY),
         });
@@ -998,7 +1011,7 @@ impl Host {
         let _ = serving_tx.send(true);
 
         tokio::select! {
-            r = serve_all(serves) => r,
+            r = serve_all(serves, live) => r,
             e = &mut client => Err(e),
             e = watchdog => Err(e),
         }
@@ -1357,18 +1370,42 @@ impl BoundHost {
     /// bound is already gone by here: [`Host::bind`] drops it, and it
     /// contributes no coordinate to [`endpoints`](Self::endpoints).
     ///
-    /// # What that costs: the endpoints for a dead transport go stale
+    /// # What that costs: the endpoints for a dead transport are withdrawn
     ///
-    /// A host registers its coordinates with the coordinator once, at `Ready`,
-    /// and a transport dying afterwards does **not** withdraw them. A consumer
-    /// resolving this service can be handed a ws URL or an iroh ticket that no
-    /// longer answers, and finds out by failing to connect. Withdrawing them
-    /// would mean re-registering a shrunken set mid-serve, which is a question
-    /// about what a re-registration means for consumers already bound to the
-    /// old set — a coordinator-side protocol question, not something this
-    /// method can decide on its own. The staleness is the accepted cost: it
-    /// fails one dial, where ending the host failed every transport at once,
-    /// including the ones that were still working.
+    /// A host registers its coordinates at `Ready`, and until `coord.update`
+    /// existed a transport dying afterwards did **not** withdraw them: the
+    /// registry went on handing out a ws URL or an iroh ticket that could only
+    /// fail to dial, for the life of the process. That is no longer the case.
+    /// When an accept loop ends, the coordinates it contributed are dropped
+    /// from the set this host advertises and the coordinator client sends the
+    /// remainder as `coord.update` — a full replacement, which is what makes it
+    /// safe to send twice and identical to what a reconnect would re-register.
+    /// A service that loses every transport keeps its entry and its
+    /// `consumes`, and becomes unselectable exactly as a service that never
+    /// bound anything is (§8).
+    ///
+    /// **What remains.** The window is now one update round trip rather than
+    /// the life of the process, and two things still sit inside it, stated
+    /// rather than left to be discovered:
+    ///
+    /// * A consumer that already holds the stale coordinate — handed it a
+    ///   moment before the transport died, or mid-dial right now — is not
+    ///   recalled. Nothing can recall it: the coordinator is never in the data
+    ///   path, so it does not know who is dialling. That consumer fails one
+    ///   dial and re-resolves, which is the path it already takes for a
+    ///   producer that restarted (see
+    ///   [`Host::dependency_budget`](Host::dependency_budget)), and it now
+    ///   re-resolves to an answer that no longer contains the dead address.
+    /// * With the coordinator connection down, the update cannot be sent. It
+    ///   is not queued and there is no retry ladder for it, because there does
+    ///   not need to be one: reconnecting re-registers, a re-registration
+    ///   carries the coordinates this host is serving on *now*, and that is
+    ///   the same replacement the update would have made.
+    ///
+    /// The **last** transport to stop is the one case that sends nothing at
+    /// all — this future resolves with it and the host is going down, so there
+    /// is no connection left to send on. That instance leaves the registry the
+    /// way every instance does, by falling silent for one TTL.
     pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<(), HostError> {
         let Self {
             host,
@@ -1395,7 +1432,11 @@ impl BoundHost {
                     for p in &prepared {
                         p.svc.bind(&bindings);
                     }
-                    serve_all(serves).await
+                    // Nothing tracks the live endpoint set here: there is no
+                    // coordinator holding a copy of it to correct, and
+                    // `endpoints()` was already read by whoever called
+                    // `Host::bind`. A transport dying is still logged.
+                    serve_all(serves, LiveEndpoints::unwatched()).await
                 }
                 Some(socket) => {
                     host.with_coordinator(&prepared, endpoints, serves, host_id, socket.clone())
@@ -1512,12 +1553,20 @@ impl Listening {
     /// the host's failure policy was three different policies depending on
     /// which future you read. The label is all that is left of the difference,
     /// and it exists only so the log line can name the transport.
+    ///
+    /// Each loop also carries the one thing that *is* per-transport: which
+    /// coordinates its death withdraws. It is supplied here because this is
+    /// where a transport is known by name and already behind its own `cfg` —
+    /// [`serve_all`] would otherwise have to match a string with a wildcard
+    /// arm, and the case that arm would swallow is a transport whose address
+    /// goes on being advertised after it stops answering.
     fn into_serves(self) -> Vec<TransportServe> {
         let mut serves: Vec<TransportServe> = Vec::new();
         #[cfg(feature = "ws")]
         if let Some(bound) = self.ws {
             serves.push(TransportServe::new(
                 "ws",
+                |e| e.ws.clear(),
                 Box::pin(async move { bound.serve().await.map_err(HostError::Serve) }),
             ));
         }
@@ -1525,6 +1574,7 @@ impl Listening {
         if let Some(bound) = self.uds {
             serves.push(TransportServe::new(
                 "uds",
+                |e| e.uds.clear(),
                 Box::pin(async move { bound.serve().await.map_err(HostError::Serve) }),
             ));
         }
@@ -1532,6 +1582,7 @@ impl Listening {
         if let Some(bound) = self.iroh {
             serves.push(TransportServe::new(
                 "iroh",
+                |e| e.iroh.clear(),
                 Box::pin(async move { bound.serve().await.map_err(HostError::Serve) }),
             ));
         }

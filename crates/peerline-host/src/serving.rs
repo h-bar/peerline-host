@@ -49,47 +49,149 @@
 //!   which on a laptop that changed networks is a routine event and not a
 //!   reason to stop answering on a socket.
 //!
-//! # The endpoints for a dead transport go stale
+//! # The endpoints for a dead transport are withdrawn
 //!
-//! Say this plainly, because the alternative is a reader assuming otherwise: a
-//! host registers its coordinates with the coordinator **once**, at `Ready`,
-//! built from what bound. When a transport's accept loop dies afterwards,
-//! those coordinates are not withdrawn. A consumer that resolves this service
-//! from the coordinator can therefore be handed a ws URL or an iroh ticket
-//! that no longer answers, and will find out by failing to connect.
+//! A host builds its coordinates from what bound and publishes them at `Ready`.
+//! When a transport's accept loop dies afterwards, the coordinates that named
+//! it describe an address that can only fail to dial — so this module drops
+//! them from the live set and says so, through a [`LiveEndpoints`] whose
+//! receiver the coordinator client holds. The client turns each change into a
+//! `coord.update`, and the registry stops handing the dead address out.
 //!
-//! This module does not fix that, and pretending otherwise would be worse than
-//! the staleness. Fixing it means re-registering a shrunken endpoint set
-//! mid-serve, which is a coordinator-side conversation about what a
-//! re-registration means for consumers already bound to the old set — a
-//! protocol question, not a combinator question. What is chosen here is the
-//! lesser wrong: a stale coordinate fails one dial, where the old behaviour
-//! failed the entire process, including the transports that were still fine.
-//! A consumer already re-resolves a dependency whose connection dropped (see
-//! [`Host::dependency_budget`](crate::Host::dependency_budget)), so a stale
-//! coordinate is a case the cluster has a path through; a host that exited had
-//! taken every one of its transports down with it.
+//! **Which coordinates to drop is not decided here.** A transport knows what it
+//! contributed and this combinator does not, so each accept loop arrives
+//! carrying its own [`Withdraw`] — `|e| e.ws.clear()` for ws, and so on — built
+//! where the transports are assembled and behind the same `cfg` they are. That
+//! is what keeps `transport` a pure log label with nothing branching on it, and
+//! what makes it impossible to add a transport whose death matches no arm.
+//!
+//! What this does **not** close is the last-transport case. When the final
+//! accept loop ends, this future resolves and the host is on its way down with
+//! it: the coordinator connection is dropped by the same shutdown, so there is
+//! nobody left to send a withdrawal to. That instance leaves the registry the
+//! way an instance always has — by falling silent, one TTL later. Withdrawing
+//! into a connection that is being torn down would be a line of code that
+//! looked like a guarantee and delivered nothing.
+//!
+//! See [`BoundHost::serve_until`](crate::BoundHost::serve_until) for what
+//! remains of the staleness window once this is in place.
 
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::watch;
 use tracing::warn;
 
-use crate::HostError;
+use crate::{Endpoints, HostError};
 
 /// A transport's forever-running accept loop.
 pub(crate) type Serve = BoxFuture<'static, Result<(), HostError>>;
 
-/// One transport's accept loop, labelled with the transport it belongs to.
+/// How one transport's death is subtracted from a service's coordinates.
+///
+/// A plain `fn` pointer rather than a boxed closure: every one of these is a
+/// non-capturing one-liner clearing one field, and there is exactly one per
+/// transport for the whole host.
+pub(crate) type Withdraw = fn(&mut Endpoints);
+
+/// One transport's accept loop, labelled with the transport it belongs to and
+/// carrying what its death costs.
 ///
 /// The label exists for exactly one reason: the log line that says a transport
-/// is gone has to name which one, and a bare future cannot be asked. It is a
-/// `&'static str` rather than an enum because nothing branches on it — a
-/// feature-gated enum would be three `cfg`s buying a value no caller reads.
+/// is gone has to name which one, and a bare future cannot be asked. It stays a
+/// `&'static str` rather than an enum because **nothing branches on it** — the
+/// one thing that has to vary per transport travels as [`Withdraw`] instead,
+/// supplied by the assembly that already knows which transport this is and is
+/// already behind that transport's `cfg`. A match on the label would have
+/// needed a wildcard arm, and the failure it would absorb — a transport whose
+/// coordinates are never withdrawn — is silent.
 pub(crate) struct TransportServe {
     /// `"ws"`, `"uds"` or `"iroh"` — what a log line calls this transport.
     transport: &'static str,
+    /// The coordinates this transport contributed, to be dropped when it stops.
+    withdraw: Withdraw,
     /// The accept loop itself.
     serve: Serve,
+}
+
+/// The coordinates this host is **currently** serving on, and the channel that
+/// republishes them when that changes.
+///
+/// # Why a `watch` rather than a queue of events
+///
+/// What the coordinator client has to send is a *full replacement*
+/// (`coord.update` takes the whole set, deliberately — see
+/// `peerline_contract::coord::UpdateArgs`), so the only thing it ever needs is
+/// the latest value. That is exactly what a `watch` channel is: a slot with a
+/// change notification, where a receiver that was busy during two changes wakes
+/// once and reads the state both of them produced. A queue of transport deaths
+/// would make the client responsible for replaying them in order into a set it
+/// would have to maintain a second copy of — two copies of one fact, and a
+/// merge rule on the receiving end, which is the shape the wire op refuses for
+/// the same reason.
+///
+/// It also makes the client a **future rather than a task**, which the
+/// coordinator client is on purpose: `changed()` is one more branch in a
+/// `select!` beside the heartbeat, with no spawn, no handle to leak, and no
+/// lifetime of its own to outlive the host.
+pub(crate) struct LiveEndpoints {
+    /// One entry per mounted service, in mount order — the same order
+    /// `Host::endpoints` built and the coordinator client's `entries` are in.
+    current: Vec<Endpoints>,
+    /// `None` when nobody is listening for changes: a host with no coordinator
+    /// has nothing to tell, and the withdrawals become bookkeeping nobody
+    /// reads. Spelled as an `Option` rather than by sending into a channel with
+    /// no receivers so that the no-coordinator path costs nothing at all.
+    tx: Option<watch::Sender<Vec<Endpoints>>>,
+}
+
+impl LiveEndpoints {
+    /// Track nothing: a host with no coordinator, or a test of the combinator
+    /// itself.
+    pub(crate) fn unwatched() -> Self {
+        Self {
+            current: Vec::new(),
+            tx: None,
+        }
+    }
+
+    /// Start from what bound, and hand back the receiver the coordinator client
+    /// holds.
+    ///
+    /// The initial value is the set that was registered, so a client that reads
+    /// before anything has died sees exactly what it published.
+    pub(crate) fn watched(initial: Vec<Endpoints>) -> (Self, watch::Receiver<Vec<Endpoints>>) {
+        let (tx, rx) = watch::channel(initial.clone());
+        (
+            Self {
+                current: initial,
+                tx: Some(tx),
+            },
+            rx,
+        )
+    }
+
+    /// Drop everything one transport contributed, and republish if that
+    /// actually removed something.
+    ///
+    /// The "if" is not an optimisation. A transport that bound but that no
+    /// service mounted contributes no coordinate, so its accept loop ending
+    /// changes nothing a consumer could observe — and waking the client to send
+    /// an identical `coord.update` would put a round trip on the wire that says
+    /// what the coordinator already believes.
+    fn withdraw(&mut self, withdraw: Withdraw) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let before = self.current.clone();
+        for endpoints in &mut self.current {
+            withdraw(endpoints);
+        }
+        if before != self.current {
+            // A closed channel means the client is already gone, which is a
+            // host on its way down rather than anything to report.
+            let _ = tx.send(self.current.clone());
+        }
+    }
 }
 
 // A host built with no transport compiled in has no accept loop to label, so
@@ -101,9 +203,14 @@ pub(crate) struct TransportServe {
     allow(dead_code)
 )]
 impl TransportServe {
-    /// Label an accept loop with the transport it belongs to.
-    pub(crate) fn new(transport: &'static str, serve: Serve) -> Self {
-        Self { transport, serve }
+    /// Label an accept loop with the transport it belongs to, and with the
+    /// coordinates its death withdraws.
+    pub(crate) fn new(transport: &'static str, withdraw: Withdraw, serve: Serve) -> Self {
+        Self {
+            transport,
+            withdraw,
+            serve,
+        }
     }
 }
 
@@ -115,34 +222,44 @@ impl TransportServe {
 /// `bind_all` refuses a host on which nothing bound — and it is spelled out
 /// rather than asserted because a future that parked forever on an empty set
 /// would be a hang where this is a return.
-pub(crate) async fn serve_all(serves: Vec<TransportServe>) -> Result<(), HostError> {
+pub(crate) async fn serve_all(
+    serves: Vec<TransportServe>,
+    mut endpoints: LiveEndpoints,
+) -> Result<(), HostError> {
+    type Ended = (&'static str, Withdraw, Result<(), HostError>);
     // `FuturesUnordered` rather than a hand-rolled `select`: the set shrinks by
     // one each time a loop ends, and this is the combinator that both polls all
-    // of them and *forgets* the one that finished. The label rides along inside
-    // each future because the set hands back only the output.
-    let mut live: FuturesUnordered<BoxFuture<'static, (&'static str, Result<(), HostError>)>> =
-        serves
-            .into_iter()
-            .map(|s| {
-                let TransportServe { transport, serve } = s;
-                Box::pin(async move { (transport, serve.await) })
-                    as BoxFuture<'static, (&'static str, Result<(), HostError>)>
-            })
-            .collect();
+    // of them and *forgets* the one that finished. The label and the withdrawal
+    // ride along inside each future because the set hands back only the output.
+    let mut live: FuturesUnordered<BoxFuture<'static, Ended>> = serves
+        .into_iter()
+        .map(|s| {
+            let TransportServe {
+                transport,
+                withdraw,
+                serve,
+            } = s;
+            Box::pin(async move { (transport, withdraw, serve.await) }) as BoxFuture<'static, Ended>
+        })
+        .collect();
 
-    while let Some((transport, result)) = live.next().await {
+    while let Some((transport, withdraw, result)) = live.next().await {
         // The completed future is already out of the set, so an empty set here
         // means the transport that just ended was the last one listening. Its
-        // result is the host's: there is nothing left to degrade to.
+        // result is the host's: there is nothing left to degrade to, and
+        // nothing to withdraw *to* either — see the module docs.
         if live.is_empty() {
             return result;
         }
+        // Before the log line, so that an operator reading "continuing without
+        // it" is reading about a host that has already stopped advertising it.
+        endpoints.withdraw(withdraw);
         match result {
             Err(e) => warn!(
                 transport,
                 error = %e,
                 "peerline-host: accept loop failed; continuing without it. Coordinates \
-                 already published for this transport will not answer"
+                 published for this transport have been withdrawn"
             ),
             // Not an error and still not nothing: whatever was reachable on
             // this transport is not reachable any more, and a coordinate for it
@@ -150,7 +267,7 @@ pub(crate) async fn serve_all(serves: Vec<TransportServe>) -> Result<(), HostErr
             Ok(()) => warn!(
                 transport,
                 "peerline-host: accept loop ended; continuing without it. Coordinates \
-                 already published for this transport will not answer"
+                 published for this transport have been withdrawn"
             ),
         }
     }
@@ -175,9 +292,38 @@ mod tests {
 
     use std::time::Duration;
 
+    use peerline_contract::HostId;
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    /// The three withdrawals, spelled here exactly as `Listening::into_serves`
+    /// spells them. Written out rather than imported because the real ones live
+    /// behind three `cfg`s and a test must not stop compiling when a transport
+    /// is switched off — what is under test is the arithmetic, not the wiring.
+    fn drops_ws(e: &mut Endpoints) {
+        e.ws.clear();
+    }
+    fn drops_uds(e: &mut Endpoints) {
+        e.uds.clear();
+    }
+    fn drops_iroh(e: &mut Endpoints) {
+        e.iroh.clear();
+    }
+
+    /// One service reachable on all three transports — the set a host of this
+    /// shape would have registered at `Ready`.
+    fn everywhere() -> Endpoints {
+        Endpoints {
+            host: HostId::new("pl-test"),
+            ws: vec!["ws://127.0.0.1:9000/".to_string()],
+            uds: vec!["/tmp/svc.sock".to_string()],
+            iroh: vec![peerline_contract::IrohDial {
+                ticket: "ticket".to_string(),
+                alpn: "peerline/svc".to_string(),
+            }],
+        }
+    }
 
     /// An accept loop that fails immediately, the way a listener that is gone
     /// would.
@@ -217,10 +363,13 @@ mod tests {
     #[tokio::test]
     async fn a_dead_accept_loop_leaves_the_others_answering() {
         let (ask, uds) = answers();
-        let mut all = Box::pin(serve_all(vec![
-            TransportServe::new("ws", dies("ws serve: listener gone")),
-            TransportServe::new("uds", uds),
-        ]));
+        let mut all = Box::pin(serve_all(
+            vec![
+                TransportServe::new("ws", drops_ws, dies("ws serve: listener gone")),
+                TransportServe::new("uds", drops_uds, uds),
+            ],
+            LiveEndpoints::unwatched(),
+        ));
 
         // Two round trips, each polling the combined future throughout: the ws
         // arm has already failed by the first one, so both answers are proof
@@ -251,10 +400,13 @@ mod tests {
             let _ = uds_fails.await;
             Err(HostError::Serve("uds serve: the socket was removed".into()))
         });
-        let mut all = Box::pin(serve_all(vec![
-            TransportServe::new("ws", dies("ws serve: listener gone")),
-            TransportServe::new("uds", uds),
-        ]));
+        let mut all = Box::pin(serve_all(
+            vec![
+                TransportServe::new("ws", drops_ws, dies("ws serve: listener gone")),
+                TransportServe::new("uds", drops_uds, uds),
+            ],
+            LiveEndpoints::unwatched(),
+        ));
 
         // ws has failed and the host is still going.
         let stopped = tokio::time::timeout(Duration::from_millis(50), &mut all).await;
@@ -274,10 +426,14 @@ mod tests {
     /// zero exit still ahead of it.
     #[tokio::test]
     async fn a_lone_transport_that_fails_takes_the_host_with_it() {
-        let err = serve_all(vec![TransportServe::new(
-            "iroh",
-            dies("iroh serve: the endpoint closed"),
-        )])
+        let err = serve_all(
+            vec![TransportServe::new(
+                "iroh",
+                drops_iroh,
+                dies("iroh serve: the endpoint closed"),
+            )],
+            LiveEndpoints::unwatched(),
+        )
         .await
         .expect_err("nothing else was listening");
         assert!(
@@ -293,10 +449,13 @@ mod tests {
     async fn a_loop_that_ends_cleanly_is_dropped_like_any_other() {
         let (ask, uds) = answers();
         let ended_cleanly: Serve = Box::pin(async { Ok(()) });
-        let mut all = Box::pin(serve_all(vec![
-            TransportServe::new("ws", ended_cleanly),
-            TransportServe::new("uds", uds),
-        ]));
+        let mut all = Box::pin(serve_all(
+            vec![
+                TransportServe::new("ws", drops_ws, ended_cleanly),
+                TransportServe::new("uds", drops_uds, uds),
+            ],
+            LiveEndpoints::unwatched(),
+        ));
 
         let (reply_tx, reply_rx) = oneshot::channel();
         ask.send(reply_tx).expect("the uds loop is still running");
@@ -312,13 +471,104 @@ mod tests {
         all.await.expect("the last loop ended without failing");
     }
 
+    /// **The staleness, closed.** A transport dies, the host goes on serving —
+    /// and what it advertises stops naming the transport that is gone, while
+    /// the ones still answering are untouched.
+    ///
+    /// This is the half that used to be missing. The policy above already said
+    /// the survivors keep answering; what nobody was told was that the dead
+    /// transport's URL stayed in the registry, so a consumer could be handed an
+    /// address whose only possible outcome was a failed dial.
+    #[tokio::test]
+    async fn a_dead_transport_is_withdrawn_from_the_published_endpoints() {
+        let (ask, uds) = answers();
+        let (live, mut published) = LiveEndpoints::watched(vec![everywhere()]);
+        let mut all = Box::pin(serve_all(
+            vec![
+                TransportServe::new("ws", drops_ws, dies("ws serve: listener gone")),
+                TransportServe::new("uds", drops_uds, uds),
+            ],
+            live,
+        ));
+
+        // A round trip proves the host is still serving *and* drives the
+        // combinator far enough to have absorbed the ws failure.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        ask.send(reply_tx).expect("the uds loop is still running");
+        tokio::select! {
+            r = &mut all => panic!("the host stopped serving: {r:?}"),
+            a = reply_rx => a.expect("the uds loop answered"),
+        };
+
+        let changed = tokio::select! {
+            r = &mut all => panic!("the host stopped serving: {r:?}"),
+            c = published.changed() => c,
+        };
+        changed.expect("the withdrawal was published");
+        let now = published.borrow_and_update();
+        let svc = now.first().expect("one service");
+        assert!(
+            svc.ws.is_empty(),
+            "the dead transport's coordinates are still advertised: {:?}",
+            svc.ws
+        );
+        assert_eq!(
+            svc.uds,
+            everywhere().uds,
+            "a transport that is still answering must keep its coordinates"
+        );
+        assert_eq!(svc.iroh, everywhere().iroh, "and so must iroh");
+        assert_eq!(
+            svc.host,
+            everywhere().host,
+            "the host token names a filesystem namespace, not a listener; losing a \
+             transport does not move this process to another machine"
+        );
+    }
+
+    /// A transport whose death removes nothing publishes nothing. A host with
+    /// no iroh coordinate to lose must not wake its coordinator client to send
+    /// a `coord.update` restating what the registry already holds.
+    #[tokio::test]
+    async fn withdrawing_a_transport_that_contributed_nothing_publishes_no_change() {
+        let mut only_uds = everywhere();
+        only_uds.ws.clear();
+        only_uds.iroh.clear();
+
+        let (ask, uds) = answers();
+        let (live, published) = LiveEndpoints::watched(vec![only_uds]);
+        let mut all = Box::pin(serve_all(
+            vec![
+                TransportServe::new("iroh", drops_iroh, dies("iroh serve: the endpoint closed")),
+                TransportServe::new("uds", drops_uds, uds),
+            ],
+            live,
+        ));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        ask.send(reply_tx).expect("the uds loop is still running");
+        tokio::select! {
+            r = &mut all => panic!("the host stopped serving: {r:?}"),
+            a = reply_rx => a.expect("the uds loop answered"),
+        };
+
+        assert!(
+            !published.has_changed().expect("the sender is alive"),
+            "a transport that advertised nothing withdrew something"
+        );
+    }
+
     /// Nothing to serve resolves rather than parks. Unreachable through the
     /// host — a bind that produced no listener is already an error — and
     /// pinned anyway, because the alternative failure mode is a hang, which is
     /// the one thing a test would not notice.
     #[tokio::test]
     async fn serving_nothing_resolves_immediately() {
-        let served = tokio::time::timeout(Duration::from_millis(50), serve_all(Vec::new())).await;
+        let served = tokio::time::timeout(
+            Duration::from_millis(50),
+            serve_all(Vec::new(), LiveEndpoints::unwatched()),
+        )
+        .await;
         served
             .expect("an empty set does not park")
             .expect("and it is not a failure");
@@ -329,10 +579,13 @@ mod tests {
     /// break.
     #[tokio::test]
     async fn nothing_failing_serves_forever() {
-        let all = serve_all(vec![
-            TransportServe::new("ws", lives()),
-            TransportServe::new("uds", lives()),
-        ]);
+        let all = serve_all(
+            vec![
+                TransportServe::new("ws", drops_ws, lives()),
+                TransportServe::new("uds", drops_uds, lives()),
+            ],
+            LiveEndpoints::unwatched(),
+        );
         let stopped = tokio::time::timeout(Duration::from_millis(50), all).await;
         assert!(stopped.is_err(), "the host resolved: {stopped:?}");
     }

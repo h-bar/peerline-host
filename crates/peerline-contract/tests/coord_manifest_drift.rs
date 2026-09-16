@@ -79,8 +79,9 @@ use std::path::PathBuf;
 
 use peerline_contract::coord::{
     self, AwaitReadyArgs, BindingGraph, Edge, Heartbeat, HeartbeatResult, InstanceInfo, Listing,
-    ReadyArgs, ReadyResult, RegisterAck, RegisterArgs, ResolveArgs, ResolveResult, ServiceEntry,
-    SingletonOccupied, Unresolved, WatchEvent,
+    ReadyArgs, ReadyResult, RegisterAck, RegisterArgs, ResolveArgs, ResolveResult,
+    ServiceEndpoints, ServiceEntry, SingletonOccupied, Unresolved, UpdateAck, UpdateArgs,
+    WatchEvent,
 };
 use peerline_contract::spec::{
     Directory, Field, FieldState, Manifest, OpKind, Schema, Tagging, TypeDef, const_name,
@@ -197,6 +198,40 @@ where
                      type reads it as `{}`.",
                     back.get(&field.name)
                         .map_or_else(|| "nothing at all".to_string(), |v| v.to_string())
+                );
+            }
+            // Both halves of the pair, because the difference between this and
+            // `Default` is a *direction* and only one of them is about reading.
+            // No `coord/1` field is in this state today; the arm is here so
+            // that one arriving is checked rather than waved through, and so
+            // that this test stops compiling if the format grows a sixth state.
+            FieldState::OptionalDefault(expected) => {
+                let decoded = absent.unwrap_or_else(|err| {
+                    panic!(
+                        "{here} is declared with a default, but the Rust type refuses an object \
+                         that omits it: {err}. It is required in Rust."
+                    )
+                });
+                let back = serde_json::to_value(&decoded)
+                    .unwrap_or_else(|err| panic!("{here}: re-serialising failed: {err}"));
+                // The reading half: absence has to mean exactly the declared
+                // value, as it does for `Default`.
+                let reread = back.get(&field.name).cloned().unwrap_or(Value::Null);
+                assert!(
+                    back.get(&field.name).is_none() || &reread == expected,
+                    "{here}: the manifest says an absent key means `{expected}`, and the Rust \
+                     type reads it as `{reread}`."
+                );
+                // The writing half, which is the whole of what this state adds:
+                // a writer must *omit* the key when the value is the default,
+                // so a decoder in another language has to apply the default to
+                // real traffic and not only to hand-written requests.
+                assert!(
+                    back.get(&field.name).is_none(),
+                    "{here} is declared optional-with-a-default, so a value equal to the default \
+                     must be written as an absent key — the Rust type wrote `{reread}`. Either \
+                     the manifest means plain `default`, or the Rust type is missing a \
+                     `skip_serializing_if`."
                 );
             }
         }
@@ -407,6 +442,13 @@ fn service_entry() -> ServiceEntry {
     }
 }
 
+fn service_endpoints() -> ServiceEndpoints {
+    ServiceEndpoints {
+        service: "storage".to_string(),
+        endpoints: endpoints(),
+    }
+}
+
 fn instance_info() -> InstanceInfo {
     InstanceInfo {
         instance: "storage-0".to_string(),
@@ -497,6 +539,13 @@ fn every_op_is_declared_with_the_kind_and_the_shapes_the_rust_side_uses() {
             OpKind::Unary,
             Some("Heartbeat"),
             Reply("HeartbeatResult"),
+        ),
+        (
+            "OP_UPDATE",
+            coord::OP_UPDATE,
+            OpKind::Unary,
+            Some("UpdateArgs"),
+            Reply("UpdateAck"),
         ),
         (
             "OP_RESOLVE",
@@ -605,7 +654,10 @@ fn every_error_code_and_its_data_shape_match_the_constants() {
             code: coord::ERR_UNKNOWN_INSTANCE,
             name: "unknown_instance",
             data: None,
-            raised_by: &["coord.await_ready"],
+            // Two ops name an instance the coordinator is expected to already
+            // hold. `ready` and `heartbeat` answer a value instead, which is
+            // why they are not here — see the error's prose.
+            raised_by: &["coord.await_ready", "coord.update"],
         },
         Row {
             konst: "ERR_UNRESOLVED",
@@ -739,6 +791,22 @@ fn the_coord_shapes_match_the_hand_written_types() {
         "Heartbeat",
         &Heartbeat {
             instance: "storage-0".to_string(),
+        },
+    );
+    check_struct(m, "ServiceEndpoints", &service_endpoints());
+    check_struct(
+        m,
+        "UpdateArgs",
+        &UpdateArgs {
+            instance: "storage-0".to_string(),
+            services: vec![service_endpoints()],
+        },
+    );
+    check_struct(
+        m,
+        "UpdateAck",
+        &UpdateAck {
+            id: "storage-0".to_string(),
         },
     );
     check_struct(m, "ResolveArgs", &ResolveArgs::by("fs-0", contract_id()));

@@ -17,6 +17,7 @@
 //! | [`OP_REGISTER`] | unary | declare produces / consumes / endpoints |
 //! | [`OP_READY`] | unary | mark serving; may answer [`ReadyResult::UnknownInstance`] |
 //! | [`OP_HEARTBEAT`] | unary | liveness against the TTL; may answer [`HeartbeatResult::UnknownInstance`] |
+//! | [`OP_UPDATE`] | unary | replace where this instance is reachable, mid-serve |
 //! | [`OP_RESOLVE`] | unary | the ready producers of one contract |
 //! | [`OP_AWAIT_READY`] | stream | one [`Binding`] per consumed contract as it resolves |
 //! | [`OP_LIST`] | unary | the whole registry, for a dashboard or a CLI |
@@ -68,6 +69,42 @@
 //! re-register-and-re-ready path it already has. The cost is one response per
 //! host per second, which is nothing.
 //!
+//! # Why there is an [`OP_UPDATE`], and why it replaces rather than patches
+//!
+//! [`OP_REGISTER`] is sent at startup and on reconnect, and until [`OP_UPDATE`]
+//! existed those were the *only* moments a coordinator learned where an
+//! instance could be reached. A host, however, keeps serving as long as
+//! anything is listening: a ws accept loop that dies does not end the process,
+//! it costs that one transport. The registered coordinates then described a ws
+//! URL that no longer answered, and went on describing it for the life of the
+//! process — so a consumer resolving that contract was handed an address that
+//! could only fail to dial.
+//!
+//! `update` closes that. It carries the endpoint set the host is serving on
+//! **right now**, and the coordinator replaces what it holds with it.
+//!
+//! **A full replacement, never a delta.** The host is the only party that knows
+//! where it is listening, so a round trip that says "here is all of it" is
+//! idempotent: sending it twice, or sending it after a reconnect that already
+//! re-registered the same set, changes nothing. A delta would need the
+//! coordinator to hold a merge rule that the host also holds — the same
+//! objection [`WatchEvent::Upsert`] records for carrying whole instances rather
+//! than patches — and the two would eventually disagree about a set that
+//! nothing else can reconcile.
+//!
+//! The replacement covers the whole instance, not only the services named in
+//! it: a registered service the args do not mention is left with **no**
+//! coordinates. That is the conservative direction, and the choice is between
+//! two failure modes rather than between a failure and safety. A sender that
+//! under-reports makes a service unselectable, which is loud — it appears in
+//! [`InstanceInfo::unreachable`], and §8 already defines exactly what a
+//! coordinate-less service is. A merge that kept what it was not told about
+//! would instead keep handing out the stale address, silently, which is the
+//! bug this op exists to end.
+//!
+//! An update is also proof that the sender is alive, so a coordinator refreshes
+//! liveness on it exactly as it does for any other op.
+//!
 //! # Errors: value or `RpcError`?
 //!
 //! Both appear, and the split is deliberate. A recoverable protocol state with
@@ -78,6 +115,19 @@
 //! [`ERR_UNRESOLVED`], a timeout that ends the process). Errors carry a
 //! stable [`RpcError::code`] plus structured `data`, so a caller matches on
 //! the code rather than on a message.
+//!
+//! [`OP_UPDATE`] answers an unregistered instance with
+//! [`ERR_UNKNOWN_INSTANCE`] rather than with a value, and it is worth saying
+//! why it sits on the other side of that line from `ready` and `heartbeat`.
+//! Those two are **lifecycle transitions** whose answer a host branches its own
+//! state machine on — each was very nearly a notification, and the whole
+//! argument for making them requests was that the state they report must not be
+//! droppable. `update` is a plain write against an entry that is supposed to
+//! already exist, and "there is no such entry" is precisely what
+//! [`ERR_UNKNOWN_INSTANCE`] already means for [`OP_AWAIT_READY`]. The recovery
+//! is the same either way — re-register, and re-`ready` if already serving —
+//! and a host reaching it from here has not learned anything new about its own
+//! lifecycle, only that this particular write landed nowhere.
 //!
 //! [`Binding`]: crate::Binding
 //! [`RpcError::code`]: https://docs.rs/peerline
@@ -111,6 +161,20 @@ pub const OP_READY: &str = "coord.ready";
 /// already serving is *told*, rather than heartbeating forever into a registry
 /// that has forgotten it. See the module docs.
 pub const OP_HEARTBEAT: &str = "coord.heartbeat";
+/// Replace where this instance is reachable, without re-declaring what it
+/// produces. Unary, [`UpdateArgs`] -> [`UpdateAck`]; raises
+/// [`ERR_UNKNOWN_INSTANCE`].
+///
+/// Sent mid-serve, whenever the set of transports a host is actually answering
+/// on changes — which for a peerline host means a transport whose accept loop
+/// died while the others carried on. Without it the coordinates published at
+/// `Ready` were the only ones a coordinator ever had, and a dead transport's
+/// URL stayed in the registry for the life of the process.
+///
+/// **It replaces; it does not patch, and it does not re-declare.** See the
+/// module docs for why a full endpoint set is the only shape that stays
+/// idempotent, and [`UpdateArgs`] for what the args do *not* carry.
+pub const OP_UPDATE: &str = "coord.update";
 /// The ready producers of one contract, best first. Unary, [`ResolveArgs`] ->
 /// [`ResolveResult`].
 pub const OP_RESOLVE: &str = "coord.resolve";
@@ -193,10 +257,19 @@ pub const OP_BINDINGS: &str = "coord.bindings";
 /// endpoints safe: the new coordinates are handed to nobody until the process
 /// that reported them says it is serving.
 pub const ERR_INSTANCE_EXISTS: i32 = 1001;
-/// The named instance is not registered. Answered by [`OP_AWAIT_READY`] when
-/// the caller never registered or its entry has already expired.
+/// The named instance is not registered — it never registered, or its entry
+/// has already expired.
 ///
-/// [`OP_READY`] does **not** use this code — see [`ReadyResult`].
+/// Raised by [`OP_AWAIT_READY`] and by [`OP_UPDATE`]: both name an instance
+/// the coordinator is expected to already hold, and neither has anything to do
+/// with an entry that is not there.
+///
+/// [`OP_READY`] and [`OP_HEARTBEAT`] do **not** use this code — they answer a
+/// value instead ([`ReadyResult`], [`HeartbeatResult`]), because they are
+/// lifecycle transitions a host branches its own state machine on. The module
+/// docs state where that line falls and why [`OP_UPDATE`] is on this side of
+/// it. The **recovery is identical** wherever it comes from: re-register, and
+/// re-send [`OP_READY`] if already serving.
 pub const ERR_UNKNOWN_INSTANCE: i32 = 1002;
 /// [`OP_AWAIT_READY`] hit its deadline with required contracts outstanding.
 /// `data` is an [`Unresolved`].
@@ -364,6 +437,79 @@ pub enum ReadyResult {
     /// was resolving. Re-register and re-send [`OP_READY`]; do **not** re-run
     /// [`OP_AWAIT_READY`], which is a one-shot startup step.
     UnknownInstance,
+}
+
+/// One service's current coordinates, as [`OP_UPDATE`] reports them.
+///
+/// # Why this is not a [`ServiceEntry`]
+///
+/// A `ServiceEntry` carries `produces` and `consumes` as well as `endpoints`,
+/// and both of those default to empty. An update built out of one would
+/// therefore be unable to say "my coordinates changed" without also appearing
+/// to say something about the contracts I declare — and since the empty list is
+/// both the default and a meaningful value, a coordinator could not tell an
+/// update that omitted them from one that withdrew them. The declarations are
+/// [`OP_REGISTER`]'s to state and nothing else's to touch, so the shape that
+/// carries an update simply has no field for them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceEndpoints {
+    /// Which mounted service these coordinates belong to, spelled exactly as
+    /// [`ServiceEntry::service`] spelled it at registration. A name the
+    /// registration did not declare is not an error and is ignored: it names
+    /// nothing the coordinator holds.
+    pub service: String,
+    /// Where that service is reachable **now**, on every transport that is
+    /// still answering. Empty is a legal and meaningful value: it says this
+    /// service can no longer be dialled on anything, which is exactly what §8
+    /// already spells for a service whose every transport failed to bind, and
+    /// it makes the service unselectable rather than removing it.
+    pub endpoints: Endpoints,
+}
+
+/// Args for [`OP_UPDATE`] — where this instance is reachable now, in full.
+///
+/// **This is the whole set, not the part that changed.** The coordinator
+/// replaces what it holds: a registered service absent from `services` is left
+/// with no coordinates at all. See the module docs for why a replacement is the
+/// only shape that is safe to send twice, and why under-reporting is the
+/// failure this trades for.
+///
+/// What it deliberately does not carry: `pid`, `produces`, `consumes`, or
+/// anything else [`OP_REGISTER`] established. An update is not a
+/// re-registration — it does not clear readiness, it cannot collide
+/// ([`ERR_INSTANCE_EXISTS`]), and it cannot be refused for cardinality
+/// ([`ERR_SINGLETON_OCCUPIED`]), because it changes nothing any of those three
+/// are about. A host that really has changed what it declares has restarted,
+/// and a restart re-registers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateArgs {
+    /// The instance whose coordinates these are, as registered.
+    pub instance: String,
+    /// Every service this process mounts, with the coordinates it is serving
+    /// on right now.
+    ///
+    /// An empty list is legal and says the whole instance is unreachable —
+    /// every transport it had is gone, and it is still running. It is not a
+    /// deregistration: the entry stays, its `consumes` still gate its own
+    /// readiness, and the TTL is still what eventually removes it.
+    #[serde(default)]
+    pub services: Vec<ServiceEndpoints>,
+}
+
+/// Reply to [`OP_UPDATE`] — the instance whose coordinates were replaced,
+/// echoed back.
+///
+/// It echoes for [`RegisterAck`]'s reason: a caller that sees its own id come
+/// back has confirmation the coordinator applied the replacement to the entry
+/// it meant. Spelled as its own type rather than a reuse of [`RegisterAck`]
+/// for the reason [`HeartbeatResult`] is not [`ReadyResult`] — the two answer
+/// different questions, and a field added to one would otherwise be an
+/// unannounced field on the other.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateAck {
+    /// The instance id that was updated — always equal to
+    /// [`UpdateArgs::instance`].
+    pub id: String,
 }
 
 /// Args for [`OP_RESOLVE`].

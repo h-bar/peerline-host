@@ -5,8 +5,8 @@ coordinator, in the language-neutral contract-manifest format that
 `peerline-contract-spec` defines and validates.
 
 - **`coord.v1.json`** — the `coord.*` ops: register, await_ready, ready,
-  heartbeat, resolve, list, bindings, watch. Eight ops, sixteen wire types,
-  four error codes.
+  heartbeat, update, resolve, list, bindings, watch. Nine ops, nineteen wire
+  types, four error codes.
 - **`peerline.contract.v1.json`** — a *vocabulary*: the shapes a service
   declares about itself and the coordinates it is handed back. No ops, and
   nothing produces it. It is separate because the same shapes travel on paths
@@ -65,6 +65,22 @@ On `{"status": "unknown_instance"}` from either `coord.ready` or
 `coord.await_ready`.** It is a one-shot startup step, its bindings are already
 in hand, and re-running it parks the process on dependencies it has already
 resolved.
+
+There is a fifth step, and it has no place in the sequence because it is not
+part of starting up:
+
+5. Whenever the set of transports you are actually answering on changes, call
+   `coord.update` with the coordinates you are serving on **now** — all of
+   them, not the ones that changed. A process that keeps running after one of
+   its transports stops listening otherwise leaves an address in the registry
+   that can only fail to dial.
+
+A joiner that binds one transport, or that exits when any transport dies, never
+sends it. `coord.update` raises `unknown_instance` rather than answering a
+value, and the recovery is the one above — and note that the re-registration it
+sends you to **carries your current coordinates**, so it is itself the update.
+That is also why a joiner whose coordinator connection is down has nothing to
+queue: reconnecting re-registers, and re-registering re-states where you are.
 
 ### The environment
 
