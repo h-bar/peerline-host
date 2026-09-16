@@ -1458,6 +1458,604 @@ fn every_scalar_has_a_row_whose_columns_agree() {
     }
 }
 
+// --- maps: the shape the format could not carry ---------------------------
+
+/// One struct with one map field, at whichever value type a test wants.
+fn with_map(value: &str, extra: &str) -> String {
+    format!(
+        r#"{{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "types": [
+            {{ "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [
+                {{ "name": "env", "type": {{ "map": {value} }} {extra},
+                  "description": "Environment for this instance, keyed by variable name." }} ] }}
+        ],
+        "ops": [ {{ "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." }} ]
+    }}"#
+    )
+}
+
+/// `BTreeMap`, not `HashMap`, and the reason is the wire rather than taste: a
+/// `HashMap`'s iteration order is unspecified and randomised per process, so
+/// two encodings of one value differ and every byte comparison downstream —
+/// a golden file, a `--check`, a wire test asserting literal JSON — stops
+/// working. The keys are strings, so the `Ord` the ordered map wants is free.
+#[test]
+fn a_map_generates_an_ordered_map_keyed_by_string() {
+    let tokens = expand(&with_map(r#""string""#, ""));
+    assert!(
+        tokens.contains(
+            "pub env : :: std :: collections :: BTreeMap < :: std :: string :: String , \
+             :: std :: string :: String >"
+        ),
+        "{tokens}",
+    );
+    assert!(
+        !tokens.contains("HashMap"),
+        "an unordered map would make one value two encodings: {tokens}",
+    );
+}
+
+/// The rung is a list's: never `Copy`, because the thing owns an allocation,
+/// and `Eq` exactly when the values are exact. The keys never enter into it —
+/// they are strings, which are always exact.
+#[test]
+fn a_maps_rung_is_a_lists() {
+    let exact = expand(&with_map(r#""i53""#, ""));
+    assert!(exact.contains("cmp :: Eq"), "{exact}");
+    assert!(
+        !exact.contains("marker :: Copy"),
+        "a map owns an allocation, so there is nothing to copy bitwise: {exact}",
+    );
+
+    let inexact = expand(&with_map(r#""f64""#, ""));
+    assert!(inexact.contains("PartialEq"), "{inexact}");
+    assert!(
+        !inexact.contains("cmp :: Eq"),
+        "a map of doubles is no more totally comparable than a list of them: {inexact}",
+    );
+}
+
+/// A required map is a required value like any other, so a constructor takes
+/// it — exactly as it takes a required `Vec`, and with no `Into` courtesy,
+/// because there is no one obvious thing a caller would otherwise be
+/// converting from.
+#[test]
+fn a_constructor_takes_a_required_map_as_it_takes_a_required_list() {
+    let tokens = expand(&with_map(r#""string""#, ""));
+    assert!(
+        tokens.contains(
+            "pub fn new (env : :: std :: collections :: BTreeMap < :: std :: string :: String , \
+             :: std :: string :: String >)"
+        ),
+        "{tokens}",
+    );
+}
+
+/// A map default is built entry by entry, and an empty one is the empty map
+/// rather than a `from([])` nobody needs.
+#[test]
+fn a_map_default_is_built_from_its_entries() {
+    let empty = expand(&with_map(r#""string""#, r#", "default": {}"#));
+    assert!(
+        empty.contains(":: std :: collections :: BTreeMap :: new ()"),
+        "{empty}",
+    );
+
+    let populated = expand(&with_map(
+        r#""string""#,
+        r#", "default": { "HOME": "/root" }"#,
+    ));
+    assert!(
+        populated.contains(
+            ":: std :: collections :: BTreeMap :: from ([(:: std :: string :: String :: from \
+             (\"HOME\") , :: std :: string :: String :: from (\"/root\"))])"
+        ),
+        "{populated}",
+    );
+}
+
+/// The doc line a caller reads names the type a caller writes, so the map has
+/// to reach the summary as well as the signature.
+#[test]
+fn a_map_is_named_in_the_docs_the_way_a_caller_would_write_it() {
+    let json = with_map(r#""string""#, "").replace(
+        r#""args": "Args","#,
+        r#""args": "Args", "result": { "map": "u32" },"#,
+    );
+    let tokens = expand(&json);
+    assert!(
+        tokens.contains("Result: `BTreeMap<String, u32>`."),
+        "{tokens}",
+    );
+}
+
+/// `ts_rs` reading the generated Rust would reach for its own idea of a
+/// `BTreeMap`, which is right in shape and wrong in the one place the
+/// manifest knows better — the value type. The override wraps whatever the
+/// value's own override is, and it spells the map the way
+/// `peerline-contract-ts` spells it, because two generators describing one
+/// shape two ways is a difference a downstream would diff and act on.
+#[test]
+fn a_map_of_a_safe_integer_is_a_record_of_numbers() {
+    let tokens = tokens(&with_map(r#""i53""#, ""), &[], &["Args"])
+        .expect("expands")
+        .to_string();
+    assert!(
+        tokens.contains(r#"# [ts (type = "Record<string, number>")]"#),
+        "{tokens}",
+    );
+
+    // And a map whose values need no override needs none itself: `ts_rs`
+    // reading a `BTreeMap<String, String>` gets that right on its own, and an
+    // attribute restating it would be a patch applied to a correct answer.
+    let plain = tokens_for_map_of(r#""string""#);
+    assert!(!plain.contains("# [ts (type"), "{plain}");
+}
+
+fn tokens_for_map_of(value: &str) -> String {
+    tokens(&with_map(value, ""), &[], &["Args"])
+        .expect("expands")
+        .to_string()
+}
+
+// --- `optional` with a `default`: the pair the format could not spell ------
+
+/// A manifest whose one field is `optional` with a `default`, at whichever
+/// type a test wants.
+fn with_pair(ty: &str, default: &str) -> String {
+    format!(
+        r#"{{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "types": [
+            {{ "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [
+                {{ "name": "id", "type": "string", "description": "Which one." }},
+                {{ "name": "dropped", "type": {ty}, "optional": true, "default": {default},
+                  "description": "How many lines this instance discarded. Absent means none." }} ] }}
+        ],
+        "ops": [ {{ "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." }} ]
+    }}"#
+    )
+}
+
+/// **The pair, as serde spells it.** `default` says what an absent key means
+/// and `skip_serializing_if` says the key is absent when the value is that —
+/// which together are one statement, and the statement `peerline-cluster`'s
+/// `SpawnDiagnostic` had to make in prose because the format could not carry
+/// it. Both attributes are pinned literally, because what they *do* is the
+/// whole feature and what they *are* can only be read here.
+#[test]
+fn the_pair_generates_a_default_and_a_skip_predicate_that_name_each_other() {
+    let tokens = expand(&with_pair(r#""u53""#, "0"));
+    assert!(
+        tokens.contains(
+            "# [serde (default = \"Args::default_dropped\" , \
+             skip_serializing_if = \"Args::is_default_dropped\")]"
+        ),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains("pub fn default_dropped () -> u64 { 0 }"),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains(
+            "pub fn is_default_dropped (value : & u64) -> bool { * value == Self :: \
+             default_dropped () }"
+        ),
+        "the predicate must compare against the same default the getter produces: {tokens}",
+    );
+}
+
+/// The Rust type is the bare type, not an `Option`. An `Option` would be a
+/// third state in the Rust that the wire does not have: a holder could tell
+/// "absent" from "the default", and the contract says those are one thing.
+#[test]
+fn the_pair_is_not_an_option_in_rust() {
+    let tokens = expand(&with_pair(r#""u53""#, "0"));
+    assert!(tokens.contains("pub dropped : u64"), "{tokens}");
+    assert!(
+        !tokens.contains("pub dropped : :: core :: option :: Option"),
+        "{tokens}",
+    );
+}
+
+/// A plain `default` is untouched by any of this — no predicate, no
+/// `skip_serializing_if`, the key written every time. The two states differ
+/// in a direction, and the expansion has to differ in exactly that.
+#[test]
+fn a_plain_default_gains_no_predicate() {
+    let json = with_pair(r#""u53""#, "0").replace(r#""optional": true, "#, "");
+    let tokens = expand(&json);
+    assert!(
+        tokens.contains("# [serde (default = \"Args::default_dropped\")]"),
+        "{tokens}",
+    );
+    assert!(!tokens.contains("skip_serializing_if"), "{tokens}");
+    assert!(!tokens.contains("is_default_dropped"), "{tokens}");
+}
+
+/// The doc line states both halves, because a reader of the generated Rust
+/// can see the type and the attributes and still not know which value is the
+/// one that goes unwritten.
+#[test]
+fn the_pairs_doc_line_says_what_absence_means_and_what_goes_unwritten() {
+    let tokens = expand(&with_pair(r#""string""#, r#""unnamed""#));
+    assert!(
+        tokens.contains(
+            "doc = \" Absent means `\\\"unnamed\\\"`; a value equal to that is omitted on the \
+             way out rather than written.\""
+        ),
+        "the value is rendered as JSON, so a string default is visibly a string: {tokens}",
+    );
+}
+
+/// A constructor takes what the shape *requires*, and the pair requires
+/// nothing — absence is legal on the wire, so a caller who says nothing has
+/// said something complete. The field starts at the default rather than at
+/// nothing, which is what the note has to say.
+#[test]
+fn a_constructor_omits_the_pair_and_starts_it_at_the_default() {
+    let tokens = expand(&with_pair(r#""u53""#, "7"));
+    assert!(
+        tokens.contains(
+            "pub fn new (id : impl :: core :: convert :: Into < :: std :: string :: String >)"
+        ),
+        "only the required field is a parameter: {tokens}",
+    );
+    assert!(tokens.contains("dropped : 7"), "{tokens}");
+    assert!(
+        tokens.contains(
+            "doc = \" Its remaining fields start at what the manifest says an unspecified one \
+             means.\""
+        ),
+        "a field in the pair does not start absent — it starts at the default: {tokens}",
+    );
+    assert!(
+        !tokens.contains("doc = \" Its optional fields start absent.\""),
+        "{tokens}",
+    );
+}
+
+/// A struct whose every field is in the pair has a canonical empty form, and
+/// `Default` is written out rather than derived for the same reason it always
+/// was: the manifest's answer is not the Rust type's.
+#[test]
+fn a_shape_of_nothing_but_the_pair_still_gets_a_default_impl() {
+    let json = with_pair(r#""u53""#, "7").replace(
+        r#"{ "name": "id", "type": "string", "description": "Which one." },"#,
+        "",
+    );
+    let tokens = expand(&json);
+    assert!(
+        tokens.contains("impl :: core :: default :: Default for Args"),
+        "{tokens}",
+    );
+    assert!(tokens.contains("dropped : 7"), "{tokens}");
+    assert!(!tokens.contains("pub fn new"), "{tokens}");
+}
+
+/// The pair works through every composite, which is what makes it a state
+/// rather than a scalar trick. An empty list or an empty map is the commonest
+/// default there is, and "omitted when empty" is precisely the wire form
+/// serde produces for it.
+#[test]
+fn the_pair_reaches_lists_maps_and_named_shapes() {
+    for (ty, default, expected) in [
+        (
+            r#"{ "array": "string" }"#,
+            "[]",
+            ":: std :: vec :: Vec :: new ()",
+        ),
+        (
+            r#"{ "map": "string" }"#,
+            "{}",
+            ":: std :: collections :: BTreeMap :: new ()",
+        ),
+    ] {
+        let tokens = expand(&with_pair(ty, default));
+        assert!(tokens.contains(expected), "{ty}: {tokens}");
+        assert!(
+            tokens.contains("skip_serializing_if = \"Args::is_default_dropped\""),
+            "{ty}: {tokens}",
+        );
+    }
+}
+
+/// A union arm's fields get the pair too, and the generated names carry the
+/// arm's prefix — so two arms with a field of one name give two getters and
+/// two predicates rather than one of each.
+#[test]
+fn a_union_arms_field_gets_its_own_getter_and_predicate() {
+    const ARMS: &str = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "types": [
+            { "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [ { "name": "id", "type": "string", "description": "Which one." } ] },
+            { "form": "union", "name": "Note", "tag": "kind", "description": "One item.",
+              "variants": [
+                { "name": "line", "description": "Something was said.",
+                  "fields": [ { "name": "count", "type": "u32", "optional": true, "default": 0,
+                                "description": "How many. Absent means none." } ] },
+                { "name": "gap", "description": "Something was missed.",
+                  "fields": [ { "name": "count", "type": "u32", "optional": true, "default": 1,
+                                "description": "How many. Absent means one." } ] } ] }
+        ],
+        "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." } ]
+    }"#;
+    let tokens = expand(ARMS);
+    for arm in ["line", "gap"] {
+        assert!(
+            tokens.contains(&format!("pub fn default_{arm}_count () -> u32")),
+            "{tokens}",
+        );
+        assert!(
+            tokens.contains(&format!(
+                "skip_serializing_if = \"Note::is_default_{arm}_count\""
+            )),
+            "{tokens}",
+        );
+    }
+    assert!(
+        tokens.contains("pub fn is_default_line_count (value : & u32)"),
+        "{tokens}"
+    );
+    assert!(
+        tokens.contains("pub fn is_default_gap_count (value : & u32)"),
+        "{tokens}"
+    );
+}
+
+/// The one thing the pair asks of a shape, asked here with the whole
+/// directory open — which is the half `peerline-contract-spec` cannot answer,
+/// because an imported shape's fields are in a file it did not parse.
+///
+/// The field is a **list** of the imported shape, and it has to be: a default
+/// naming an imported type directly is already refused by the validator, on
+/// the grounds that a default has to be checkable where it is written. An
+/// empty list is checkable anywhere, so the manifest parses — and then the
+/// `f64` that decides the question is in the *vocabulary*, where nothing in
+/// the importing file shows it and only this check can see it at all.
+#[test]
+fn the_pair_is_refused_where_an_imported_shape_cannot_be_compared_exactly() {
+    let json = IMPORTING.replace(
+        r#"{ "name": "shared", "type": "Shared",
+                        "description": "The shared shape." }"#,
+        r#"{ "name": "shared", "type": { "array": "Shared" }, "optional": true,
+                        "default": [], "description": "The shared shapes." }"#,
+    );
+    // The validator, which cannot see inside the vocabulary, accepts it.
+    Manifest::parse(&json).expect("an empty list is checkable in any file");
+
+    let err = alongside(
+        &json,
+        &[&vocab("f64")],
+        &[("demo.vocab/1", to(quote!(::demo_vocab)))],
+        &[],
+        false,
+    )
+    .expect_err("`Shared` holds an `f64`, which is not exactly comparable")
+    .to_string();
+    assert!(err.contains("`Args.shared`"), "{err}");
+    assert!(err.contains("skip_serializing_if"), "{err}");
+    assert!(err.contains("not comparable for exact equality"), "{err}");
+    assert!(
+        err.contains("`demo.thing/1`"),
+        "the message must name the manifest to change: {err}",
+    );
+
+    // The same import at a rung that *is* exact is fine, which is what makes
+    // the check about the shape rather than about importing.
+    alongside(
+        &json,
+        &[&vocab("string")],
+        &[("demo.vocab/1", to(quote!(::demo_vocab)))],
+        &[],
+        false,
+    )
+    .expect("a vocabulary of exact scalars is comparable");
+}
+
+// --- newtypes: a name for a shape that is already something else -----------
+
+/// One newtype over whichever inner schema a test wants, with a struct that
+/// holds it so the name is used as well as declared.
+fn with_newtype(inner: &str) -> String {
+    format!(
+        r#"{{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "types": [
+            {{ "form": "newtype", "name": "HostId", "newtype": {inner},
+              "description": "Which host, in the coordinator's namespace." }},
+            {{ "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [ {{ "name": "host", "type": "HostId",
+                            "description": "Where." }} ] }}
+        ],
+        "ops": [ {{ "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." }} ]
+    }}"#
+    )
+}
+
+/// **The wire claim.** `#[serde(transparent)]` is the whole of it: a `HostId`
+/// serialises as its single field and deserialises from whatever that field
+/// would, so the name is this target's and the bytes are the inner shape's.
+/// Without it serde would write a one-element array, and the name would have
+/// changed the contract rather than described it.
+#[test]
+fn a_newtype_is_transparent_on_the_wire() {
+    let tokens = expand(&with_newtype(r#""string""#));
+    assert!(tokens.contains("# [serde (transparent)]"), "{tokens}");
+    assert!(
+        tokens.contains("pub struct HostId (pub :: std :: string :: String)"),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains("doc = \" On the wire this is a `String` and nothing else"),
+        "the docs say it too, because a reader of the type cannot see serde's rules: {tokens}",
+    );
+}
+
+/// The ways in and out. `new` matches every other generated constructor down
+/// to the `Into` courtesy a string-ish inner shape gets; `From` in both
+/// directions is what lets the name be put on and taken off at a seam with
+/// `.into()`, which is where a conversion is least in the way.
+#[test]
+fn a_newtype_has_a_constructor_and_a_conversion_each_way() {
+    let tokens = expand(&with_newtype(r#""string""#));
+    assert!(
+        tokens.contains(
+            "pub fn new (value : impl :: core :: convert :: Into < :: std :: string :: String >) \
+             -> Self { Self (value . into ()) }"
+        ),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains("pub fn into_inner (self) -> :: std :: string :: String { self . 0 }"),
+        "{tokens}",
+    );
+    assert!(
+        tokens.contains("pub fn get (& self) -> & :: std :: string :: String { & self . 0 }"),
+        "{tokens}",
+    );
+    assert!(
+        tokens
+            .contains("impl :: core :: convert :: From < :: std :: string :: String > for HostId"),
+        "{tokens}",
+    );
+    assert!(
+        tokens
+            .contains("impl :: core :: convert :: From < HostId > for :: std :: string :: String"),
+        "{tokens}",
+    );
+}
+
+/// A name is free in Rust, and it would not be free if the wrapper cost a
+/// rung. The rung comes off the inner shape, unchanged.
+#[test]
+fn a_newtypes_rung_is_the_inner_shapes() {
+    let copyable = expand(&with_newtype(r#""i53""#));
+    assert!(copyable.contains("marker :: Copy"), "{copyable}");
+
+    let total = expand(&with_newtype(r#""string""#));
+    assert!(total.contains("cmp :: Eq"), "{total}");
+    assert!(!total.contains("marker :: Copy"), "{total}");
+
+    let partial = expand(&with_newtype(r#""f64""#));
+    assert!(partial.contains("PartialEq"), "{partial}");
+    assert!(!partial.contains("cmp :: Eq"), "{partial}");
+}
+
+/// A newtype over a composite is the composite with a name on it, and the
+/// generated field type is exactly what the bare schema would have generated.
+#[test]
+fn a_newtype_may_name_a_composite() {
+    let list = expand(&with_newtype(r#"{ "array": "string" }"#));
+    assert!(
+        list.contains(
+            "pub struct HostId (pub :: std :: vec :: Vec < :: std :: string :: String >)"
+        ),
+        "{list}",
+    );
+
+    let map = expand(&with_newtype(r#"{ "map": "u32" }"#));
+    assert!(
+        map.contains(
+            "pub struct HostId (pub :: std :: collections :: BTreeMap < :: std :: string :: \
+             String , u32 >)"
+        ),
+        "{map}",
+    );
+}
+
+/// A field of a newtype type names the newtype, and a default of one is the
+/// inner value with the wrapper put back on — because the wire is the inner
+/// value and the Rust is the wrapper.
+#[test]
+fn a_newtype_is_used_by_name_and_defaults_through_its_inner_shape() {
+    let json = with_newtype(r#""string""#).replace(
+        r#""type": "HostId","#,
+        r#""type": "HostId", "default": "local","#,
+    );
+    let tokens = expand(&json);
+    assert!(tokens.contains("pub host : HostId"), "{tokens}");
+    assert!(
+        tokens.contains("pub fn default_host () -> HostId { HostId (:: std :: string :: String :: from (\"local\")) }"),
+        "{tokens}",
+    );
+}
+
+/// A newtype is a shape this expansion declares, so an `inline` import copies
+/// it exactly as it copies a struct — out of the manifest that declares it,
+/// with that manifest's prose.
+#[test]
+fn an_inlined_import_copies_a_newtype_like_any_other_shape() {
+    const NEWTYPE_VOCAB: &str = r#"{
+        "contract": "demo.vocab", "version": 1, "role": "vocabulary",
+        "description": "The shapes more than one contract carries.",
+        "types": [
+            { "form": "newtype", "name": "Shared", "newtype": "string",
+              "description": "A name for the string both contracts pass." }
+        ]
+    }"#;
+    let tokens = alongside(
+        IMPORTING,
+        &[NEWTYPE_VOCAB],
+        &[("demo.vocab/1", inline())],
+        &[],
+        false,
+    )
+    .expect("expands")
+    .to_string();
+    assert!(tokens.contains("pub struct Shared (pub"), "{tokens}");
+    assert!(tokens.contains("# [serde (transparent)]"), "{tokens}");
+    assert!(
+        tokens.contains("doc = \" A name for the string both contracts pass.\""),
+        "the copy carries the vocabulary's prose: {tokens}",
+    );
+    assert!(!tokens.contains(":: demo_vocab"), "{tokens}");
+}
+
+/// And it is a shape the `typescript` clause may name, with the same member
+/// rule every other shape answers to — `ts_rs` derives through what a newtype
+/// wraps as readily as through a struct's fields.
+#[test]
+fn a_newtype_may_be_exported_and_drags_its_inner_shape_into_the_clause() {
+    const HOLDS_AN_ENUM: &str = r#"{
+        "contract": "demo.thing", "version": 1,
+        "description": "Why this contract exists.",
+        "types": [
+            { "form": "enum", "name": "Level", "description": "How bad.",
+              "variants": [ { "name": "info", "description": "Fine." } ] },
+            { "form": "newtype", "name": "Severity", "newtype": "Level",
+              "description": "A name for how bad it is." },
+            { "form": "struct", "name": "Args", "description": "What a call carries.",
+              "fields": [ { "name": "level", "type": "Severity",
+                            "description": "How bad." } ] }
+        ],
+        "ops": [ { "name": "demo.thing.go", "kind": "unary", "args": "Args",
+                   "description": "Do the thing." } ]
+    }"#;
+    let both = tokens(HOLDS_AN_ENUM, &[], &["Severity", "Level"])
+        .expect("expands")
+        .to_string();
+    assert_eq!(both.matches("derive (:: ts_rs :: TS)").count(), 2, "{both}");
+
+    let err = tokens(HOLDS_AN_ENUM, &[], &["Severity"])
+        .expect_err("`Severity` wraps a `Level`")
+        .to_string();
+    assert!(err.contains("add `Level` to the clause"), "{err}");
+}
+
 /// The two rows where `ts_rs` reading the Rust alone gets it wrong, and the
 /// nine where it does not. A safe integer generates an `i64`, which `ts_rs`
 /// maps to `bigint` — correct for a value that may exceed the safe range and

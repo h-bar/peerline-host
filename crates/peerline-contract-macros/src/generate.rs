@@ -446,6 +446,10 @@ fn member_names(def: &TypeDef) -> Vec<String> {
     match def {
         TypeDef::Struct { fields, .. } => fields.iter().for_each(|f| push(&f.ty)),
         TypeDef::Enum { .. } => {}
+        // A newtype reaches exactly what it wraps. It matters here for the
+        // same two reasons every other member does: an `inline` import has to
+        // drag the inner shape in behind it, and `ts_rs` derives through it.
+        TypeDef::Newtype { newtype, .. } => push(newtype),
         TypeDef::Union { variants, .. } => {
             for variant in variants {
                 variant.fields.iter().for_each(|f| push(&f.ty));
@@ -461,6 +465,9 @@ fn member_names(def: &TypeDef) -> Vec<String> {
 fn collect_named(schema: &Schema, out: &mut Vec<String>) {
     match schema {
         Schema::Array { array } => collect_named(array, out),
+        // A map's keys are strings and name nothing; its values are a schema
+        // like any other.
+        Schema::Map { map } => collect_named(map, out),
         Schema::Nullable { nullable } => collect_named(nullable, out),
         Schema::Named(name) => {
             if Scalar::from_keyword(name).is_none() {
@@ -509,8 +516,17 @@ struct ScalarTarget {
     ///
     /// `peerline-contract-ts` carries its own copy of this column (a
     /// proc-macro crate exports nothing but macros, so it cannot share
-    /// ours); its `scalar` module cross-checks the two tables in a test.
-    /// A new scalar edits both, and that test is what says so.
+    /// ours); its `scalar` module cross-checks the two tables in a test,
+    /// `this_table_agrees_with_the_macro_crates_typescript_column`. A new
+    /// scalar edits both, and that test is what says so. That module's own
+    /// docs point back here, so whichever a reader reaches first tells them
+    /// the other exists.
+    ///
+    /// The **composites** are kept in step by hand the same way and are not
+    /// in this column: [`ts_override`] wraps a leaf answer as `Array<…>`,
+    /// `Record<string, …>` or `… | null`, and `peerline-contract-ts` spells
+    /// them identically. A downstream diffing the two generators has to see
+    /// one shape described one way.
     ///
     /// Two rows carry one. A safe integer generates an `i64`, which `ts_rs`
     /// maps to `bigint` — correct for a value that may exceed the safe range
@@ -593,6 +609,10 @@ fn scalar_target(scalar: Scalar) -> ScalarTarget {
 fn ts_override(schema: &Schema) -> Option<String> {
     match schema {
         Schema::Array { array } => ts_override(array).map(|inner| format!("Array<{inner}>")),
+        // `Record<string, V>`, which is what `peerline-contract-ts` writes for
+        // the same schema — the two generators have to name one shape one way
+        // or a downstream diffing them sees a difference that is not one.
+        Schema::Map { map } => ts_override(map).map(|inner| format!("Record<string, {inner}>")),
         Schema::Nullable { nullable } => {
             ts_override(nullable).map(|inner| format!("{inner} | null"))
         }
@@ -1400,6 +1420,7 @@ fn shape(
             let ty = ident(name, span)?;
             let prose = docs(description);
             let exported = bindings.is_exported(name);
+            check_comparable_defaults(name, fields, owner, dir, span)?;
             let decls = fields
                 .iter()
                 .map(|f| field_decl(&ty, "", f, bindings, span, Visibility::Public, exported))
@@ -1417,6 +1438,97 @@ fn shape(
                 #defaults
                 #ctor
                 #default_impl
+            })
+        }
+        // # A newtype is a name, and in Rust a name is free
+        //
+        // `#[serde(transparent)]` is the whole of the wire claim: the
+        // generated struct serialises as its single field and deserialises
+        // from whatever that field would, so a `HostId` on the wire is the
+        // string and nothing else. Without the attribute serde would write a
+        // one-element array or an object, and the name would have changed the
+        // contract rather than described it.
+        //
+        // Everything else here is what makes the name worth having in this
+        // target. The field is `pub` so a holder can reach the value without
+        // ceremony; `new` matches every other generated constructor,
+        // including its `Into` treatment of a string-ish inner shape;
+        // `into_inner` and `get` are the two ways back out, by value and by
+        // reference. `From` in both directions is what lets a `HostId` be
+        // built and unbuilt at a seam by `.into()`, which is where a
+        // conversion is least in the way.
+        //
+        // The rung comes off the inner shape unchanged — see `type_support` —
+        // so wrapping a `i53` in a name does not cost the `Copy` it had.
+        TypeDef::Newtype {
+            name,
+            description,
+            newtype,
+        } => {
+            let ty = ident(name, span)?;
+            let prose = docs(description);
+            let exported = bindings.is_exported(name);
+            let inner = rust_type(newtype, bindings, span);
+            let inner_name = rust_type_name(newtype);
+            let derives = comparison_derives(support_of(def, owner, dir));
+            let ts = ts_derive(exported);
+            let wire_note = doc_lines(&[
+                String::new(),
+                format!(
+                    "On the wire this is a `{inner_name}` and nothing else: the name is this \
+                     target's, and the bytes are the inner shape's."
+                ),
+            ]);
+            // The same `Into` courtesy every other constructor extends to a
+            // string-ish parameter, so `HostId::new("h1")` works without a
+            // `.to_string()` at the call site.
+            let (param, init) = match newtype {
+                Schema::Named(n) if Scalar::from_keyword(n) == Some(Scalar::String) => (
+                    quote! { value: impl ::core::convert::Into<::std::string::String> },
+                    quote! { Self(value.into()) },
+                ),
+                Schema::Named(n) if Scalar::from_keyword(n) == Some(Scalar::Path) => (
+                    quote! { value: impl ::core::convert::Into<::std::path::PathBuf> },
+                    quote! { Self(value.into()) },
+                ),
+                _ => (quote! { value: #inner }, quote! { Self(value) }),
+            };
+            let new_docs = doc_lines(&[format!("A `{name}` over a `{inner_name}`.")]);
+            let into_docs = doc_lines(&[
+                format!("The `{inner_name}` underneath, by value."),
+                String::new(),
+                "The name is a fact about this target, so there is always a way out of it.".into(),
+            ]);
+            let get_docs = doc_lines(&[format!("The `{inner_name}` underneath, by reference.")]);
+            Ok(quote! {
+                #prose
+                #wire_note
+                #[derive(::core::fmt::Debug, ::core::clone::Clone, #derives ::serde::Serialize, ::serde::Deserialize)]
+                #ts
+                #[serde(transparent)]
+                pub struct #ty(pub #inner);
+
+                impl #ty {
+                    #new_docs
+                    #[must_use]
+                    pub fn new(#param) -> Self { #init }
+
+                    #into_docs
+                    #[must_use]
+                    pub fn into_inner(self) -> #inner { self.0 }
+
+                    #get_docs
+                    #[must_use]
+                    pub fn get(&self) -> &#inner { &self.0 }
+                }
+
+                impl ::core::convert::From<#inner> for #ty {
+                    fn from(value: #inner) -> Self { Self(value) }
+                }
+
+                impl ::core::convert::From<#ty> for #inner {
+                    fn from(value: #ty) -> Self { value.0 }
+                }
             })
         }
         TypeDef::Enum {
@@ -1493,6 +1605,13 @@ fn shape(
                         });
                     }
                     (None, false) => {
+                        check_comparable_defaults(
+                            &format!("{name}.{}", v.name),
+                            &v.fields,
+                            owner,
+                            dir,
+                            span,
+                        )?;
                         let decls = v
                             .fields
                             .iter()
@@ -1641,12 +1760,44 @@ fn field_decl(
             #vis #name: #ty
         });
     }
-    if field.default.is_some() {
+    if let Some(value) = &field.default {
         let getter = default_fn_ident(owner, prefix, &field.name);
         let path = LitStr::new(&format!("{owner}::{getter}"), span);
+        if !field.optional {
+            // A default alone: absence is legal on the way *in* and carries a
+            // value, and the key is written every time on the way out.
+            return Ok(quote! {
+                #prose
+                #[serde(default = #path)]
+                #ts
+                #vis #name: #ty
+            });
+        }
+        // `optional` with a `default`: absence is legal in both directions,
+        // which is the pair serde spells `default` plus `skip_serializing_if`
+        // and this format could not express until now. The predicate is a
+        // generated inherent function comparing against the same default the
+        // getter produces, so the two halves cannot say different things
+        // about which value is the uninteresting one.
+        //
+        // The Rust type is the bare `#ty` and not an `Option`, deliberately.
+        // An `Option` would be a third state in the Rust that the wire does
+        // not have — a holder could distinguish "absent" from "the default",
+        // and the contract says those are one thing.
+        let predicate = is_default_fn_ident(owner, prefix, &field.name);
+        let predicate_path = LitStr::new(&format!("{owner}::{predicate}"), span);
+        let note = doc_lines(&[
+            String::new(),
+            format!(
+                "Absent means `{}`; a value equal to that is omitted on the way out rather \
+                 than written.",
+                json_text(value)
+            ),
+        ]);
         return Ok(quote! {
             #prose
-            #[serde(default = #path)]
+            #note
+            #[serde(default = #path, skip_serializing_if = #predicate_path)]
             #ts
             #vis #name: #ty
         });
@@ -1698,8 +1849,44 @@ fn default_fn_ident(owner: &Ident, prefix: &str, field: &str) -> Ident {
     )
 }
 
+/// The companion predicate's name, for the one field state that needs one.
+///
+/// Derived from the same two pieces the getter's name is, so that reading a
+/// `skip_serializing_if` in the expansion tells you which `default` it is
+/// paired with without looking anything up.
+fn is_default_fn_ident(owner: &Ident, prefix: &str, field: &str) -> Ident {
+    format_ident!(
+        "is_default_{prefix}{field}",
+        span = owner.span(),
+        prefix = prefix,
+        field = field
+    )
+}
+
+/// A JSON value as the text a doc line shows it as.
+///
+/// `Value`'s own `Display`, which writes compact JSON — the same rendering
+/// `peerline-contract-ts` puts in its doc comments, so the two generators
+/// describe one default with one string. A string default therefore appears
+/// quoted, which is the difference between `unnamed` and `"unnamed"` as a
+/// default and is exactly what a doc line is for.
+fn json_text(value: &Value) -> String {
+    value.to_string()
+}
+
 /// One function per defaulted field, because that is what serde's `default`
-/// attribute takes: a path to something that produces the value.
+/// attribute takes: a path to something that produces the value — plus, for a
+/// field that is `optional` as well, the predicate `skip_serializing_if`
+/// takes.
+///
+/// # Why the predicate is generated rather than written as a closure
+///
+/// `skip_serializing_if` takes a *path*, not an expression, so there has to be
+/// a named function somewhere. Generating it beside the getter is what makes
+/// the pair impossible to get out of step: both are derived from the one
+/// `default` in the manifest, so the value a reader applies to an absent key
+/// and the value a writer declines to write are the same value by
+/// construction rather than by anybody checking.
 fn default_fns(
     owner: &Ident,
     prefix: &str,
@@ -1725,6 +1912,28 @@ fn default_fns(
             #[doc(hidden)]
             #[must_use]
             pub fn #name() -> #ty { #expr }
+        });
+        if !field.optional {
+            continue;
+        }
+        let predicate = is_default_fn_ident(owner, prefix, &field.name);
+        let predicate_prose = doc_lines(&[format!(
+            "Whether `{}` is what the manifest says an absent one means, and so is omitted \
+             on the way out.",
+            field.name
+        )]);
+        // Compared through a reference on both sides: the value is borrowed
+        // from the struct being serialised and the default is a temporary, so
+        // neither is moved and no `Copy` is required of the shape. The
+        // validator has already refused this state for a shape that cannot be
+        // compared exactly, and `Bindings::resolve` re-asks with the whole
+        // directory open — so the `PartialEq` this needs is one the derives
+        // above have emitted.
+        fns.push(quote! {
+            #predicate_prose
+            #[doc(hidden)]
+            #[must_use]
+            pub fn #predicate(value: &#ty) -> bool { *value == Self::#name() }
         });
     }
     if fns.is_empty() {
@@ -1765,6 +1974,19 @@ fn default_impl(
             }
         }
     })
+}
+
+/// Whether a field's generated Rust type is an `Option`.
+///
+/// Three of the states are not, and one of those used to be reachable only by
+/// being neither optional nor nullable. `optional` with a `default` is
+/// optional *and* not an `Option`: the wire may omit the key, and what the
+/// holder gets when it is omitted is the default, which is a value of the
+/// bare type. An `Option` there would be a third state in the Rust that the
+/// wire does not have, letting a holder distinguish "absent" from "the
+/// default" when the contract says those are one thing.
+fn wraps_in_option(field: &Field) -> bool {
+    field.nullable || (field.optional && field.default.is_none())
 }
 
 /// The value of a field nobody supplied: absent, null, or the manifest's
@@ -1813,6 +2035,26 @@ fn default_expr(
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(quote! { ::std::vec::Vec::from([#(#elements),*]) })
         }
+        // A map default is the JSON object it is, built from its entries.
+        // `serde_json::Map` iterates in the order the format preserves, and
+        // the `BTreeMap` this builds sorts them again — so the built value
+        // does not depend on how the manifest happened to be written, which
+        // is the same determinism the type was chosen for.
+        Schema::Map { map } => {
+            let entries = value.as_object().expect("validated as an object");
+            if entries.is_empty() {
+                return Ok(quote! { ::std::collections::BTreeMap::new() });
+            }
+            let pairs = entries
+                .iter()
+                .map(|(key, entry)| {
+                    let value = default_expr(entry, map, types, bindings, span)?;
+                    let key = LitStr::new(key, span);
+                    Ok(quote! { (::std::string::String::from(#key), #value) })
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote! { ::std::collections::BTreeMap::from([#(#pairs),*]) })
+        }
         Schema::Named(name) => {
             if let Some(scalar) = Scalar::from_keyword(name) {
                 return Ok(scalar_default(value, scalar));
@@ -1828,6 +2070,12 @@ fn default_expr(
                     let arm = format_ident!("{}", pascal_case(&variant.name), span = span);
                     Ok(quote! { #path::#arm })
                 }
+                // A newtype is wire-identical to what it wraps, so the value
+                // is a value of the inner shape with the wrapper put back on.
+                Some(TypeDef::Newtype { newtype, .. }) => {
+                    let inner = default_expr(value, newtype, types, bindings, span)?;
+                    Ok(quote! { #path(#inner) })
+                }
                 Some(TypeDef::Struct { fields, .. }) => {
                     let object = value.as_object().expect("validated as an object");
                     let mut inits = Vec::new();
@@ -1836,7 +2084,7 @@ fn default_expr(
                         let init = match object.get(&field.name) {
                             Some(inner) => {
                                 let expr = default_expr(inner, &field.ty, types, bindings, span)?;
-                                if field.optional || field.nullable {
+                                if wraps_in_option(field) {
                                     quote! { ::core::option::Option::Some(#expr) }
                                 } else {
                                     expr
@@ -1942,12 +2190,17 @@ fn constructor(
 }
 
 /// What a constructor says about the fields it did not take.
+///
+/// A field that is `optional` *with* a `default` does not start absent — it
+/// starts at the default, and is merely omitted from the wire while it stays
+/// there. So it falls under the second line, not the first: "start absent" is
+/// reserved for the fields whose initial value really is nothing.
 fn rest_note(fields: &[Field]) -> Vec<String> {
     let rest: Vec<&Field> = fields.iter().filter(|f| !f.is_required()).collect();
     if rest.is_empty() {
         return Vec::new();
     }
-    let line = if rest.iter().all(|f| f.optional) {
+    let line = if rest.iter().all(|f| f.optional && f.default.is_none()) {
         "Its optional fields start absent.".to_string()
     } else {
         "Its remaining fields start at what the manifest says an unspecified one means.".to_string()
@@ -2072,6 +2325,61 @@ fn ctor_parts(
     Ok((params, inits))
 }
 
+/// The one field state whose Rust needs a rung, checked with the whole
+/// directory open.
+///
+/// # Why this is asked twice
+///
+/// A field that is `optional` with a `default` generates a
+/// `skip_serializing_if` predicate comparing the value against the default,
+/// so its shape has to be comparable. `peerline-contract-spec` asks that
+/// question first and answers it for everything it can see — but it parses
+/// one file, so a field whose type came from another manifest is taken on
+/// trust there, exactly as every imported shape is. Here the directory is
+/// open, so the same question has a real answer for an imported shape too,
+/// and it is asked again rather than assumed.
+///
+/// The rung is [`Support::Total`] and not `Partial`. Every generated shape
+/// carries `PartialEq`, so a `Partial` requirement would be a check that can
+/// never fire — a rule in name only. What `Total` means is what the format
+/// already says: `f64` and passthrough `json` cannot be compared for *exact*
+/// equality, and a wire form that depends on an inexact comparison is a wire
+/// form the contract cannot predict. Two encodings of one value would differ
+/// on whether the key is there at all.
+fn check_comparable_defaults(
+    owner: &str,
+    fields: &[Field],
+    manifest: &Manifest,
+    dir: &Directory,
+    span: Span,
+) -> syn::Result<()> {
+    for field in fields {
+        if field.default.is_none() || !field.optional {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        if schema_support(&field.ty, manifest, dir, &mut seen) >= Support::Total {
+            continue;
+        }
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`{owner}.{}` is `optional` with a `default`, so this expansion writes a \
+                 `skip_serializing_if` that compares the field against that default — and \
+                 `{}`, the shape it is declared as, holds a value this format says is not \
+                 comparable for exact equality (an `f64` or a passthrough `json`, here or \
+                 inside a shape it names). Whether the key reaches the wire would then depend \
+                 on a comparison the contract disclaims. Declare the field `default` alone, or \
+                 `optional` alone, in `{}`",
+                field.name,
+                rust_type_name(&field.ty),
+                manifest.id(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// How far up the ladder a shape goes, read off the manifest.
 ///
 /// Not a cosmetic question: a type that can be a `HashMap` key or compared
@@ -2101,6 +2409,12 @@ fn type_support(
             .map(|f| schema_support(&f.ty, owner, dir, seen))
             .min()
             .unwrap_or(Support::Copy),
+        // A newtype is its inner shape with a name on it, and the rung is a
+        // property of the shape. A `HostId` wrapping a `string` is `Total`
+        // like the string; one wrapping an `i53` is `Copy` like the integer —
+        // which is the point of the form being free in Rust, and it would not
+        // be free if the wrapper cost a rung.
+        TypeDef::Newtype { newtype, .. } => schema_support(newtype, owner, dir, seen),
         TypeDef::Union { variants, .. } => {
             // A union is never `Copy` today and nothing here changes that: a
             // payload variant holds whatever the payload is, and a shape that
@@ -2132,6 +2446,11 @@ fn schema_support(
     match schema {
         // A list is never `Copy`, whatever it holds.
         Schema::Array { array } => schema_support(array, owner, dir, seen).min(Support::Total),
+        // Nor is a map, and for the same reason: it owns a heap allocation,
+        // so there is nothing to copy bitwise. `Eq` still follows the values
+        // — the keys are strings and are always exact — so a map of `i53` is
+        // `Total` and a map of `f64` is `Partial`, exactly as a list would be.
+        Schema::Map { map } => schema_support(map, owner, dir, seen).min(Support::Total),
         // An absent-or-null value supports exactly what the value does.
         Schema::Nullable { nullable } => schema_support(nullable, owner, dir, seen),
         Schema::Named(name) => {
@@ -2163,6 +2482,30 @@ fn rust_type(schema: &Schema, bindings: &Bindings, span: Span) -> TokenStream {
             let inner = rust_type(array, bindings, span);
             quote! { ::std::vec::Vec<#inner> }
         }
+        // # Why `BTreeMap` and not `HashMap`
+        //
+        // Because the generated type is a **wire** type, and a wire type is
+        // serialised. `HashMap`'s iteration order is unspecified and, with
+        // the default hasher, deliberately randomised per process — so two
+        // encodings of one value differ, and everything downstream that
+        // compares bytes stops working: a golden file, a `--check` against a
+        // committed tree, a signature over a request, a cache key, a test
+        // that asserts a literal JSON body. None of those are exotic; the
+        // wire tests in this workspace are exactly that shape.
+        //
+        // `BTreeMap` orders by key, so one value has one encoding on every
+        // machine and every run. What it asks in return is `Ord` on the key,
+        // which is free here — a map's keys are strings.
+        //
+        // It also costs nothing a contract can observe. The wire is a JSON
+        // object either way, and JSON object keys are unordered by the
+        // format's own rules, so a decoder that cared about order was already
+        // reading something the contract does not promise. Choosing the
+        // ordered map is choosing the determinism for free.
+        Schema::Map { map } => {
+            let inner = rust_type(map, bindings, span);
+            quote! { ::std::collections::BTreeMap<::std::string::String, #inner> }
+        }
         Schema::Nullable { nullable } => {
             let inner = rust_type(nullable, bindings, span);
             quote! { ::core::option::Option<#inner> }
@@ -2185,6 +2528,7 @@ fn rust_type(schema: &Schema, bindings: &Bindings, span: Span) -> TokenStream {
 fn rust_type_name(schema: &Schema) -> String {
     match schema {
         Schema::Array { array } => format!("Vec<{}>", rust_type_name(array)),
+        Schema::Map { map } => format!("BTreeMap<String, {}>", rust_type_name(map)),
         Schema::Nullable { nullable } => format!("Option<{}>", rust_type_name(nullable)),
         Schema::Named(name) => match Scalar::from_keyword(name) {
             Some(scalar) => scalar_target(scalar).doc.to_owned(),

@@ -69,6 +69,12 @@ OPTIONS:
                          Whether a field with a manifest default is emitted
                          `key?: T` (default) or `key: T` (what ts-rs produces).
     --barrel             Also emit `index.ts` re-exporting every type.
+    --ops                Also emit one `.ops.ts` per contract, holding its op
+                         names and error codes as `export const`s. Off by
+                         default: without it the output is byte-for-byte what
+                         it has always been. Lands beside the types under the
+                         flat layouts (`<contract>.v<n>.ops.ts`) and inside
+                         the manifest's own folder under `--layout folder`.
     -h, --help           This.
 ";
 
@@ -307,6 +313,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "-h" | "--help" => return Ok(None),
             "--check" => check = true,
             "--barrel" => opts.barrel = true,
+            "--ops" => opts.ops = true,
             "--layout" => {
                 opts.layout = match value("--layout")?.as_str() {
                     "type" => Layout::Type,

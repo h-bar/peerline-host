@@ -3,15 +3,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Manifest, TypeDef};
+use crate::{CodeBand, Error, Manifest, TypeDef};
 
 /// Every manifest in one contracts directory, checked against each other.
 ///
-/// [`Manifest::parse`] checks one file, and three things about a contract
+/// [`Manifest::parse`] checks one file, and four things about a contract
 /// are not checkable from one file: an import naming a type the other
-/// manifest does not declare, two contracts picking the same error code, and
-/// a file whose name disagrees with what it declares. All three need the
-/// whole directory in hand, which is what this holds.
+/// manifest does not declare, two contracts picking the same error code, two
+/// contracts claiming overlapping error-code bands, and a file whose name
+/// disagrees with what it declares. All four need the whole directory in
+/// hand, which is what this holds.
 ///
 /// The directory — not the file — is the unit a contract is written in. It
 /// is what a non-Rust implementor clones, it is what `contract!` loads, and
@@ -100,6 +101,35 @@ impl Directory {
         // contracts mounted in one process is a mis-decode rather than a
         // confusing message. Obvious within a file, invisible across a
         // directory, so it is checked here.
+        //
+        // # Two checks, and the second is the one that fires early
+        //
+        // The first is the collision itself: two contracts that picked the
+        // same number. It is exact, and it is late — it fires when somebody
+        // has already written the duplicate, and it says nothing about which
+        // numbers were free.
+        //
+        // The second is the band. `Manifest::codes` is a contract claiming a
+        // *range*, and two claimed ranges may not overlap even where no
+        // number in them is spent yet. That is the check a hand-partitioned
+        // directory has been doing in its head: coagent's four contracts sit
+        // at 3001, 3101, 3201 and 3301, one code each, with every one of the
+        // four descriptions asserting the code is "distinct from every other
+        // code in this system" — four true sentences, no checker, and nothing
+        // telling the fifth author where the unclaimed hundred starts.
+        // Declaring the bands makes the partition a fact the loader holds, and
+        // makes the failure land on whoever picks an overlapping range rather
+        // than on whoever later mounts both contracts.
+        //
+        // A band is optional and absent means today's behaviour exactly. A
+        // directory may therefore hold banded and unbanded manifests at once,
+        // which is what lets one be added at a time. What that costs is
+        // honest and worth stating: an *unbanded* manifest's codes are not
+        // held out of anybody's band. Only the duplicate check sees them,
+        // because a manifest that claimed no range made no promise about
+        // where its numbers would be, and refusing it on the strength of a
+        // range somebody else declared later would make adding a band to one
+        // file a breaking change to every other.
         let mut codes: BTreeMap<i32, String> = BTreeMap::new();
         for manifest in &manifests {
             for err in &manifest.errors {
@@ -108,6 +138,22 @@ impl Directory {
                         "error code {} is declared by `{}` and by `{other}`",
                         err.code,
                         manifest.id()
+                    )));
+                }
+            }
+        }
+        let banded: Vec<(String, CodeBand)> = manifests
+            .iter()
+            .filter_map(|m| m.codes.map(|band| (m.id(), band)))
+            .collect();
+        for (i, (id, band)) in banded.iter().enumerate() {
+            for (other_id, other) in &banded[i + 1..] {
+                if band.overlaps(other) {
+                    return Err(Error::new(format!(
+                        "`{id}` claims the error-code band {band} and `{other_id}` claims \
+                         {other}; the two overlap, so a code either of them adds could be a code \
+                         the other already spent — and a consumer holding both would decode one \
+                         contract's payload behind the other's number"
                     )));
                 }
             }

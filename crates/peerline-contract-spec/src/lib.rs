@@ -98,7 +98,7 @@
 //! That rule is not specific to imports. Any key that only makes sense to one
 //! language belongs at that language's generator, not in the shared file.
 //!
-//! # Three field states, not two
+//! # The field states, and why there are more than two
 //!
 //! A field is required, **absent** when it has nothing to say
 //! ([`Field::optional`]), or **null** when it has nothing to say
@@ -113,6 +113,36 @@
 //! written in, which would leave them undescribed — the opposite of the point.
 //! So both are expressible, the difference is stated rather than lost, and the
 //! recommendation is a recommendation rather than a silent limit.
+//!
+//! [`Field::default`] is the fourth: absence with a **value**. And
+//! [`Field::default`] *with* [`Field::optional`] is the fifth, which is the
+//! same fact holding in both directions — a writer omits the key when the
+//! value is the uninteresting one, and a reader that meets an absent key
+//! applies it. That pair is what serde spells
+//! `#[serde(default = …, skip_serializing_if = …)]`, it is the commonest
+//! shape in the wires this format was written to describe, and until it was
+//! expressible a contract with such a field declared one half and put the
+//! other in prose. See [`Field::default`] for the case that made it worth
+//! adding and for the one requirement it puts on a field's shape.
+//!
+//! # Composites: lists and maps
+//!
+//! [`Schema::Array`] and [`Schema::Map`] are the two ways a value is many
+//! values. A map's keys are strings, always, because a JSON object has no
+//! other kind of member name — there is no key-type keyword and nothing one
+//! could say with it. Before the map form existed, a contract whose field was
+//! an object of strings to strings had to declare it as passthrough `json`,
+//! which says the value is not interpreted when it very much is;
+//! `peerline-cluster` carries exactly that field, with a test of its own
+//! pinning the gap.
+//!
+//! # Error codes, and the range a contract claims
+//!
+//! Two contracts in one directory may not pick the same code, and never
+//! could. [`Manifest::codes`] is how a contract says which codes are *its* —
+//! a claim on a range rather than on the numbers it happens to have spent —
+//! so that the next contract's author finds out at the moment they choose,
+//! rather than when a consumer mounts both. See [`CodeBand`].
 //!
 //! # Two integer widths are a portability fact, not a Rust one
 //!
@@ -185,6 +215,15 @@ pub struct Manifest {
     /// one, or is a scalar.
     #[serde(default)]
     pub types: Vec<TypeDef>,
+    /// The range this contract's error codes are drawn from, when it claims
+    /// one. See [`CodeBand`].
+    ///
+    /// Absent is exactly today's behaviour: the codes are checked for
+    /// uniqueness and nothing else. A manifest that never declares a band is
+    /// unaffected by every rule the key adds, which is what lets it be added
+    /// to a directory one file at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codes: Option<CodeBand>,
     /// The error codes a producer of this contract may raise, with what each
     /// one means and what it carries. Declared once and referenced by name
     /// from the ops that can raise them, because one code is normally raised
@@ -251,6 +290,74 @@ impl Manifest {
     }
 }
 
+/// The range of error codes one contract claims.
+///
+/// # Why a contract declares a range rather than picking numbers
+///
+/// [`Directory::new`](crate::Directory::new) has always refused two contracts
+/// that pick the same code, because a consumer matches on the code and then
+/// decodes the payload behind it, so a collision is a mis-decode rather than a
+/// confusing message. What it could not refuse is the *next* collision: two
+/// contracts that do not collide today and will, because neither said which
+/// numbers were its to spend.
+///
+/// That is not hypothetical, and it is not solved by care. The `coagent`
+/// contracts directory partitions its four codes by hundreds — 3001, 3101,
+/// 3201, 3301 — and the partition exists only as four hand-chosen literals
+/// whose descriptions each say the code is "distinct from every other code in
+/// this system". Every one of those sentences is true and none of them is
+/// checkable: the fifth contract's author reads four descriptions asserting
+/// distinctness and has nothing that says where the unclaimed numbers start.
+/// `peerline-cluster`'s contracts README has the same note pointing the other
+/// way — "if an error code is ever added here it must not collide with
+/// `coord/1`'s 1001–1004. No checker can see that."
+///
+/// A band is that convention, written where a checker can read it. Declaring
+/// one says two things at once: every code in this file is inside it, and no
+/// other file in this directory may claim a number in it. The second half is
+/// what makes a band worth more than a comment — it fails at the moment a new
+/// contract's author picks a range, which is the moment they can still pick a
+/// different one, rather than at the moment a consumer mounts both.
+///
+/// # Both ends are inclusive
+///
+/// `{ "start": 3100, "end": 3199 }` is a hundred codes, 3100 through 3199. An
+/// exclusive end would make the natural spelling of a hundred-wide band
+/// `3100..3200`, whose last digit belongs to the *next* band — which is the
+/// off-by-one that the partition exists to prevent, reintroduced in the key
+/// that states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeBand {
+    /// The lowest code this contract may use. Inclusive.
+    pub start: i32,
+    /// The highest code this contract may use. Inclusive, and not less than
+    /// [`Self::start`] — a band that holds nothing is a claim on nothing.
+    pub end: i32,
+}
+
+impl CodeBand {
+    /// Whether a code falls inside this band.
+    pub fn holds(&self, code: i32) -> bool {
+        (self.start..=self.end).contains(&code)
+    }
+
+    /// Whether two bands share any code at all.
+    ///
+    /// The whole of what makes two declared bands incompatible: a directory
+    /// may hold any number of bands, and they may sit anywhere, as long as no
+    /// number is claimed twice.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+impl fmt::Display for CodeBand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..={}", self.start, self.end)
+    }
+}
+
 /// What a manifest file is.
 ///
 /// Two roles, because there turned out to be two things a manifest is written
@@ -272,8 +379,11 @@ pub enum Role {
     /// the reader this format serves: an implementor who cannot fall back to
     /// somebody's code.
     ///
-    /// A vocabulary therefore declares no ops and no errors. An error code is
-    /// something a *producer* raises, and a vocabulary has no producer.
+    /// A vocabulary therefore declares no ops, no errors and no
+    /// [`Manifest::codes`] band. An error code is something a *producer*
+    /// raises, and a vocabulary has no producer; a band reserving codes for a
+    /// producer that does not exist would take numbers out of the directory's
+    /// one code space on behalf of nobody.
     Vocabulary,
 }
 
@@ -352,15 +462,16 @@ impl Prose {
     }
 }
 
-/// A type reference: a scalar keyword, a named type, an array of either, or
-/// one of those or null.
+/// A type reference: a scalar keyword, a named type, an array or map of
+/// either, or one of those or null.
 ///
 /// Written as a bare string in the common case (`"string"`, `"Fault"`), as
-/// `{ "array": … }` for a list, and as `{ "nullable": … }` where the value
-/// may be JSON `null`. A bare string that is not one of the eleven scalar
-/// keywords is a reference to a [`TypeDef`] by name or to an imported type,
-/// and the validator rejects one that does not resolve — so a misspelled
-/// scalar fails loudly rather than becoming a dangling reference.
+/// `{ "array": … }` for a list, as `{ "map": … }` for an object of string
+/// keys, and as `{ "nullable": … }` where the value may be JSON `null`. A
+/// bare string that is not one of the eleven scalar keywords is a reference to
+/// a [`TypeDef`] by name or to an imported type, and the validator rejects one
+/// that does not resolve — so a misspelled scalar fails loudly rather than
+/// becoming a dangling reference.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Schema {
@@ -370,6 +481,34 @@ pub enum Schema {
     Array {
         /// What the list holds.
         array: Box<Schema>,
+    },
+    /// A JSON object whose keys are arbitrary strings and whose values are
+    /// all the inner schema.
+    ///
+    /// # There is no key-type keyword, and there is nothing one could say
+    ///
+    /// A JSON object's keys are strings. Not "strings by convention" —
+    /// strings by grammar: there is no other kind of member name in the
+    /// format this contract travels in, and a target that decodes a JSON
+    /// object into a dictionary keyed by anything else has done a conversion
+    /// the wire did not describe. So a `key` keyword beside this one would
+    /// have exactly one legal value, which is a knob that documents nothing
+    /// and gives every generator a case to handle that no manifest can
+    /// reach. The keys are strings; that is said here, once, instead.
+    ///
+    /// What a contract *can* still say about the keys is what they mean —
+    /// environment variable names, session ids, locale tags — and that is
+    /// prose, on the field, like every other thing the shape does not carry.
+    ///
+    /// Position rules are an array's: legal wherever a list is, which is to
+    /// say anywhere except as an op's `args` (peerline wants a struct there,
+    /// not an object of unknown keys) and except as an internally tagged
+    /// arm's payload (there is nowhere inside an object of unknown keys to
+    /// put a discriminator without possibly colliding with one). A map-typed
+    /// field may not be [`Field::flatten`]ed; see that key for why.
+    Map {
+        /// What each value is. The keys are strings and are not declared.
+        map: Box<Schema>,
     },
     /// The inner schema, or JSON `null`.
     ///
@@ -528,10 +667,22 @@ impl fmt::Display for Scalar {
 
 /// One named shape.
 ///
-/// Three forms, because three is what the wire actually uses: a record, a
-/// closed set of names, and a tagged union of records. Anything else is
-/// expressible as a composition of these, and adding a fourth is a change to
-/// every generator at once.
+/// Four forms, because four is what the wire actually uses: a record, a
+/// closed set of names, a tagged union of records, and a **name for a shape
+/// that is already something else**. Anything else is expressible as a
+/// composition of these, and adding a fifth is a change to every generator at
+/// once.
+///
+/// The fourth is the odd one and is worth saying why it is here. A
+/// [`Self::Newtype`] adds nothing to the wire — it serialises as whatever it
+/// wraps, byte for byte — so on the face of it it is a form that says
+/// nothing. What it says is that two values of the same *representation* are
+/// not the same *thing*: a host id and a session id are both strings, and a
+/// contract that calls them both `string` has described a wire nobody can
+/// mix up and an API everybody can. Which targets can act on that varies —
+/// Rust makes it a distinct type for free, TypeScript cannot without
+/// breaking assignability from parsed JSON — and each generator's answer is
+/// its own, read off the same declaration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "form", rename_all = "snake_case")]
 pub enum TypeDef {
@@ -572,13 +723,62 @@ pub enum TypeDef {
         /// The variants, each with its own payload.
         variants: Vec<UnionVariant>,
     },
+    /// A name for a shape that is already something else, carrying no keys of
+    /// its own and no discriminator.
+    ///
+    /// ```jsonc
+    /// { "form": "newtype", "name": "HostId", "newtype": "string",
+    ///   "description": ["Which host, in the coordinator's namespace."] }
+    /// ```
+    ///
+    /// **Wire-identical to what it wraps.** A `HostId` on the wire is the
+    /// string; there is no envelope, no tag and no extra object. That is the
+    /// whole constraint on a generator: whatever it emits must serialise and
+    /// deserialise as the inner schema does, or the name has changed the
+    /// contract rather than described it.
+    ///
+    /// What it is *for* is the distinction between representation and
+    /// meaning. `peerline-cluster` records the motivating case: its `HostId`
+    /// is a string, its connection dialling and its socket-reachability check
+    /// are both keyed on the type, and a manifest that could only say
+    /// `string` would describe a contract whose Rust cannot be written the way
+    /// the hand-written Rust already is.
+    ///
+    /// The inner schema follows a struct field's position rules: a scalar, a
+    /// named shape, a list, a map, or a composition of those, but not a
+    /// nullable *schema* — "or null" about a named thing is
+    /// `{ "nullable": "HostId" }` at the place it is used, where the reader
+    /// can see it, rather than baked into the name so that every use of it is
+    /// silently optional.
+    ///
+    /// A newtype may not wrap itself, directly or through a chain of other
+    /// newtypes: the value would have no size in any target that generates
+    /// records, for the same reason a struct containing itself does not.
+    Newtype {
+        /// The type's name.
+        name: String,
+        /// What this name is for, and what it stops being confused with.
+        description: Prose,
+        /// The shape this is a name for.
+        ///
+        /// Spelled `newtype`, repeating the `form`, rather than `type` as a
+        /// field's is. A type definition's payload key is already its form's
+        /// own word — `fields`, `variants` — and reading `"newtype": "string"`
+        /// beside `"form": "newtype"` is how every other definition in the
+        /// file reads. `type` would also be the one key in this format that
+        /// means two different things depending on which object it is in.
+        newtype: Schema,
+    },
 }
 
 impl TypeDef {
     /// The declared name.
     pub fn name(&self) -> &str {
         match self {
-            Self::Struct { name, .. } | Self::Enum { name, .. } | Self::Union { name, .. } => name,
+            Self::Struct { name, .. }
+            | Self::Enum { name, .. }
+            | Self::Union { name, .. }
+            | Self::Newtype { name, .. } => name,
         }
     }
 
@@ -587,7 +787,8 @@ impl TypeDef {
         match self {
             Self::Struct { description, .. }
             | Self::Enum { description, .. }
-            | Self::Union { description, .. } => description,
+            | Self::Union { description, .. }
+            | Self::Newtype { description, .. } => description,
         }
     }
 }
@@ -630,6 +831,11 @@ pub struct Field {
     /// the same as a present null one in every target, so a generator omits
     /// it on the way out rather than writing `null`. The recommended way to
     /// say "nothing to say": see the crate docs.
+    ///
+    /// On its own, absence means *nothing was said*. Together with
+    /// [`Self::default`] it means something more specific — absence is legal
+    /// in both directions *and* carries a value — which is a fourth state and
+    /// is described on that key.
     #[serde(default)]
     pub optional: bool,
     /// Whether the field may be **null**: the key is always written, and its
@@ -640,6 +846,13 @@ pub struct Field {
     /// another language needs. A nullable field still *accepts* an absent key
     /// on the way in, because a decoder that tolerates less than it emits
     /// helps nobody; what it does not do is emit one.
+    ///
+    /// Also mutually exclusive with [`Self::default`], and for a reason that
+    /// does not weaken now that `optional` and `default` combine: a default
+    /// is what an **absent** key means, and a nullable field's key is never
+    /// absent on the way out. `null` and the default would be two answers to
+    /// one question, with nothing saying which a reader that saw an explicit
+    /// `null` should take.
     #[serde(default)]
     pub nullable: bool,
     /// The value a reader assumes when the key is absent.
@@ -656,6 +869,34 @@ pub struct Field {
     /// Written as JSON of the field's own declared type, and validated
     /// against it here so that a default a generator cannot emit is a parse
     /// failure rather than a surprise in one target.
+    ///
+    /// # With [`Self::optional`]: the pair the format could not spell
+    ///
+    /// On its own, a default says absence is legal **on the way in** and
+    /// carries a value; a writer still writes the key every time. Saying
+    /// `optional` as well says absence is legal in **both** directions: a
+    /// writer omits the key when the value is the declared default, and a
+    /// reader that meets an absent key applies it. The two halves are one
+    /// statement — *this value is the uninteresting one, and the uninteresting
+    /// one is not written down* — and it is the single most common shape serde
+    /// produces, `#[serde(default = …, skip_serializing_if = …)]`.
+    ///
+    /// Before the pair was expressible, a contract with such a field had to
+    /// declare one half and put the other in prose. `peerline-cluster`'s
+    /// `SpawnDiagnostic` is the recorded case: all six of its fields are
+    /// `optional`, because that is the statement about the wire, with the
+    /// meaning of an absent key written out in each field's description —
+    /// "absent means none", for a counter that is zero almost always "and is
+    /// why it is omitted rather than written out". That sentence *is* this
+    /// pair, said in a place no generator reads.
+    ///
+    /// The cost is one requirement the other states do not have: a writer
+    /// deciding whether to omit the key has to compare the value against the
+    /// default, so the field's shape must be one this format says can be
+    /// compared exactly. A shape holding an `f64` or a passthrough `json`
+    /// cannot — the format says so itself, in [`Scalar::is_exact`] — and such
+    /// a field is rejected rather than given a predicate whose answer depends
+    /// on a comparison the contract disclaims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
     /// Whether this field's own keys are written **beside** its siblings
@@ -671,6 +912,21 @@ pub struct Field {
     /// call the member. It is the one place in this format where `name` is
     /// not a JSON key, and the prose on such a field should say what it
     /// carries.
+    ///
+    /// # Not a map
+    ///
+    /// The field's type must be a named object shape. A **map** is refused
+    /// here specifically, and not as an oversight: flattening a map is a
+    /// thing serde will happily do, and what it means is *every key the
+    /// enclosing object has left over lands in here* — a catch-all for
+    /// unknown keys. That is a real and useful wire form and it is not one
+    /// any manifest in this format declares: every shape here is closed, a
+    /// key nobody declared is a decoding failure, and a flattened map would
+    /// quietly turn the enclosing object into one that accepts anything. If a
+    /// contract ever genuinely wants a catch-all it is a thing the format
+    /// should learn to *say*, with the openness visible at the shape, rather
+    /// than something a reader has to infer from the type of a flattened
+    /// field.
     #[serde(default)]
     pub flatten: bool,
     /// What this field means and why it is here. Required — see the crate
@@ -690,30 +946,28 @@ impl Field {
 
     /// Which of the states this field is in, as one value.
     ///
-    /// The three states are spelled on [`Field`] as three independent keys
-    /// because that is what reads well in the file, and the validator has
-    /// already rejected the combinations that are not a state — optional and
-    /// nullable together, or either of them with a default. A reader that has
-    /// a validated manifest in hand is therefore looking at exactly one of
-    /// [`FieldState`]'s arms, and matching on it is how a checker gets told by
-    /// its own compiler when a fourth state is added to the format. Four
-    /// booleans tested in the wrong order would just quietly pick one.
+    /// The states are spelled on [`Field`] as independent keys because that is
+    /// what reads well in the file, and the validator has already rejected the
+    /// combinations that are not a state — optional and nullable together, or
+    /// nullable with a default. A reader that has a validated manifest in hand
+    /// is therefore looking at exactly one of [`FieldState`]'s arms, and
+    /// matching on it is how a checker gets told by its own compiler when a
+    /// state is added to the format. Booleans tested in the wrong order would
+    /// just quietly pick one.
     pub fn state(&self) -> FieldState<'_> {
-        if let Some(default) = &self.default {
-            FieldState::Default(default)
-        } else if self.nullable {
-            FieldState::Nullable
-        } else if self.optional {
-            FieldState::Optional
-        } else {
-            FieldState::Required
+        match (&self.default, self.nullable, self.optional) {
+            (Some(default), _, true) => FieldState::OptionalDefault(default),
+            (Some(default), _, false) => FieldState::Default(default),
+            (None, true, _) => FieldState::Nullable,
+            (None, false, true) => FieldState::Optional,
+            (None, false, false) => FieldState::Required,
         }
     }
 }
 
 /// What a field's absence from an object means.
 ///
-/// See [`Field::state`], and the crate docs on the three field states for why
+/// See [`Field::state`], and the crate docs on the field states for why
 /// absent and null are not one answer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FieldState<'a> {
@@ -726,8 +980,47 @@ pub enum FieldState<'a> {
     /// nothing to say. See [`Field::nullable`].
     Nullable,
     /// Absence has a **value**, carried here: a reader that does not apply it
-    /// gets a different answer than one that does. See [`Field::default`].
+    /// gets a different answer than one that does. The key is nevertheless
+    /// always written on the way out, so a reader never has to apply it to
+    /// something this contract's own producer wrote. See [`Field::default`].
     Default(&'a Value),
+    /// Absence has a **value**, carried here, **and is legal on the way out**:
+    /// a writer omits the key exactly when the value equals this one.
+    ///
+    /// The difference from [`Self::Default`] is a direction, not a value. Both
+    /// say what an absent key means; this one also says that a writer of this
+    /// contract will produce absent keys, so a decoder has to apply the
+    /// default to real traffic rather than only to hand-written requests. See
+    /// [`Field::default`] for the pair this is, and for the one shape
+    /// requirement it carries that no other state does.
+    OptionalDefault(&'a Value),
+}
+
+impl FieldState<'_> {
+    /// The value an absent key means, when it means one.
+    ///
+    /// The two defaulted states differ in what a *writer* does, and a reader
+    /// applying a default does not care which: asking for the value through
+    /// this is how a decoder avoids matching two arms to do one thing, and
+    /// how it stops compiling rather than silently ignoring a third if the
+    /// format ever grows one.
+    pub fn default_value(&self) -> Option<&Value> {
+        match self {
+            Self::Default(value) | Self::OptionalDefault(value) => Some(value),
+            Self::Required | Self::Optional | Self::Nullable => None,
+        }
+    }
+
+    /// Whether a writer may leave this key out.
+    ///
+    /// True for [`Self::Optional`] and [`Self::OptionalDefault`], which are
+    /// the two states whose whole content is about the way out. A
+    /// [`Self::Nullable`] key is written as `null` and a [`Self::Default`] one
+    /// is written as its value, so neither is absent on a wire this contract
+    /// produced — even though both tolerate an absent key coming in.
+    pub fn may_be_absent(&self) -> bool {
+        matches!(self, Self::Optional | Self::OptionalDefault(_))
+    }
 }
 
 /// One value of a string enum.

@@ -59,6 +59,32 @@ fn decl(def: &TypeDef, opts: &Options) -> Decl {
     refers_to.remove(&name);
     let body = match def {
         TypeDef::Struct { fields, .. } => struct_body(fields, opts),
+        // # A plain alias, and not a branded type
+        //
+        // Rust gets a distinct type for a newtype because Rust's newtypes are
+        // free: a wrapper struct costs nothing at run time, and the value
+        // comes out with `.0` or an `Into`. TypeScript has no such thing.
+        // The nearest equivalent is a *brand* — `string & { __brand: "HostId" }`
+        // — and brands are not free here, they are expensive in exactly the
+        // place this generator's output is used.
+        //
+        // Every value of a generated type in TypeScript arrives from
+        // `JSON.parse`. A parsed string is a `string`; it is not assignable to
+        // a branded `string`, so a consumer would have to cast at every
+        // boundary — which is the boundary where the types were supposed to
+        // be helping. The brand would also leak into the JSON: `JSON.stringify`
+        // of a branded value is fine, but the brand shows up in editor hovers,
+        // in `.d.ts` output, and in every error message about a shape that
+        // does not have it. What a downstream would get is friction at the
+        // seam and no check that is not already made by the producer.
+        //
+        // So the asymmetry is real and is stated rather than papered over:
+        // Rust distinguishes `HostId` from `String`, TypeScript does not, and
+        // the manifest's prose is what carries the distinction to a
+        // TypeScript reader. That is the same answer `path` already gets —
+        // `path` is `string` here too, and what the keyword adds is prose
+        // about where the value is resolved.
+        TypeDef::Newtype { newtype, .. } => format!(" {}", ty_expr(newtype, opts)),
         TypeDef::Enum { variants, .. } => {
             let arms: Vec<String> = variants
                 .iter()
@@ -223,14 +249,35 @@ fn member(field: &Field, opts: &Options) -> Member {
         // and not `key: T`.
         FieldState::Default(value) => {
             doc.push(String::new());
-            doc.push(format!(
-                "Absent means `{}`.",
-                serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
-            ));
+            doc.push(format!("Absent means `{}`.", json_text(value)));
             match opts.defaults {
                 DefaultFields::Optional => (true, base),
                 DefaultFields::Required => (false, base),
             }
+        }
+        // Absence has a value *and* is legal on the way out. Rendered exactly
+        // as the state above — `key?: T`, with the value in the prose —
+        // because TypeScript has one type for both directions and these two
+        // states differ only in a direction. See the crate docs.
+        //
+        // `DefaultFields` is deliberately not consulted. That option exists to
+        // reproduce what the `ts_rs` route emits for a *plain* default, which
+        // is `key: T`, and it is defensible there because a producer of a
+        // plainly defaulted field really does write the key every time — the
+        // `?` is a widening chosen for the caller's benefit. Here a producer
+        // genuinely omits the key, so `key: T` would not be a conservative
+        // reading of an ambiguous case; it would be false. An option whose
+        // whole purpose is byte-compatibility with an older route has nothing
+        // to say about a state that route could not describe at all.
+        FieldState::OptionalDefault(value) => {
+            doc.push(String::new());
+            doc.push(format!("Absent means `{}`.", json_text(value)));
+            doc.push(
+                "A writer omits the key when the value is that, so an absent key is \
+                 something this contract's own producer emits."
+                    .to_string(),
+            );
+            (true, base)
         }
     };
     Member {
@@ -241,8 +288,16 @@ fn member(field: &Field, opts: &Options) -> Member {
     }
 }
 
+/// A JSON value as the text a doc comment shows it as.
+///
+/// The same rendering `peerline-contract-macros` puts in its own generated
+/// docs, so that one manifest default reads as one string in both targets.
+fn json_text(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
 /// A schema, as a TypeScript type expression.
-fn ty_expr(schema: &Schema, opts: &Options) -> String {
+pub(crate) fn ty_expr(schema: &Schema, opts: &Options) -> String {
     match schema {
         Schema::Named(name) => match Scalar::from_keyword(name) {
             Some(s) => scalar(s, opts.wide_integers).to_string(),
@@ -256,6 +311,18 @@ fn ty_expr(schema: &Schema, opts: &Options) -> String {
         // compiler, and the generic form is what the existing bindings use
         // and what stays readable when the element is itself a union.
         Schema::Array { array } => format!("Array<{}>", ty_expr(array, opts)),
+        // `Record<string, V>`, which is TypeScript's own spelling for an
+        // object whose keys are not enumerated. The key type is `string` and
+        // is not read off anything, because a JSON object's keys are strings
+        // and the schema says no more than that — there is no key-type
+        // keyword in the format and nothing one could say with it.
+        //
+        // `Record<string, never>` never arises from here. That spelling is
+        // what an *empty struct* becomes, and an empty struct is a shape with
+        // no keys; a map with no entries is a **value**, not a type, and its
+        // type is still `Record<string, V>`. The two look adjacent and are
+        // not related at all.
+        Schema::Map { map } => format!("Record<string, {}>", ty_expr(map, opts)),
         // A nullable *schema* — the form used where there is no field to
         // carry `nullable`, i.e. an op's result or item or an error's data.
         // The validator forbids it inside an array or a field, so it never
@@ -313,7 +380,7 @@ fn key(name: &str) -> String {
 /// A wire value may be any non-blank string, so it is escaped rather than
 /// interpolated: `serde_json` produces exactly a double-quoted JSON string,
 /// and a JSON string literal is a TypeScript string literal.
-fn string_literal(wire: &str) -> String {
+pub(crate) fn string_literal(wire: &str) -> String {
     serde_json::to_string(wire).unwrap_or_else(|_| format!("\"{wire}\""))
 }
 
@@ -327,6 +394,7 @@ fn collect_refs(def: &TypeDef, out: &mut BTreeSet<String>) {
                 }
             }
             Schema::Array { array } => schema(array, out),
+            Schema::Map { map } => schema(map, out),
             Schema::Nullable { nullable } => schema(nullable, out),
         }
     }
@@ -339,6 +407,9 @@ fn collect_refs(def: &TypeDef, out: &mut BTreeSet<String>) {
         TypeDef::Struct { fields: fs, .. } => fields(fs, out),
         // A closed set of strings mentions nothing.
         TypeDef::Enum { .. } => {}
+        // An alias mentions exactly what it aliases, which under the per-type
+        // and folder layouts is a file it has to import.
+        TypeDef::Newtype { newtype, .. } => schema(newtype, out),
         TypeDef::Union { variants, .. } => {
             for v in variants {
                 fields(&v.fields, out);

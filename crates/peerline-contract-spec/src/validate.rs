@@ -82,8 +82,7 @@ impl Manifest {
         self.check_header()?;
         let scope = self.check_imports_and_types()?;
         self.check_errors(&scope)?;
-        self.check_ops(&scope)?;
-        check_no_direct_recursion(&scope)
+        self.check_ops(&scope)
     }
 
     /// Check each [`Manifest::imports`] against the manifest it names.
@@ -169,6 +168,20 @@ impl Manifest {
                         self.contract
                     )));
                 }
+                // The same reasoning one step on from the errors rule above.
+                // A band is a claim on part of the directory's one code
+                // space, made so that the errors in this file have somewhere
+                // to be; a vocabulary has no producer and therefore no
+                // errors, so the claim would hold numbers out of every other
+                // contract's reach on behalf of nobody.
+                if let Some(band) = &self.codes {
+                    return Err(Error::new(format!(
+                        "`{}` is a vocabulary and claims the error-code band {band}; a band \
+                         reserves codes for the errors a producer raises, and a vocabulary has no \
+                         producer",
+                        self.contract
+                    )));
+                }
             }
         }
         check_prose("the contract", &self.description)
@@ -250,6 +263,16 @@ impl Manifest {
         }
 
         let scope = Scope { types, imported };
+        // Before anything walks a type's *contents*, check that the walk
+        // terminates. A shape that contains itself by value has no size, and
+        // it is also a shape whose fields cannot be visited: resolving a
+        // default declared on a field of a self-referential newtype would
+        // follow the name to itself forever. This check reads only the graph
+        // of names, so it is safe to run against a scope whose bodies have
+        // not been checked yet — and running it here is what makes every
+        // later walk finite by construction rather than by each walk
+        // carrying its own visited set.
+        check_no_direct_recursion(&scope)?;
         // Resolution is a second pass: a type may legally reference one
         // declared after it, and requiring declaration order would make the
         // file's reading order a constraint rather than a choice.
@@ -264,12 +287,33 @@ impl Manifest {
                     variants,
                     ..
                 } => check_union(name, *tagging, tag.as_deref(), variants, &scope)?,
+                // A newtype's inner schema sits where a struct field's type
+                // sits — it is the same position, one level of naming up —
+                // so it gets the same rule: no nullable schema, because
+                // "or null" about a named thing belongs at the place the name
+                // is used, where a reader can see it, rather than baked into
+                // the name so that every use of it is quietly optional.
+                TypeDef::Newtype { newtype, .. } => check_schema(
+                    &format!("newtype `{name}`"),
+                    newtype,
+                    &scope,
+                    Nullability::Forbidden,
+                )?,
             }
         }
         Ok(scope)
     }
 
     fn check_errors(&self, scope: &Scope<'_>) -> Result<(), Error> {
+        if let Some(band) = &self.codes
+            && band.start > band.end
+        {
+            return Err(Error::new(format!(
+                "`{}` claims the error-code band {band}, whose end is below its start; both ends \
+                 are inclusive, so a band holding no codes is a claim on nothing",
+                self.id()
+            )));
+        }
         let mut names = BTreeSet::new();
         let mut codes = BTreeSet::new();
         for err in &self.errors {
@@ -290,6 +334,22 @@ impl Manifest {
                     "error code {} is used by two errors of one contract; a consumer matches on \
                      the code and then decodes `data`, so two shapes behind one code is a \
                      mis-decode",
+                    err.code
+                )));
+            }
+            // The band is the contract's own claim about its numbers, so a
+            // code outside it is the manifest contradicting itself — caught
+            // here, in the file that made the claim, rather than as a
+            // collision in whichever directory the file later lands in.
+            if let Some(band) = &self.codes
+                && !band.holds(err.code)
+            {
+                return Err(Error::new(format!(
+                    "`{}` declares error `{}` with code {}, which is outside the band {band} this \
+                     manifest claims; move the code into the band, or widen the band and check it \
+                     still overlaps nothing else in the directory",
+                    self.id(),
+                    err.name,
                     err.code
                 )));
             }
@@ -577,6 +637,20 @@ fn check_internal_payload(
     tag: Option<&str>,
     scope: &Scope<'_>,
 ) -> Result<(), Error> {
+    // A map *is* a JSON object, so unlike a list it has somewhere to put the
+    // key — and that is exactly the problem: the keys are the contract's data
+    // and the discriminator would be one of them. A producer whose map
+    // happened to hold the tag's own key would emit an object a decoder reads
+    // as a different arm, and nothing in the schema could rule that out,
+    // because a map declares no keys at all.
+    if matches!(payload, Schema::Map { .. }) {
+        return Err(Error::new(format!(
+            "variant `{owner}`'s payload is a map, whose keys are the contract's data and are \
+             not declared — so a discriminator written beside them could collide with one, and \
+             no schema could say it does not; declare the union `\"tagging\": \"external\"`, \
+             where the arm's name is the key and the map is its whole value"
+        )));
+    }
     let Schema::Named(name) = payload else {
         return Err(Error::new(format!(
             "variant `{owner}`'s payload is a list, and an internally tagged arm has nowhere to \
@@ -601,6 +675,13 @@ fn check_internal_payload(
                 )));
             }
             Ok(())
+        }
+        // A newtype is wire-identical to what it wraps, so whether an arm can
+        // carry it is entirely a question about the inner shape — asked here
+        // by asking it. The walk terminates because the recursion check has
+        // already refused a newtype that reaches itself.
+        Some(TypeDef::Newtype { newtype, .. }) => {
+            check_internal_payload(owner, newtype, tag, scope)
         }
         Some(TypeDef::Union { .. }) | None => Ok(()),
         Some(TypeDef::Enum { .. }) => Err(Error::new(format!(
@@ -650,8 +731,8 @@ fn check_fields(
     check_key_collisions(owner, fields, tag, scope)
 }
 
-/// The three states a field may be in, and the combinations that are not a
-/// state at all.
+/// The states a field may be in, and the combinations that are not a state at
+/// all.
 fn check_field_state(here: &str, field: &Field, scope: &Scope<'_>) -> Result<(), Error> {
     if field.optional && field.nullable {
         return Err(Error::new(format!(
@@ -660,10 +741,33 @@ fn check_field_state(here: &str, field: &Field, scope: &Scope<'_>) -> Result<(),
              to know"
         )));
     }
-    if field.default.is_some() && (field.optional || field.nullable) {
+    if field.default.is_some() && field.nullable {
         return Err(Error::new(format!(
-            "{here} has a `default` and is also optional or nullable; a default is what an \
-             absent key means, so the field is neither absent nor null once it is read"
+            "{here} has a `default` and is also `nullable`; a default is what an absent key \
+             means, and a nullable key is never absent on the way out — so the two would be two \
+             answers to one question, with nothing saying which a reader that met an explicit \
+             `null` should take. `optional` with a `default` is the combination that means \
+             something: absent in both directions, and absence carries the value"
+        )));
+    }
+    // `optional` with a `default` is legal, and it is the one state whose
+    // meaning a *writer* has to compute: it omits the key exactly when the
+    // value equals the default, which means comparing them. The format
+    // already says which shapes can be compared exactly, so it can say when
+    // that comparison is not available rather than leaving a generator to
+    // emit a predicate whose answer the contract itself disclaims.
+    if field.default.is_some()
+        && field.optional
+        && let Some(scalar) = inexact_scalar(&field.ty, scope, &mut BTreeSet::new())
+    {
+        return Err(Error::new(format!(
+            "{here} is `optional` with a `default`, which says a writer omits the key when the \
+             value equals the default — but the field's shape holds a `{scalar}`, which this \
+             format says is not comparable for exact equality. Whether the key is written would \
+             then depend on a comparison the contract disclaims. Say `default` alone (the key is \
+             always written, and absence still means the default on the way in), or `optional` \
+             alone (absence means nothing was said), or move the `{scalar}` behind a shape that \
+             does not carry it"
         )));
     }
     if field.flatten {
@@ -671,6 +775,23 @@ fn check_field_state(here: &str, field: &Field, scope: &Scope<'_>) -> Result<(),
             return Err(Error::new(format!(
                 "{here} is flattened and also optional, nullable or defaulted; a flattened field \
                  has no key of its own, so there is nothing for any of those to be about"
+            )));
+        }
+        // A map is refused before the general "is a list" message, because
+        // serde would in fact flatten one and what it would mean is not what
+        // any manifest here declares: a flattened map is a catch-all for
+        // every key the enclosing object did not claim. Every shape in this
+        // format is closed and an undeclared key is a decoding failure, so a
+        // flattened map would quietly reopen the enclosing object — a
+        // semantic no manifest asked for, arrived at through the type of one
+        // field. If a contract ever wants a catch-all, the openness belongs
+        // at the shape where a reader can see it.
+        if matches!(&field.ty, Schema::Map { .. }) {
+            return Err(Error::new(format!(
+                "{here} is flattened and is a map; flattening a map means \"every key the \
+                 enclosing object did not declare lands in here\", which would turn a closed \
+                 shape into one that accepts anything — and no manifest in this format declares \
+                 that. Give the field a key of its own, or declare the keys as a struct"
             )));
         }
         let Schema::Named(name) = &field.ty else {
@@ -696,6 +817,62 @@ fn check_field_state(here: &str, field: &Field, scope: &Scope<'_>) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// The first scalar in a shape that cannot be compared for exact equality, if
+/// there is one.
+///
+/// [`Scalar::is_exact`] is the format's own answer for a keyword — `f64` and
+/// passthrough `json` are the two that are not — and this is that answer
+/// carried through lists, maps, nullables and the shapes a name resolves to.
+/// What it is for is the one field state whose wire form depends on a
+/// comparison: `optional` with a `default`, where a writer omits the key
+/// exactly when the value equals the default.
+///
+/// **An imported shape is taken on trust**, exactly as every other imported
+/// shape is: this crate parses one file and cannot open the one a name came
+/// from. The generator that *has* the directory open re-asks the same question
+/// with the far side readable, so the answer is not lost — it is deferred to
+/// the only place that can give it. That is the same division of labour
+/// [`Manifest::check_imports`] already draws.
+///
+/// `seen` stops a walk through a legal cycle — recursion through a list is
+/// allowed, and a list holding its own container is a ring of names. A name
+/// already in `seen` was either fully searched and clean, or is on the stack
+/// beneath this call and contributes no scalar the walk has not met.
+fn inexact_scalar(
+    schema: &Schema,
+    scope: &Scope<'_>,
+    seen: &mut BTreeSet<String>,
+) -> Option<Scalar> {
+    match schema {
+        Schema::Array { array } => inexact_scalar(array, scope, seen),
+        Schema::Map { map } => inexact_scalar(map, scope, seen),
+        Schema::Nullable { nullable } => inexact_scalar(nullable, scope, seen),
+        Schema::Named(name) => {
+            if let Some(scalar) = Scalar::from_keyword(name) {
+                return (!scalar.is_exact()).then_some(scalar);
+            }
+            if !seen.insert(name.to_string()) {
+                return None;
+            }
+            match scope.local(name)? {
+                // A closed set of strings holds nothing.
+                TypeDef::Enum { .. } => None,
+                TypeDef::Newtype { newtype, .. } => inexact_scalar(newtype, scope, seen),
+                TypeDef::Struct { fields, .. } => fields
+                    .iter()
+                    .find_map(|f| inexact_scalar(&f.ty, scope, seen)),
+                TypeDef::Union { variants, .. } => variants.iter().find_map(|v| {
+                    v.fields
+                        .iter()
+                        .map(|f| &f.ty)
+                        .chain(v.payload.iter())
+                        .find_map(|s| inexact_scalar(s, scope, seen))
+                }),
+            }
+        }
+    }
 }
 
 /// A flattened field contributes its type's keys to the enclosing object, so
@@ -777,6 +954,13 @@ fn check_schema(
             }
         }
         Schema::Array { array } => check_schema(owner, array, scope, Nullability::Forbidden),
+        // A map's value schema is checked exactly as an array's element
+        // schema is, down to forbidding a nullable one inside it: a list of
+        // "a thing or null" and a map of "a thing or null" are the same
+        // question, and the format answers it the same way in both — an
+        // absent key and a null value are a distinction only a *field* can
+        // draw, and neither an element nor a map value is one.
+        Schema::Map { map } => check_schema(owner, map, scope, Nullability::Forbidden),
         Schema::Nullable { nullable } => {
             if nullability == Nullability::Forbidden {
                 return Err(Error::new(format!(
@@ -821,6 +1005,19 @@ fn check_value(
             }
             Ok(())
         }
+        // A map's default is a JSON object, and every value in it is checked
+        // against the value schema. The keys are not checked against
+        // anything, because there is nothing to check them against: a map's
+        // keys are strings and the schema declares no more than that.
+        Schema::Map { map } => {
+            let Some(entries) = value.as_object() else {
+                return mismatch("an object");
+            };
+            for (key, entry) in entries {
+                check_value(&format!("{owner}'s `{key}`"), entry, map, scope)?;
+            }
+            Ok(())
+        }
         Schema::Named(name) => {
             if let Some(scalar) = Scalar::from_keyword(name) {
                 return check_scalar_value(owner, value, scalar);
@@ -846,6 +1043,11 @@ fn check_value(
                 Some(TypeDef::Struct { fields, .. }) => {
                     check_object_value(owner, value, name, fields, scope)
                 }
+                // A newtype is wire-identical to what it wraps, so a default
+                // of one is a default of the inner shape and is checked as
+                // that. No cycle can be reached from here: the recursion
+                // check refuses a newtype that reaches itself.
+                Some(TypeDef::Newtype { newtype, .. }) => check_value(owner, value, newtype, scope),
                 Some(TypeDef::Union { .. }) => Err(Error::new(format!(
                     "{owner} defaults a union; which arm a value takes when nobody said is a \
                      choice a contract should make in prose and an op should take explicitly"
@@ -965,6 +1167,16 @@ fn check_no_direct_recursion(scope: &Scope<'_>) -> Result<(), Error> {
             TypeDef::Struct { fields, .. } => push(&mut out, fields),
             // A closed set of strings holds nothing, so it ends every walk.
             TypeDef::Enum { .. } => {}
+            // A newtype holds its inner shape by value and adds nothing, so
+            // it is exactly as recursive as that shape is: a newtype of
+            // itself, or a ring of newtypes, has no size in any target that
+            // generates records. A list or a map in the ring breaks it, for
+            // the same reason and with the same message.
+            TypeDef::Newtype { newtype, .. } => {
+                if let Schema::Named(name) = newtype {
+                    out.push(name.as_str());
+                }
+            }
             TypeDef::Union { variants, .. } => {
                 for variant in variants {
                     push(&mut out, &variant.fields);

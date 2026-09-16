@@ -39,6 +39,20 @@ fn cluster() -> Directory {
     Directory::load(&dir).expect("the cluster fixture directory must parse and validate")
 }
 
+/// The second checklist: the forms the format grew after the first one was
+/// written — maps, newtypes, a field that is both absent-able and defaulted,
+/// and a contract claiming a band of the error-code space.
+///
+/// A directory of its own rather than more types in `tests/contracts`, and
+/// deliberately. Every golden the first checklist produces has to stay
+/// byte-for-byte what it was: a generator whose new features moved its old
+/// output is a generator nobody can adopt one feature at a time, and the
+/// cheapest way to prove that is to leave the old fixture alone entirely.
+fn shapes() -> Directory {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/contracts-shapes");
+    Directory::load(&dir).expect("the shapes fixture directory must parse and validate")
+}
+
 /// [`emit_directory`] where the fixtures make failure impossible, which is
 /// every call in this suite that is not about `EmitError` itself.
 fn emitted(dir: &Directory, opts: &Options) -> BTreeMap<PathBuf, String> {
@@ -176,6 +190,32 @@ fn one_folder_per_manifest() {
         ..Options::default()
     };
     check_tree("folder", &emitted(&cluster(), &opts));
+}
+
+/// The second checklist, one file per type, with the barrel and the ops file.
+/// Maps, newtypes and the absent-able default all in one readable tree.
+#[test]
+fn the_newer_forms_one_file_per_type() {
+    let opts = Options {
+        barrel: true,
+        ops: true,
+        ..Options::default()
+    };
+    check_tree("shapes", &emitted(&shapes(), &opts));
+}
+
+/// The same, one folder per manifest — which is where the ops file lands
+/// somewhere different, and where an imported newtype has to be reached
+/// across folders.
+#[test]
+fn the_newer_forms_one_folder_per_manifest() {
+    let opts = Options {
+        layout: Layout::Folder,
+        barrel: true,
+        ops: true,
+        ..Options::default()
+    };
+    check_tree("shapes-folder", &emitted(&shapes(), &opts));
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +742,402 @@ fn only_an_unknown_selection_lists_what_the_directory_holds() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The newer forms, asserted by name.
+// ---------------------------------------------------------------------------
+
+fn shapes_file(name: &str) -> String {
+    let files = emitted(
+        &shapes(),
+        &Options {
+            ops: true,
+            ..Options::default()
+        },
+    );
+    files
+        .get(&PathBuf::from(name))
+        .unwrap_or_else(|| panic!("`{name}` was not generated; files: {:?}", files.keys()))
+        .clone()
+}
+
+/// A map is `Record<string, T>`, and the key type is `string` because a JSON
+/// object's keys are strings — there is no key-type keyword in the format and
+/// nothing one could say with it.
+#[test]
+fn a_map_is_a_record_keyed_by_string() {
+    let ts = shapes_file("Environment.ts");
+    assert_has(&ts, "vars: Record<string, string>;", "a map of a scalar");
+    assert_has(
+        &ts,
+        "layers: Record<string, Array<string>>;",
+        "a map of a list, which is the two composites nesting",
+    );
+    assert_has(
+        &ts,
+        "by_host: Record<string, HostId>;",
+        "a map whose values are a named shape, which is therefore imported",
+    );
+    assert_has(
+        &ts,
+        "import type { HostId } from \"./HostId\";",
+        "a map's value schema is collected like any other reference",
+    );
+}
+
+/// `Record<string, never>` belongs to an *empty struct* — a shape with no
+/// keys — and never arises from a map. A map with no entries is a value, not
+/// a type, and its type is still `Record<string, T>`.
+#[test]
+fn an_empty_map_is_a_value_and_never_the_empty_record_type() {
+    let opts = Options {
+        ops: true,
+        ..Options::default()
+    };
+    for (_, text) in emitted(&shapes(), &opts) {
+        assert!(
+            !text.contains("Record<string, never>"),
+            "nothing in this fixture is an empty struct, so nothing should be the \
+             empty-object type:\n{text}"
+        );
+    }
+    // And the empty map that *is* here is a default value in a doc comment.
+    assert_has(
+        &shapes_file("Environment.ts"),
+        "Absent means `{}`.",
+        "an empty map is a value",
+    );
+}
+
+/// A newtype is a plain alias, not a branded type — because every value of a
+/// generated type arrives from `JSON.parse`, and a parsed string is not
+/// assignable to a branded one.
+#[test]
+fn a_newtype_is_a_plain_alias_and_never_a_brand() {
+    assert_has(
+        &shapes_file("HostId.ts"),
+        "export type HostId = string;",
+        "the inner shape, under the manifest's name",
+    );
+    assert_has(
+        &shapes_file("Millis.ts"),
+        "export type Millis = number;",
+        "a newtype over a safe integer is that integer's TypeScript",
+    );
+    assert_has(
+        &shapes_file("Labels.ts"),
+        "export type Labels = Record<string, string>;",
+        "a newtype over a composite is that composite",
+    );
+    for name in ["HostId.ts", "Millis.ts", "Labels.ts"] {
+        let ts = shapes_file(name);
+        assert!(
+            !ts.contains("__brand") && !ts.contains("unique symbol"),
+            "a brand would break assignability from parsed JSON, which is where \
+             every value comes from:\n{ts}"
+        );
+    }
+    // The prose is what carries the distinction to a TypeScript reader, since
+    // the type cannot.
+    assert_has(
+        &shapes_file("HostId.ts"),
+        "Which host, in the coordinator's own namespace.",
+        "the name means something even where the type does not distinguish it",
+    );
+}
+
+/// A newtype declared in another manifest is imported like any other shape,
+/// and under the folder layout it is reached across folders.
+#[test]
+fn an_imported_newtype_is_imported_like_any_other_shape() {
+    assert_has(
+        &shapes_file("Meta.ts"),
+        "import type { TraceId } from \"./TraceId\";",
+        "under the flat layout every reference is its own file",
+    );
+    assert_has(
+        &shapes_file("StartArgs.ts"),
+        "trace?: TraceId;",
+        "and it is used by name",
+    );
+
+    let opts = Options {
+        layout: Layout::Folder,
+        ops: true,
+        ..Options::default()
+    };
+    let files = emitted(&shapes(), &opts);
+    assert_has(
+        &files[&PathBuf::from("demo.shapes.v1/StartArgs.ts")],
+        "import type { TraceId } from \"../demo.shared.v1/TraceId\";",
+        "an imported newtype lives in the declaring manifest's own folder",
+    );
+}
+
+/// The pair — `optional` with a `default` — is `key?: T` with the value in
+/// the prose, plus the one line the type cannot carry: that a producer really
+/// does omit the key.
+#[test]
+fn an_absent_able_default_is_optional_and_says_both_halves() {
+    let ts = shapes_file("Diagnostic.ts");
+    assert_has(&ts, "dropped?: number;", "absence is legal on this wire");
+    assert_has(&ts, "Absent means `0`.", "and it carries a value");
+    assert_has(
+        &ts,
+        "A writer omits the key when the value is that, so an absent key is something \
+         this contract's own producer emits.",
+        "the direction TypeScript's one type for both directions cannot express",
+    );
+    // Through every composite and every named form the manifest has.
+    assert_has(&ts, "output?: Array<string>;", "a list");
+    assert_has(&ts, "Absent means `[]`.", "defaulting to the empty list");
+    assert_has(&ts, "labels?: Labels;", "a newtype over a map");
+    assert_has(&ts, "mode?: Mode;", "an enum");
+    assert_has(
+        &ts,
+        "Absent means `\"best-effort\"`.",
+        "whose default is the wire spelling",
+    );
+    assert_has(&ts, "host?: HostId;", "a newtype over a string");
+    assert_has(
+        &ts,
+        "Absent means `\"local\"`.",
+        "whose default is checked through to what it wraps",
+    );
+}
+
+/// `--defaults required` reproduces the `ts_rs` route for a *plain* default,
+/// and has nothing to say about the pair: a producer of a pair field really
+/// does omit the key, so `key: T` there would not be a conservative reading
+/// of an ambiguous case — it would be false.
+#[test]
+fn the_defaults_option_does_not_reach_the_absent_able_pair() {
+    let opts = Options {
+        defaults: DefaultFields::Required,
+        ..Options::default()
+    };
+    let files = emitted(&shapes(), &opts);
+    let ts = &files[&PathBuf::from("Diagnostic.ts")];
+    assert_has(
+        ts,
+        "dropped?: number;",
+        "still absent-able under the option",
+    );
+    assert_has(ts, "label?: string;", "all of them");
+    assert!(
+        !ts.contains("dropped: number;"),
+        "the option must not turn a key a producer omits into one it writes:\n{ts}"
+    );
+
+    // And the option still does what it is for, on the fixture that has a
+    // plain default.
+    let flat = emitted(&contracts(), &opts);
+    assert_has(
+        &flat[&PathBuf::from("States.ts")],
+        "include_history: boolean;",
+        "a plainly defaulted field is still emitted the ts-rs way",
+    );
+}
+
+/// An externally tagged arm may carry a map, which is the case internal
+/// tagging cannot express: the keys are the contract's data and one of them
+/// could be the discriminator.
+#[test]
+fn an_externally_tagged_arm_may_carry_a_map() {
+    let ts = shapes_file("Selector.ts");
+    assert_has(
+        &ts,
+        "\"by-label\": Labels;",
+        "the arm's wire name is the key and the map is its whole value",
+    );
+    assert_has(&ts, "\"by-host\": Array<HostId>;", "and a list beside it");
+    assert_has(&ts, "| \"everything\";", "and a bare string for a unit arm");
+}
+
+// ---------------------------------------------------------------------------
+// `--ops`: opt-in constants, in a file of their own
+// ---------------------------------------------------------------------------
+
+/// **The compatibility claim, asserted as an equality rather than argued.**
+/// With the flag off the output is exactly what it has always been; with it
+/// on, every file that was there before is byte-identical and the only
+/// difference is files that did not exist.
+#[test]
+fn the_ops_flag_only_ever_adds_files() {
+    for dir in [contracts(), cluster(), shapes()] {
+        for layout in [Layout::Manifest, Layout::Folder] {
+            for barrel in [false, true] {
+                let without = Options {
+                    layout,
+                    barrel,
+                    ..Options::default()
+                };
+                let with = Options {
+                    ops: true,
+                    ..without.clone()
+                };
+                let before = emitted(&dir, &without);
+                let after = emitted(&dir, &with);
+                for (name, text) in &before {
+                    assert_eq!(
+                        after.get(name),
+                        Some(text),
+                        "{}: `--ops` must not change a file that was already generated",
+                        name.display()
+                    );
+                }
+                assert!(
+                    after.len() > before.len(),
+                    "and it must actually add something for a directory with ops"
+                );
+                for name in after.keys() {
+                    assert!(
+                        before.contains_key(name) || name.to_string_lossy().contains("ops"),
+                        "{}: the only new files may be ops files",
+                        name.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Where the file lands under each layout: beside the types where the layout
+/// is flat, and inside the manifest's own folder where it is not.
+#[test]
+fn an_ops_file_lands_where_the_layout_already_puts_per_manifest_things() {
+    for (layout, expected) in [
+        (Layout::Type, "demo.shapes.v1.ops.ts"),
+        (Layout::Manifest, "demo.shapes.v1.ops.ts"),
+        (Layout::Folder, "demo.shapes.v1/ops.ts"),
+    ] {
+        let opts = Options {
+            layout,
+            ops: true,
+            ..Options::default()
+        };
+        let files = emitted(&shapes(), &opts);
+        assert!(
+            files.contains_key(&PathBuf::from(expected)),
+            "expected `{expected}`, got {:?}",
+            files.keys()
+        );
+    }
+}
+
+/// Nobody produces a vocabulary, so it declares no ops and raises no errors —
+/// and a file holding two empty lists would be a file with nothing in it.
+#[test]
+fn a_vocabulary_gets_no_ops_file() {
+    let opts = Options {
+        ops: true,
+        ..Options::default()
+    };
+    let files = emitted(&shapes(), &opts);
+    assert!(
+        !files.contains_key(&PathBuf::from("demo.shared.v1.ops.ts")),
+        "a vocabulary has nothing to put in one: {:?}",
+        files.keys()
+    );
+    assert!(files.contains_key(&PathBuf::from("demo.shapes.v1.ops.ts")));
+}
+
+/// The constants are the wire spellings, under the same names the Rust
+/// generator produces — a constant names one wire string, and two generators
+/// giving it two names would put the work of knowing they are the same thing
+/// back on the reader.
+#[test]
+fn the_ops_file_carries_wire_spellings_under_the_rust_generators_names() {
+    let ts = shapes_file("demo.shapes.v1.ops.ts");
+    assert_has(
+        &ts,
+        "export const OP_START = \"demo.shapes.start\";",
+        "the op name as it travels, not the short one",
+    );
+    assert_has(
+        &ts,
+        "export const OP_ENVIRONMENT_READ = \"demo.shapes.environment.read\";",
+        "a dotted op name becomes one underscored constant",
+    );
+    assert_has(
+        &ts,
+        "export const ERR_NO_SUCH_HOST = 3101;",
+        "an error code is the number a consumer matches on",
+    );
+    assert_has(
+        &ts,
+        "Start one instance and answer when it is ready.",
+        "with the manifest's prose above it",
+    );
+    assert_has(
+        &ts,
+        "Kind: stream.",
+        "plus the one line the manifest cannot write: which call to make",
+    );
+    assert_has(
+        &ts,
+        "Carried in the error's `data` as `Diagnostic`.",
+        "and what a matched code lets a consumer decode",
+    );
+}
+
+/// No barrel re-exports it. The barrels are `export type *`, which is erased
+/// at compile time; an ops file holds runtime values, and folding it in would
+/// turn every barrel from an erased import into an emitted one.
+#[test]
+fn no_barrel_re_exports_the_ops_file() {
+    for layout in [Layout::Type, Layout::Manifest, Layout::Folder] {
+        let opts = Options {
+            layout,
+            barrel: true,
+            ops: true,
+            ..Options::default()
+        };
+        let files = emitted(&shapes(), &opts);
+        for (name, text) in &files {
+            if !name.to_string_lossy().ends_with("index.ts") {
+                continue;
+            }
+            assert!(
+                !text.contains("ops"),
+                "{}: a type-only barrel cannot carry a value, and a value-carrying \
+                 one would add a runtime import to every consumer:\n{text}",
+                name.display()
+            );
+        }
+    }
+}
+
+/// `--only` governs ops files exactly as it governs types, because a subset
+/// selects manifests and an ops file is a per-manifest artefact.
+#[test]
+fn only_narrows_the_ops_files_with_everything_else() {
+    let opts = Options {
+        ops: true,
+        only: Some(vec![ContractSelector {
+            contract: "demo.shared".into(),
+            version: None,
+        }]),
+        ..Options::default()
+    };
+    let files = emitted(&shapes(), &opts);
+    assert!(
+        files.keys().all(|k| !k.to_string_lossy().contains("ops")),
+        "the vocabulary alone has no ops file: {:?}",
+        files.keys()
+    );
+
+    let opts = Options {
+        ops: true,
+        only: Some(vec![ContractSelector {
+            contract: "demo.shapes".into(),
+            version: Some(1),
+        }]),
+        ..Options::default()
+    };
+    let files = emitted(&shapes(), &opts);
+    assert!(files.contains_key(&PathBuf::from("demo.shapes.v1.ops.ts")));
+}
+
 /// Nothing generated may contain a tab or a trailing space.
 ///
 /// Not pedantry: the output is committed in somebody else's repository, and a
@@ -716,11 +1152,17 @@ fn the_output_is_stable_under_the_formatters_it_will_meet() {
         (contracts(), Layout::Folder),
         (cluster(), Layout::Manifest),
         (cluster(), Layout::Folder),
+        (shapes(), Layout::Type),
+        (shapes(), Layout::Manifest),
+        (shapes(), Layout::Folder),
     ];
     for (dir, layout) in trees {
         let opts = Options {
             layout,
             barrel: true,
+            // The ops files are committed output like any other and meet the
+            // same formatters, so they are held to the same rule.
+            ops: true,
             ..Options::default()
         };
         for (name, text) in emitted(&dir, &opts) {

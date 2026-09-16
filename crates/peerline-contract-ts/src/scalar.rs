@@ -14,8 +14,11 @@
 //!
 //! This table has no such gap: every row says what the keyword *is* in
 //! TypeScript, and the two agree everywhere the macros crate has an opinion.
-//! `scalar_matches_the_macro_crates_overrides` in `tests/mapping.rs` is that
-//! agreement written down as a test.
+//! `this_table_agrees_with_the_macro_crates_typescript_column`, in this
+//! module's own test block, is that agreement written down as a test. Named
+//! in text rather than linked: it is a `cfg(test)` item, so a link to it
+//! would resolve in a test build and dangle in the documentation anybody
+//! actually reads.
 //!
 //! **The manual-sync relationship.** The macros crate is not a dependency of
 //! this one and cannot be — it is a proc-macro crate, and a proc-macro crate
@@ -28,9 +31,20 @@
 //! notice when the macros crate *changes* an existing row's `ts` column, and
 //! the cross-check test is what fails when they do not.
 //!
-//! A one-line pointer comment on `ScalarTarget::ts` naming this module would
-//! close the loop from the other side. It is not written yet because that
-//! crate is owned elsewhere; see this crate's `README.md`.
+//! The loop is closed from the other side too: `ScalarTarget::ts` in
+//! `peerline-contract-macros` names this module and says that a new scalar
+//! edits both tables. The two comments point at each other on purpose, so
+//! that whichever one a reader reaches first tells them the other exists.
+//!
+//! # What this table is *not* asked about
+//!
+//! Only leaves. How a list, a map or a nullable wraps its inner answer is
+//! [`crate::render`]'s, and the macros crate's `ts_override` makes the
+//! matching decision for its own attribute — `Array<…>`, `Record<string, …>`,
+//! `… | null` — with the same spellings, for the same reason the leaf answers
+//! must match. A downstream diffing the two generators has to see one shape
+//! described one way, and a composite spelled differently would be a
+//! difference that is not one.
 
 use peerline_contract_spec::Scalar;
 

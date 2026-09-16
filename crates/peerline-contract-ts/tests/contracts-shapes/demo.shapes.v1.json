@@ -1,0 +1,170 @@
+{
+  "contract": "demo.shapes",
+  "version": 1,
+  "description": [
+    "A contract that exercises the forms the manifest format grew after the first checklist was written: maps, newtypes, a field that is both absent-able and defaulted, and a contract that claims a band of the error-code space.",
+    "",
+    "Like its sibling in tests/contracts, this is not a design, it is a checklist. It lives in a directory of its own so that every golden file the older checklist produces stays byte-for-byte what it was — a generator whose new features moved its old output would be a generator nobody could adopt one feature at a time."
+  ],
+
+  "codes": { "start": 3100, "end": 3199 },
+
+  "imports": [
+    { "contract": "demo.shared", "version": 1, "types": ["TraceId", "Meta"],
+      "description": ["The trace identifier and the envelope carrying it. Declared once so that two contracts carrying a trace carry the same one, rather than two strings that agree by accident."] }
+  ],
+
+  "types": [
+    {
+      "form": "newtype",
+      "name": "HostId",
+      "newtype": "string",
+      "description": [
+        "Which host, in the coordinator's own namespace.",
+        "",
+        "A string on the wire and nothing else. What the name buys is that dialling a host and asking whether a socket is reachable from one are both keyed on the type, so a plain string passed to either is a mistake a compiler can catch in the targets that have distinct types — and prose in the ones that do not."
+      ]
+    },
+    {
+      "form": "newtype",
+      "name": "Millis",
+      "newtype": "i53",
+      "description": [
+        "A duration in milliseconds.",
+        "",
+        "Over a safe integer rather than a wide one, because a duration sits many orders of magnitude inside the range every target holds exactly. The name costs nothing: a target whose newtypes are free keeps whatever the inner shape could do, including being copied."
+      ]
+    },
+    {
+      "form": "newtype",
+      "name": "Labels",
+      "newtype": { "map": "string" },
+      "description": [
+        "A set of labels, keyed by name.",
+        "",
+        "A newtype over a composite rather than over a scalar, which is the case that shows the name is a name for a shape and not a wrapper around a primitive."
+      ]
+    },
+    {
+      "form": "enum",
+      "name": "Mode",
+      "description": ["How hard to try."],
+      "variants": [
+        { "name": "best_effort", "wire": "best-effort",
+          "description": ["Do what can be done and report what could not. The wire spelling is hyphenated, so the identifier and the value are two different strings."] },
+        { "name": "strict",
+          "description": ["Refuse rather than partially succeed."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Environment",
+      "description": [
+        "The environment an instance runs with, which is the shape this format could not previously carry.",
+        "",
+        "Every field here is an object of string keys. Before the map form existed the only truthful declaration available was passthrough JSON, which says the value is not interpreted when it very much is — leaving \"object of strings to strings\" as prose an implementor had to enforce, and a request whose value was a number malformed in a way the file could not describe as malformed."
+      ],
+      "fields": [
+        { "name": "vars", "type": { "map": "string" },
+          "description": ["Variable names to values. Required: an instance always runs with some environment, even an empty one."] },
+        { "name": "counts", "type": { "map": "u32" }, "optional": true, "default": {},
+          "description": ["Per-name counters. Absent means none of them, and a writer omits the key rather than writing an empty object — which is the pair of serde attributes this format previously could not spell."] },
+        { "name": "layers", "type": { "map": { "array": "string" } },
+          "description": ["Named layers, each a list of entries. A map of a list, to show the two composites nest either way round."] },
+        { "name": "by_host", "type": { "map": "HostId" },
+          "description": ["Which host each named role resolves to. A map whose values are a newtype, so the value schema is resolved rather than assumed to be a scalar."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Diagnostic",
+      "description": [
+        "What the producer saw of an attempt that did not succeed.",
+        "",
+        "Every field may be absent and every one of them has a value when it is, which makes this shape additive in both directions: a consumer built against an earlier version ignores a key it does not know, and a consumer of this version reads an earlier producer's answer as a diagnostic with nothing in it.",
+        "",
+        "This is the shape the pair exists for. Written before it, each of these fields declared only that it was absent-able, with the meaning of an absent key stated in its own prose — a sentence no generator reads."
+      ],
+      "fields": [
+        { "name": "dropped", "type": "u53", "optional": true, "default": 0,
+          "description": ["How many lines this attempt's buffer discarded. Absent means none, which is the answer almost every time, and is why it is omitted rather than written out."] },
+        { "name": "output", "type": { "array": "string" }, "optional": true, "default": [],
+          "description": ["What the attempt said, in the order it said it. Absent means it said nothing at all, which is itself diagnostic."] },
+        { "name": "label", "type": "string", "optional": true, "default": "unnamed",
+          "description": ["What to call this attempt in a listing."] },
+        { "name": "host", "type": "HostId", "optional": true, "default": "local",
+          "description": ["Where it ran. Absent means this machine — a default whose value is checked against what the newtype wraps, because the wire is the inner shape."] },
+        { "name": "mode", "type": "Mode", "optional": true, "default": "best-effort",
+          "description": ["How hard it tried. The default is written as the wire spelling and not as the variant name, because the wire is what a default is a value of."] },
+        { "name": "labels", "type": "Labels", "optional": true, "default": {},
+          "description": ["Whatever the attempt labelled itself with. Absent means none, and the default is checked through the newtype into the map it names."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "StartArgs",
+      "description": ["What a caller asks for when starting an instance."],
+      "fields": [
+        { "name": "host", "type": "HostId",
+          "description": ["Where to start it. Required, because there is no sensible machine to guess."] },
+        { "name": "environment", "type": "Environment",
+          "description": ["What it runs with."] },
+        { "name": "budget", "type": "Millis", "optional": true, "default": 30000,
+          "description": ["How long to wait for it to become ready. Absent means half a minute, and a caller who wants that says nothing."] },
+        { "name": "trace", "type": "TraceId", "optional": true,
+          "description": ["The chain this call belongs to, when the caller has one. Absent-able without a default: there is no trace to assume, and inventing one would be claiming a chain that does not exist."] }
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Started",
+      "description": ["What a caller gets back when an instance came up."],
+      "fields": [
+        { "name": "meta", "type": "Meta",
+          "description": ["When, and on whose chain. An imported shape that itself holds an imported newtype."] },
+        { "name": "took", "type": "Millis",
+          "description": ["How long it took to become ready."] }
+      ]
+    },
+    {
+      "form": "union",
+      "name": "Selector",
+      "tagging": "external",
+      "description": [
+        "Which instances a read covers, externally tagged.",
+        "",
+        "Externally tagged because one arm carries a map, and there is nowhere safe inside an object of undeclared keys to put a discriminator — the keys are the contract's data, and one of them could be the tag. The arm's name is the key instead, and the map is its whole value."
+      ],
+      "variants": [
+        { "name": "by_label", "wire": "by-label", "payload": "Labels",
+          "description": ["Keep instances whose labels match every entry given. An empty set of labels keeps everything."] },
+        { "name": "by_host", "wire": "by-host", "payload": { "array": "HostId" },
+          "description": ["Keep instances on any of these hosts. An empty list keeps nothing."] },
+        { "name": "everything",
+          "description": ["Keep every instance. An arm with neither a payload nor fields is a bare string on the wire."] }
+      ]
+    }
+  ],
+
+  "errors": [
+    { "name": "no_such_host", "code": 3101, "data": "Diagnostic",
+      "description": [
+        "The host named is not one this coordinator knows.",
+        "",
+        "Inside the band this contract claims, which is what makes the claim worth making: the band says which numbers are this contract's to spend, so the next contract's author finds out where the free ones start without reading four other files and taking their word for it."
+      ] },
+    { "name": "would_not_start", "code": 3102, "data": "Diagnostic",
+      "description": ["The instance was reachable and did not come up. The diagnostic travels with the refusal rather than sending the caller back to ask for logs."] }
+  ],
+
+  "ops": [
+    { "name": "demo.shapes.start", "kind": "unary", "args": "StartArgs", "result": "Started",
+      "description": ["Start one instance and answer when it is ready."],
+      "errors": ["no_such_host", "would_not_start"] },
+    { "name": "demo.shapes.environment.read", "kind": "unary", "args": "StartArgs", "result": { "map": "string" },
+      "description": ["The environment an instance actually resolved to, flattened to names and values. A map as a result, which is a value like any other."] },
+    { "name": "demo.shapes.watch", "kind": "stream", "args": "StartArgs", "item": "Diagnostic",
+      "description": ["Whatever the instance reports, as it reports it."],
+      "errors": ["no_such_host"] }
+  ]
+}

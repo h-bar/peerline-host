@@ -1,0 +1,34 @@
+{
+  "contract": "demo.shared",
+  "version": 1,
+  "role": "vocabulary",
+  "description": [
+    "The shapes the newer forms are shared through, so that a newtype crossing a file is exercised as well as one declared where it is used.",
+    "",
+    "A newtype is the form most likely to live in a vocabulary: an identifier is exactly the sort of thing several contracts pass around, and a name for it is only worth having if every contract that passes it agrees on the name."
+  ],
+
+  "types": [
+    {
+      "form": "newtype",
+      "name": "TraceId",
+      "newtype": "string",
+      "description": [
+        "Which chain of calls this one belongs to.",
+        "",
+        "A string on the wire, and a distinct type wherever a target has such a thing. Two contracts that both carry one must not have to agree in prose that their two strings are the same string."
+      ]
+    },
+    {
+      "form": "struct",
+      "name": "Meta",
+      "description": ["When something happened, and what chain it belonged to."],
+      "fields": [
+        { "name": "at_ms", "type": "i53",
+          "description": ["Wall clock, in milliseconds. Inside the range every target holds exactly, which is what the keyword promises."] },
+        { "name": "trace", "type": "TraceId",
+          "description": ["The chain. An imported newtype used as a field's type is the case the folder layout has to reach across a directory for."] }
+      ]
+    }
+  ]
+}

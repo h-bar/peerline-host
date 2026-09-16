@@ -7,8 +7,22 @@ A contract manifest is a language-neutral JSON file describing one contract
 completely enough to implement it in any language (the format lives in
 `peerline-contract-spec`). This crate reads one and writes `.ts`: type aliases
 for its structs, string-literal unions for its enums, discriminated unions for
-its unions, intersections for its flattened fields, and the manifest's own
-prose as doc comments on every one of them.
+its unions, `Record<string, T>` for its maps, plain aliases for its newtypes,
+intersections for its flattened fields, and the manifest's own prose as doc
+comments on every one of them.
+
+A **newtype** is a plain alias and not a branded type, and the asymmetry with
+Rust is deliberate: every value of a generated type here arrives from
+`JSON.parse`, a parsed string is a `string`, and a branded one would not be
+assignable from it — so a consumer would cast at exactly the boundary the types
+were meant to help at. The manifest's prose carries the distinction instead,
+which is the answer `path` already gets for the same reason.
+
+A field that is both `optional` and `default` is `key?: T` with the value in
+the doc comment — the same rendering as a plain default, because the two differ
+in a *direction* and TypeScript has one type for both. The line the type cannot
+carry is written in the prose: that a producer really does omit the key, so an
+absent one is normal traffic and not just a permission granted to callers.
 
 ```console
 $ peerline-contract-ts contracts/ bindings/
@@ -65,6 +79,35 @@ that dangled would only be caught by a downstream type-checker. A bare name
 is every version the directory holds; an unknown name or version is an error
 listing what the directory does hold.
 
+## `--ops`, and why it is off by default
+
+A manifest declares op names and error codes, and `--ops` emits them as
+`export const`s — one file per contract, with the manifest's prose above each,
+under the same constant names the Rust generator produces:
+
+```ts
+/**
+ * The session's items, as they happen.
+ *
+ * Kind: stream.
+ */
+export const OP_WATCH = "coord.watch";
+```
+
+It is off by default because what makes this generator adoptable is that its
+output can be diffed against what a downstream already committed, and what they
+committed is shapes. With the flag off every byte of every file is what it has
+always been; with it on, the constants arrive in files that did not exist
+before, so nothing already there changes.
+
+The file lands where each layout already puts per-manifest things:
+`<contract>.v<n>.ops.ts` at the top level under `type` and `manifest`, and
+`ops.ts` inside the folder under `folder`. Both are places `--check`'s staleness
+rule already looks, so a stale ops file is reported with no new rule — and
+`--only` governs these exactly as it governs types, because a subset selects
+manifests. No barrel re-exports it: the barrels are `export type *`, erased at
+compile time, and an ops file holds runtime values.
+
 ## The `typescript { … }` clause is not going anywhere
 
 There is an older route from a manifest to TypeScript: `contract!` expands the
@@ -87,7 +130,12 @@ that table is unreachable from ordinary code by construction. The two are kept
 in step by hand, protected by an exhaustive match over `Scalar` in each (a new
 keyword is a compile error in both) and by a cross-check test here.
 
-**A one-line pointer comment on `ScalarTarget::ts` naming
-`peerline-contract-ts`'s `scalar.rs` would close the loop from the other
-side.** It is not written because that crate is owned elsewhere; it is the one
-change this work would like made there and did not make.
+**That pointer is now written.** `ScalarTarget::ts` names this crate's
+`scalar.rs` and the cross-check test by name, and `scalar.rs` names it back, so
+whichever a reader reaches first tells them the other exists.
+
+The same hand-sync applies to the **composites**, which are not in that column
+at all: the macros crate's `ts_override` wraps a leaf answer as `Array<…>`,
+`Record<string, …>` or `… | null`, and this crate spells them identically. A
+downstream diffing the two generators has to see one shape described one way, so
+a composite spelled differently would be a difference that is not one.

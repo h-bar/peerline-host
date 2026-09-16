@@ -1,0 +1,72 @@
+{
+  "contract": "demo.forms",
+  "version": 1,
+  "description": [
+    "A contract whose only job is to put the forms the manifest format grew later on a real connection: a map, a newtype, and a field that is both absent-able and defaulted.",
+    "",
+    "The token tests in peerline-contract-macros can read what the expansion says — that the attribute is there, that the struct is a tuple struct, that the predicate compares against the getter. What they cannot do is put the bytes on a wire and decode them at the other end, and every one of these three forms makes a claim about bytes: a map is a JSON object, a newtype is wire-identical to what it wraps, and a defaulted absent-able key is genuinely missing from the object rather than written as its value."
+  ],
+
+  "codes": { "start": 9200, "end": 9299 },
+
+  "types": [
+    {
+      "form": "newtype",
+      "name": "HostId",
+      "newtype": "string",
+      "description": [
+        "Which host, in this contract's own namespace.",
+        "",
+        "A string on the wire and nothing else, which is the claim the round trip below checks against a literal rather than against the other end."
+      ]
+    },
+    {
+      "form": "newtype",
+      "name": "Millis",
+      "newtype": "i53",
+      "description": ["A duration in milliseconds. A newtype over a number, so that transparency is checked for something that is not a string."]
+    },
+    {
+      "form": "struct",
+      "name": "Report",
+      "description": [
+        "What one instance reported.",
+        "",
+        "Every field is one of the cases under test, and the fields that are not absent-able are here so that a decode failure has something to be a failure about."
+      ],
+      "fields": [
+        { "name": "host", "type": "HostId",
+          "description": ["Where it ran. A required newtype, so the key is always written and its value is the bare string."] },
+        { "name": "env", "type": { "map": "string" },
+          "description": ["The environment it ran with, keyed by variable name. A required map, so the key is always written and its value is a JSON object."] },
+        { "name": "counts", "type": { "map": "u32" }, "optional": true, "default": {},
+          "description": ["Per-name counters. Absent means none, and a writer omits the key rather than writing an empty object."] },
+        { "name": "tags", "type": { "array": "string" }, "optional": true, "default": [],
+          "description": ["Whatever it tagged itself with. Absent means none."] },
+        { "name": "label", "type": "string", "optional": true, "default": "unnamed",
+          "description": ["What to call it in a listing. Absent means it was not named."] },
+        { "name": "took", "type": "Millis", "optional": true, "default": 0,
+          "description": ["How long it ran. Absent means no time at all — the pair through a newtype, so the comparison runs against a wrapped value."] },
+        { "name": "note", "type": "string", "optional": true,
+          "description": ["Anything else it said. Absent-able with no default, which is the state this one is here to be distinguished from: absence means nothing was said, and there is no value to apply."] }
+      ]
+    }
+  ],
+
+  "errors": [
+    { "name": "no_such_host", "code": 9201, "data": "Report",
+      "description": ["The host named is not one this producer knows. Inside the band this contract claims, which is the whole of what claiming one asserts."] }
+  ],
+
+  "ops": [
+    { "name": "demo.forms.round", "kind": "unary", "args": "Report", "result": "Report",
+      "description": ["Take a report and hand back exactly what arrived, so that a difference between the two ends is a difference in the value."],
+      "errors": ["no_such_host"] },
+    { "name": "demo.forms.host", "kind": "unary", "args": "Report", "result": "HostId",
+      "description": ["The host the report named, as a bare newtype result — the position where transparency is most visible, because there is no surrounding object to hide an envelope in."] },
+    { "name": "demo.forms.env.read", "kind": "unary", "args": "Report", "result": { "map": "string" },
+      "description": ["The report's environment, as a map result. A map is a value like any other and travels in a result position as readily as in a field."] },
+    { "name": "demo.forms.watch", "kind": "stream", "args": "Report", "item": "Report",
+      "description": ["The report that arrived, emitted as stream items. A stream item is put on the wire by a different encoder than a unary result, so a form that was right for one and wrong for the other would pass every unary test."] }
+  ]
+}

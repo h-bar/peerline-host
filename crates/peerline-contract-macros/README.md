@@ -41,6 +41,27 @@ one holding an `f64` does not, one whose fields are all fixed-size is
 declares it. None of those is a manifest key, because none of them is
 something the contract says: they follow from what it already said.
 
+## What the newer manifest forms become
+
+- A **map** is `BTreeMap<String, V>`. Ordered and not hashed, because a wire
+  type is serialised and an unordered map gives one value two encodings —
+  which every byte comparison downstream depends on not happening. The `Ord`
+  that buys is free: a map's keys are strings. Never `Copy`, and `Eq` exactly
+  when the values are exact, like a list.
+- A **newtype** is `#[serde(transparent)] pub struct HostId(pub String)`, with
+  `new`, `into_inner`, `get` and `From` both ways. Wire-identical to what it
+  wraps, and the comparison rung comes off the inner shape unchanged — wrapping
+  an `i53` in a name does not cost the `Copy` it had.
+- A field that is **`optional` with a `default`** is the bare type with
+  `#[serde(default = "Ty::default_field", skip_serializing_if =
+  "Ty::is_default_field")]`, where the predicate is generated beside the getter
+  so the value a reader applies and the value a writer declines to write cannot
+  get out of step. Not an `Option`: that would be a third state in the Rust the
+  wire does not have. The one thing it asks of a shape is that the shape be
+  comparable for exact equality, checked here with the whole directory open —
+  which is the half the format's own validator cannot answer, because an
+  imported shape's fields are in a file it did not parse.
+
 Reach it through
 [peerline-contract](https://crates.io/crates/peerline-contract), which
 re-exports both this macro and the format it reads

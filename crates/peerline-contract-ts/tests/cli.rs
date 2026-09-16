@@ -389,4 +389,117 @@ fn help_is_help_and_succeeds() {
     assert!(stdout.contains("<contracts-dir> <out-dir>"), "{stdout}");
     assert!(stdout.contains("--only"), "{stdout}");
     assert!(stdout.contains("folder"), "{stdout}");
+    assert!(stdout.contains("--ops"), "{stdout}");
+}
+
+/// The fixture for the forms the format grew later, which is also the one
+/// with ops and error codes worth emitting constants for.
+fn shapes() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/contracts-shapes")
+}
+
+/// `--ops` is off by default and additive when on, at the level a build
+/// actually sees it: the same command without the flag writes a tree, and
+/// with it writes that tree plus one file per contract.
+#[test]
+fn ops_is_off_by_default_and_adds_one_file_per_contract() {
+    let out = scratch("ops");
+    let dir = out.to_string_lossy().into_owned();
+    let src = shapes().to_string_lossy().into_owned();
+
+    assert!(run(&[&src, &dir]).status.success());
+    let without = snapshot(&out);
+    assert!(
+        !out.join("demo.shapes.v1.ops.ts").exists(),
+        "the flag is off by default, so a tree generated without it is unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+    assert!(run(&["--ops", &src, &dir]).status.success());
+    let with = snapshot(&out);
+    for (name, text) in &without {
+        assert!(
+            with.contains(&(name.clone(), text.clone())),
+            "`{name}` must be byte-identical with the flag on"
+        );
+    }
+    assert_eq!(
+        with.len(),
+        without.len() + 1,
+        "one contract with ops, one vocabulary without: exactly one new file"
+    );
+    let ops = std::fs::read_to_string(out.join("demo.shapes.v1.ops.ts")).unwrap();
+    assert!(
+        ops.contains(r#"export const OP_START = "demo.shapes.start";"#),
+        "{ops}"
+    );
+    assert!(
+        ops.contains("export const ERR_NO_SUCH_HOST = 3101;"),
+        "{ops}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// It round-trips through `--check` like everything else, and — this is the
+/// part that needed no new rule — an ops file left behind by a run that
+/// stopped passing the flag is reported as no longer generated, because it
+/// sits where the staleness rule already looks.
+#[test]
+fn an_ops_file_is_checked_and_goes_stale_like_any_other() {
+    let out = scratch("ops-check");
+    let dir = out.to_string_lossy().into_owned();
+    let src = shapes().to_string_lossy().into_owned();
+
+    assert!(run(&["--ops", &src, &dir]).status.success());
+    let checked = run(&["--check", "--ops", &src, &dir]);
+    assert!(
+        checked.status.success(),
+        "a freshly generated tree must pass --check: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    // Drop the flag: the file is now this tool's to call stale.
+    let checked = run(&["--check", &src, &dir]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        stderr.contains("demo.shapes.v1.ops.ts") && stderr.contains("no longer generated"),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Inside a folder, under the folder layout — the other of the two places the
+/// staleness rule already owns.
+#[test]
+fn an_ops_file_inside_a_folder_is_checked_too() {
+    let out = scratch("ops-folder");
+    let dir = out.to_string_lossy().into_owned();
+    let src = shapes().to_string_lossy().into_owned();
+
+    assert!(
+        run(&["--layout", "folder", "--ops", &src, &dir])
+            .status
+            .success()
+    );
+    assert!(
+        out.join("demo.shapes.v1/ops.ts").is_file(),
+        "the manifest owns a directory here, so its constants live in it"
+    );
+    assert!(
+        !out.join("demo.shared.v1/ops.ts").exists(),
+        "a vocabulary has nothing to put in one"
+    );
+
+    let victim = out.join("demo.shapes.v1/ops.ts");
+    let original = std::fs::read_to_string(&victim).unwrap();
+    std::fs::write(&victim, original.replace("3101", "3199")).unwrap();
+    let checked = run(&["--check", "--layout", "folder", "--ops", &src, &dir]);
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("demo.shapes.v1/ops.ts"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&out);
 }

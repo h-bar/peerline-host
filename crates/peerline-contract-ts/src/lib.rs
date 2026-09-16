@@ -3,9 +3,11 @@
 //! A **contract manifest** is a language-neutral JSON file describing one
 //! peerline contract completely enough to implement it in any language; the
 //! format is `peerline-contract-spec`. This crate reads one and writes
-//! TypeScript: interfaces for its structs, string-literal unions for its
-//! enums, discriminated unions for its unions, and the manifest's own prose as
-//! doc comments on every one of them.
+//! TypeScript: object types for its structs, string-literal unions for its
+//! enums, discriminated unions for its unions, plain aliases for its
+//! newtypes, and the manifest's own prose as doc comments on every one of
+//! them. With [`Options::ops`], its op names and error codes as constants
+//! too.
 //!
 //! ```no_run
 //! use peerline_contract_spec::Directory;
@@ -109,7 +111,7 @@
 //! TypeScript `{}` means "anything but null and undefined", which is the
 //! opposite of a shape with no keys.
 //!
-//! ## The three field states
+//! ## The field states
 //!
 //! The format distinguishes *required*, *absent* and *null*, and the
 //! distinction is the reason it has three keys rather than two.
@@ -129,6 +131,57 @@
 //! - **default** → `key?: T`, with the default value in the doc comment. This
 //!   is the one place the emitter departs from what the `ts_rs` route
 //!   produces, and the reasoning is below.
+//! - **optional *and* default** → `key?: T`, with the default value in the
+//!   doc comment. The same rendering as the state above, and the collapse is
+//!   legitimate; see below.
+//!
+//! ### Why the pair renders exactly like a plain default
+//!
+//! `optional` with a `default` says absence is legal in **both** directions:
+//! a writer omits the key when the value equals the default, and a reader
+//! that meets an absent key applies it. A plain `default` says absence is
+//! legal on the way **in** only. The difference is a direction — and
+//! TypeScript has one type for both directions, so it is a difference this
+//! target structurally cannot carry in a type.
+//!
+//! What it collapses *to* is the same for both, and correctly so. `key?: T`
+//! is exactly right for the pair: a caller may omit the key, and a reader may
+//! meet it missing. For a plain default it is the deliberate widening argued
+//! below — the wire-in reading, chosen because that is the direction in which
+//! being wrong is safe. The two arrive at one spelling from two arguments,
+//! which is the honest outcome rather than a coincidence being papered over.
+//!
+//! The one thing the type cannot say, the prose does. A pair field's doc
+//! comment carries an extra line — "a writer omits the key when the value is
+//! that, so an absent key is something this contract's own producer emits" —
+//! because a TypeScript consumer *reading* such a field needs to know that
+//! absent keys are normal traffic and not just a permission granted to
+//! callers. And [`DefaultFields::Required`] does not touch the pair: that
+//! option reproduces the `ts_rs` route's `key: T` for a plainly defaulted
+//! field, which is defensible because a producer of one really does write the
+//! key every time. For the pair it would not be a conservative reading of an
+//! ambiguous case; it would be false.
+//!
+//! ## Newtypes
+//!
+//! `export type HostId = string;` — a plain alias, not a branded type.
+//!
+//! Rust gets a genuinely distinct type here, because Rust's newtypes are
+//! free. TypeScript's nearest equivalent is a brand
+//! (`string & { __brand: "HostId" }`), and a brand is expensive in precisely
+//! the place this generator's output is used: **every value of a generated
+//! type arrives from `JSON.parse`**, a parsed string is a `string`, and a
+//! `string` is not assignable to a branded one. A consumer would cast at every
+//! boundary — which is the boundary the types were supposed to be helping at —
+//! and the brand would show up in every hover, every `.d.ts` and every error
+//! message about a shape that lacks it.
+//!
+//! So the asymmetry is real and is stated rather than hidden: Rust
+//! distinguishes `HostId` from `String`; TypeScript does not, and the
+//! manifest's prose is what carries the distinction to a TypeScript reader.
+//! That is the answer `path` already gets, for the same reason — `path` is
+//! `string` here, and what the keyword adds is prose about where the value is
+//! resolved.
 //!
 //! ### Why a defaulted field is `key?:`
 //!
@@ -217,6 +270,19 @@
 //! `Array<T>`, not `T[]`. Identical to the compiler; the generic form is what
 //! the existing bindings use and it stays readable when the element is a
 //! union.
+//!
+//! ## Maps
+//!
+//! `Record<string, T>`. The key type is `string` and is not read off
+//! anything: a JSON object's keys are strings, the format has no key-type
+//! keyword, and there is nothing one could say with it if it had. What a
+//! contract can still say about the keys — that they are environment variable
+//! names, or session ids — is prose on the field, where it already goes.
+//!
+//! `Record<string, never>` never arises from a map. That spelling belongs to
+//! an **empty struct**, which is a shape with no keys; a map with no entries
+//! is a *value*, and its type is still `Record<string, T>`. The two look
+//! adjacent and are unrelated.
 //!
 //! ## Imports
 //!
@@ -316,16 +382,70 @@
 //! holds; a pinned version selects one; a name or version the directory does
 //! not hold is [`EmitError`] listing what it does.
 //!
-//! # What this crate does not emit
+//! # Ops and error codes: `--ops`
 //!
-//! **Ops and error codes.** A manifest declares them and the Rust generator
-//! emits constants for both, and there is nothing hard about doing the same
-//! here. It is left out because the thing that makes this generator adoptable
-//! is that its output can be diffed against what a downstream has already
-//! committed, and what they have committed is shapes. A file that also carried
-//! `OP_THREAD_START` would differ from the tree it is meant to replace for a
-//! reason that has nothing to do with whether the mapping is right. It is the
-//! obvious next addition once a downstream has swapped.
+//! A manifest declares both, and the Rust generator emits a constant for each.
+//! [`Options::ops`] does the same here — one file per contract, holding its op
+//! names and error codes as `export const`s with the manifest's prose above
+//! them:
+//!
+//! ```ts
+//! /**
+//!  * The session's items, as they happen.
+//!  *
+//!  * Kind: stream.
+//!  */
+//! export const OP_WATCH = "coord.watch";
+//! ```
+//!
+//! **It is off by default, and that is the whole reason it is a flag.** What
+//! makes this generator adoptable is that its output can be diffed against
+//! what a downstream has already committed, and what they have committed is
+//! shapes. A types file that had grown an `OP_WATCH` would differ from the
+//! tree it is meant to replace for a reason that has nothing to do with
+//! whether the mapping is right. With the flag off, every byte of every file
+//! is what it has always been; with it on, the constants arrive in files that
+//! did not exist before, so nothing a downstream already has changes.
+//!
+//! The names are `peerline_contract_spec::const_name`'s — the same ones the
+//! Rust expansion produces. A constant names one wire string, and two
+//! generators giving it two names would put the work of knowing they are the
+//! same thing back on the reader.
+//!
+//! ## Where the file lands
+//!
+//! Each layout already has a place where a per-manifest thing goes, and the
+//! ops file goes there: `<contract>.v<n>.ops.ts` at the top level under
+//! [`Layout::Type`] and [`Layout::Manifest`], and `ops.ts` inside the folder
+//! under [`Layout::Folder`]. Both are places `--check`'s staleness rule
+//! already owns, so an ops file left behind by a deleted contract — or by a
+//! run that stopped passing the flag — is reported with no new rule. And
+//! because a subset selects *manifests*, `--only` governs these exactly as it
+//! governs types.
+//!
+//! One flat path for all three layouts was the alternative. Under
+//! [`Layout::Folder`] it would be the one generated file not inside the
+//! manifest's own directory, so a consumer copying a folder would take the
+//! types and silently lose the constants.
+//!
+//! Under [`Layout::Type`] the file is per manifest rather than per type, which
+//! is the one place that layout's rule bends. There is nothing else it could
+//! be: an op is not a type, and a contract's ops are read together or not at
+//! all. The names cannot collide with a type's — a type name is PascalCase and
+//! alphanumeric, and a manifest stem contains dots.
+//!
+//! ## No barrel re-exports it
+//!
+//! [`Options::barrel`] writes `export type *`, which is type-only and erased
+//! at compile time — the property that lets a generated file add nothing to a
+//! bundle. An ops file holds **runtime values**. `export type *` cannot carry
+//! them, and a plain `export *` that could would quietly turn every barrel
+//! from an erased import into an emitted one, adding a runtime dependency to
+//! every consumer of the barrel including those that only ever wanted types.
+//! A consumer who wants the constants imports the ops file directly, whose
+//! name is a function of the manifest stem.
+//!
+//! # What this crate does not emit
 //!
 //! **A client.** Generating call stubs means deciding what a peerline
 //! TypeScript client looks like, which is a question about `peerline-ts` and
@@ -356,6 +476,13 @@ pub use scalar::WideIntegers;
 ///
 /// See the crate docs for why [`Optional`](Self::Optional) is the default and
 /// what [`Required`](Self::Required) is for.
+///
+/// This governs the **plain** `default` state only. A field that is
+/// `optional` *and* defaulted is `key?: T` under either setting, because
+/// absence is legal on that wire in both directions — a producer really does
+/// omit the key — so `key: T` there would not be a conservative reading of an
+/// ambiguous case, it would be false. The option exists to reproduce what the
+/// `ts_rs` route emits, and that route could not describe the pair at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DefaultFields {
     /// `key?: T`, with the default value in the doc comment. The wire-in
@@ -515,6 +642,13 @@ pub struct Options {
     /// import specifier, and a file the generator did not previously write is
     /// a diff a downstream did not ask for.
     pub barrel: bool,
+    /// Also emit one `.ops.ts` per contract, carrying its op names and error
+    /// codes as `export const`s.
+    ///
+    /// Off by default, and the default is what keeps every byte of today's
+    /// output byte-identical — see the crate docs for what the file holds,
+    /// where it lands under each layout, and why no barrel re-exports it.
+    pub ops: bool,
     /// Generate only these contracts — plus their transitive imports,
     /// always.
     ///
@@ -573,6 +707,99 @@ pub fn emit(manifest: &Manifest, opts: &Options) -> String {
     out
 }
 
+/// One manifest's ops and error codes, as TypeScript constants.
+///
+/// `None` for a manifest that has neither, which is every
+/// [`Role::Vocabulary`](peerline_contract_spec::Role::Vocabulary): nobody
+/// produces a vocabulary, so it declares no ops and raises no errors, and a
+/// file holding two empty lists would be a file with nothing in it.
+///
+/// # The names are the Rust generator's names
+///
+/// `OP_THREAD_START`, `ERR_CODEX_SERVER` — produced by the same
+/// `peerline_contract_spec::const_name` the Rust expansion uses, not by a
+/// spelling invented here. A constant is a name for one wire string, and two
+/// generators giving one wire string two names would put the burden of
+/// knowing they are the same thing back on the reader, which is the whole
+/// thing the manifest exists to remove.
+///
+/// The **values** are the wire spellings exactly: the op name as it travels,
+/// and the error code as the number a consumer matches on.
+///
+/// `opts` reaches exactly one thing here — the type named in an error's doc
+/// line — and it has to, so that a `--wide-integers number` run does not
+/// describe a payload one way in `Fault.ts` and another way beside the code
+/// that carries it. The constants themselves are the manifest's own strings
+/// and numbers and no option touches them.
+pub fn emit_ops(manifest: &Manifest, opts: &Options) -> Option<String> {
+    if manifest.ops.is_empty() && manifest.errors.is_empty() {
+        return None;
+    }
+    let mut out = header(&manifest.id(), &format!("{}.ops", file_for(manifest)));
+    out.push_str(&doc::block(&manifest.description, 0));
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+
+    let mut first = true;
+    let mut decl = |out: &mut String, doc: &[&str], line: String| {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(&doc::lines_block(doc, 0));
+        out.push_str(&line);
+    };
+
+    for op in &manifest.ops {
+        // The manifest's prose, plus the one line it cannot write: which
+        // peerline call this name is for. A consumer holding the constant
+        // still has to choose between a unary call and a stream one, and the
+        // kind is the manifest's answer.
+        let mut doc: Vec<String> = op
+            .description
+            .lines()
+            .iter()
+            .map(|l| (*l).to_string())
+            .collect();
+        doc.push(String::new());
+        doc.push(format!("Kind: {}.", op.kind));
+        let lines: Vec<&str> = doc.iter().map(String::as_str).collect();
+        decl(
+            &mut out,
+            &lines,
+            format!(
+                "export const {} = {};\n",
+                peerline_contract_spec::const_name("OP", op.short_name(&manifest.contract)),
+                render::string_literal(&op.name),
+            ),
+        );
+    }
+
+    for err in &manifest.errors {
+        let mut doc: Vec<String> = err
+            .description
+            .lines()
+            .iter()
+            .map(|l| (*l).to_string())
+            .collect();
+        if let Some(data) = &err.data {
+            doc.push(String::new());
+            doc.push(format!(
+                "Carried in the error's `data` as `{}`.",
+                render::ty_expr(data, opts),
+            ));
+        }
+        let lines: Vec<&str> = doc.iter().map(String::as_str).collect();
+        decl(
+            &mut out,
+            &lines,
+            format!("export const {} = {};\n", err.const_name(), err.code),
+        );
+    }
+    Some(out)
+}
+
 /// Every manifest in a directory — or the subset [`Options::only`] asks for —
 /// as the files a generator writes.
 ///
@@ -602,6 +829,18 @@ pub fn emit_directory(
     // Under `Layout::Folder`, the manifests that got a folder, with the
     // namespace each is re-exported under — the root barrel's raw material.
     let mut folders: Vec<(String, String)> = Vec::new();
+
+    // One per selected manifest, under every layout, before the layouts
+    // diverge — because `--only` selects *manifests* and an ops file is a
+    // per-manifest artefact, so the subset rule that already governs types
+    // governs these with no second rule to keep in step.
+    if opts.ops {
+        for manifest in &manifests {
+            if let Some(text) = emit_ops(manifest, opts) {
+                files.insert(ops_path(manifest, opts.layout), text);
+            }
+        }
+    }
 
     match opts.layout {
         Layout::Manifest => {
@@ -854,4 +1093,47 @@ fn module_for_type(name: &str) -> String {
 /// name `Directory::load` already requires of the manifest itself.
 fn file_for(manifest: &Manifest) -> String {
     format!("{}.v{}", manifest.contract, manifest.version)
+}
+
+/// Where one manifest's ops file lands, per layout.
+///
+/// # Why the path differs, and why that is the composing answer
+///
+/// Each layout already has a place where a *per-manifest* thing goes, and the
+/// ops file goes there. Under the flat layouts there is no folder, so it sits
+/// at the top level as `<stem>.ops.ts`; under [`Layout::Folder`] the manifest
+/// owns a directory, so it sits in it as `ops.ts`. Either way the name is a
+/// function of the manifest stem, which the format already owns —
+/// `Directory::load` requires `<contract>.v<version>.json` — so an implementor
+/// who can find the manifest can find the file.
+///
+/// **It composes with `--check` for free.** The staleness rule already owns
+/// exactly these two places: every `*.ts` at the top level, and every `*.ts`
+/// inside a directory named like a manifest. So an ops file left behind by a
+/// contract that was deleted, or by a run that stopped passing `--ops`, is
+/// reported as no longer generated — with no new rule, which is the point of
+/// putting it where the layout already looks.
+///
+/// **And with `--only` for free**, because a subset selects manifests and this
+/// is a per-manifest file.
+///
+/// The rejected alternative was one path for all three layouts. A flat
+/// `<stem>.ops.ts` sitting *beside* the folders under [`Layout::Folder`] would
+/// be the one generated file in that layout not inside the manifest's own
+/// directory — so a consumer who copied a folder would get the types and
+/// silently lose the constants, and a `--check` run would have to learn a
+/// place it does not otherwise look.
+///
+/// Under [`Layout::Type`] the file is per *manifest* rather than per type,
+/// which is the one place that layout's rule bends. It bends because there is
+/// nothing else it could be: an op is not a type, there is no per-op file a
+/// consumer would want, and a contract's ops are read together or not at all.
+/// The names cannot collide either — a type name is PascalCase and
+/// alphanumeric, and a stem contains dots.
+fn ops_path(manifest: &Manifest, layout: Layout) -> PathBuf {
+    let stem = file_for(manifest);
+    match layout {
+        Layout::Type | Layout::Manifest => PathBuf::from(format!("{stem}.ops.ts")),
+        Layout::Folder => PathBuf::from(format!("{stem}/ops.ts")),
+    }
 }
